@@ -1,0 +1,31 @@
+{
+  "type": "object",
+  "properties": {
+    "tournament_id": {
+      "type": "string"
+    },
+    "guild_id": {
+      "type": "string"
+    },
+    "group_label": {
+      "type": "string"
+    },
+    "player_ids": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "player_names": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "generated_at": {
+      "type": "string"
+    }
+  },
+  "required": [],
+  "name": "TournamentGroup"
+}

@@ -1,0 +1,60 @@
+{
+  "type": "object",
+  "properties": {
+    "tournament_id": {
+      "type": "string"
+    },
+    "guild_id": {
+      "type": "string"
+    },
+    "round_number": {
+      "type": "number"
+    },
+    "match_number": {
+      "type": "number"
+    },
+    "group_label": {
+      "type": "string"
+    },
+    "player1_id": {
+      "type": "string"
+    },
+    "player1_username": {
+      "type": "string"
+    },
+    "player2_id": {
+      "type": "string"
+    },
+    "player2_username": {
+      "type": "string"
+    },
+    "player1_score": {
+      "type": "number"
+    },
+    "player2_score": {
+      "type": "number"
+    },
+    "winner_id": {
+      "type": "string"
+    },
+    "winner_username": {
+      "type": "string"
+    },
+    "scheduled_at": {
+      "type": "string"
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "scheduled",
+        "in_progress",
+        "completed"
+      ]
+    },
+    "results_card_image_url": {
+      "type": "string"
+    }
+  },
+  "required": [],
+  "name": "Match"
+}

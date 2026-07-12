@@ -1,0 +1,55 @@
+{
+  "type": "object",
+  "properties": {
+    "guild_id": {
+      "type": "string"
+    },
+    "guild_name": {
+      "type": "string"
+    },
+    "owner_discord_id": {
+      "type": "string"
+    },
+    "owner_name": {
+      "type": "string"
+    },
+    "plan_id": {
+      "type": "string"
+    },
+    "trial_started_at": {
+      "type": "string"
+    },
+    "trial_expires_at": {
+      "type": "string"
+    },
+    "subscription_status": {
+      "type": "string",
+      "enum": [
+        "active",
+        "trial",
+        "expired",
+        "banned"
+      ]
+    },
+    "tournaments_used_this_cycle": {
+      "type": "number"
+    },
+    "tournaments_limit": {
+      "type": "number"
+    },
+    "added_at": {
+      "type": "string"
+    },
+    "last_active_at": {
+      "type": "string"
+    },
+    "banned_at": {
+      "type": "string"
+    },
+    "ban_reason": {
+      "type": "string"
+    }
+  },
+  "required": [],
+  "name": "Server"
+}

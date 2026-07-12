@@ -1,0 +1,39 @@
+{
+  "type": "object",
+  "properties": {
+    "type": {
+      "type": "string",
+      "enum": [
+        "billing",
+        "escalation",
+        "api_error",
+        "ban",
+        "upgrade",
+        "trial_expiry",
+        "new_server"
+      ]
+    },
+    "server_id": {
+      "type": "string"
+    },
+    "guild_name": {
+      "type": "string"
+    },
+    "message": {
+      "type": "string"
+    },
+    "severity": {
+      "type": "string",
+      "enum": [
+        "info",
+        "warning",
+        "critical"
+      ]
+    },
+    "read_by_unish": {
+      "type": "boolean"
+    }
+  },
+  "required": [],
+  "name": "AdminNotification"
+}

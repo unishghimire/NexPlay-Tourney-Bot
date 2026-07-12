@@ -1,0 +1,95 @@
+{
+  "type": "object",
+  "properties": {
+    "server_id": {
+      "type": "string"
+    },
+    "guild_id": {
+      "type": "string"
+    },
+    "name": {
+      "type": "string"
+    },
+    "game": {
+      "type": "string"
+    },
+    "format": {
+      "type": "string",
+      "enum": [
+        "single_elim",
+        "double_elim",
+        "round_robin",
+        "swiss"
+      ]
+    },
+    "prize_pool": {
+      "type": "string"
+    },
+    "description": {
+      "type": "string"
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "draft",
+        "registration_open",
+        "registration_closed",
+        "groups_generated",
+        "scheduled",
+        "in_progress",
+        "completed",
+        "cancelled"
+      ]
+    },
+    "max_players": {
+      "type": "number"
+    },
+    "registered_count": {
+      "type": "number"
+    },
+    "created_by_discord_id": {
+      "type": "string"
+    },
+    "tournament_date": {
+      "type": "string"
+    },
+    "started_at": {
+      "type": "string"
+    },
+    "completed_at": {
+      "type": "string"
+    },
+    "winner_username": {
+      "type": "string"
+    },
+    "second_place": {
+      "type": "string"
+    },
+    "third_place": {
+      "type": "string"
+    },
+    "poster_image_url": {
+      "type": "string"
+    },
+    "roadmap_image_url": {
+      "type": "string"
+    },
+    "schedule_image_url": {
+      "type": "string"
+    },
+    "announcement_channel_id": {
+      "type": "string"
+    },
+    "registration_channel_id": {
+      "type": "string"
+    },
+    "brackets_channel_id": {
+      "type": "string"
+    },
+    "champions_channel_id": {
+      "type": "string"
+    }
+  },
+  "required": [],
+  "name": "Tournament"
+}

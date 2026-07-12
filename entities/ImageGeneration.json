@@ -1,0 +1,39 @@
+{
+  "type": "object",
+  "properties": {
+    "tournament_id": {
+      "type": "string"
+    },
+    "guild_id": {
+      "type": "string"
+    },
+    "image_type": {
+      "type": "string",
+      "enum": [
+        "poster",
+        "roadmap",
+        "group_draw",
+        "match_schedule",
+        "results_card",
+        "champion_card"
+      ]
+    },
+    "prompt": {
+      "type": "string"
+    },
+    "pollinations_url": {
+      "type": "string"
+    },
+    "generated_at": {
+      "type": "string"
+    },
+    "published_channel_id": {
+      "type": "string"
+    },
+    "message_id": {
+      "type": "string"
+    }
+  },
+  "required": [],
+  "name": "ImageGeneration"
+}

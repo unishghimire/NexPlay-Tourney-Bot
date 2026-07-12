@@ -1,0 +1,40 @@
+{
+  "type": "object",
+  "properties": {
+    "server_id": {
+      "type": "string"
+    },
+    "plan_id": {
+      "type": "string"
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "active",
+        "trial",
+        "expired",
+        "cancelled"
+      ]
+    },
+    "started_at": {
+      "type": "string"
+    },
+    "renews_at": {
+      "type": "string"
+    },
+    "cancelled_at": {
+      "type": "string"
+    },
+    "promo_code_id": {
+      "type": "string"
+    },
+    "billing_notes": {
+      "type": "string"
+    },
+    "discount_applied": {
+      "type": "number"
+    }
+  },
+  "required": [],
+  "name": "Subscription"
+}

@@ -1,0 +1,31 @@
+{
+  "type": "object",
+  "properties": {
+    "name": {
+      "type": "string"
+    },
+    "price_monthly": {
+      "type": "number"
+    },
+    "price_yearly": {
+      "type": "number"
+    },
+    "tournament_limit": {
+      "type": "number"
+    },
+    "features": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "is_active": {
+      "type": "boolean"
+    },
+    "description": {
+      "type": "string"
+    }
+  },
+  "required": [],
+  "name": "Plan"
+}
