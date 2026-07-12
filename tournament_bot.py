@@ -174,411 +174,286 @@ async def on_message(message: discord.Message):
     # AI Support in support channel
     if message.channel.id == CH_SUPPORT and len(message.content.strip()) > 5:
         async with message.channel.typing():
-            await handleasync def handle_support_message(message: discord.Message):
-    """Smart AI support: answers user, sends staff alert with suggestions."""
-    q = message.content.strip()
-    ql = q.lower()
-    guild_id = str(message.guild.id)
+            await handle_support_message(message)
+        return
 
-    # Load active tournament for context
-    tournaments = await b44_list("Tournament", {"guild_id": guild_id})
-    active = next((t for t in tournaments if t.get("status") not in ["completed", "cancelled"]), None)
-    t_name   = active.get("name", "the current tournament") if active else None
-    t_status = active.get("status", "")   if active else ""
-    t_game   = active.get("game", "")     if active else ""
-    t_prize  = active.get("prize_pool", "TBA") if active else "TBA"
-    t_date   = active.get("tournament_date", "TBA") if active else "TBA"
-    t_max    = active.get("max_players", "?")  if active else "?"
-    t_count  = active.get("registered_count", 0) if active else 0
+    await bot.process_commands(message)
 
-    has = lambda kws: any(k in ql for k in kws)
 
-    # ── Classify & Build Response ────────────────────────────────────────
-    routed     = False          # True = escalate to staff
-    suggestions = []            # staff action suggestions
-    category   = "General"
+async def handle_support_message(message: discord.Message):
+    q      = message.content.strip()
+    ql     = q.lower()
+    gid    = str(message.guild.id)
+    routed = False
+    tips   = []
 
-    if has(["payment","refund","billing","cost","price","subscription","upgrade","plan","buy","paid"]):
-        category = "Billing"
-        routed   = True
-        resp     = (
-            "💳 **Billing / Payment Issue**
+    all_t  = await b44_list("Tournament", {"guild_id": gid})
+    active = next((t for t in all_t if t.get("status") not in ("completed", "cancelled")), None)
+    tn   = active.get("name", "current tournament") if active else None
+    ts   = active.get("status", "")                 if active else ""
+    tg   = active.get("game", "")                   if active else ""
+    tp   = active.get("prize_pool", "TBA")           if active else "TBA"
+    td   = active.get("tournament_date", "TBA")      if active else "TBA"
+    tmx  = active.get("max_players", "?")            if active else "?"
+    tcnt = active.get("registered_count", 0)         if active else 0
 
-"
-            "I've notified the **admin team** right away! 🔔
+    def has(*kws):
+        return any(k in ql for k in kws)
 
-"
-            "**Quick answers:**
-"
-            "> • Tournament entry is **free** for all members
-"
-            "> • Prize payouts are handled by tournament host after completion
-"
-            "> • For subscription/plan issues, the owner will contact you
-
-"
+    # ---------- classify + build response ----------
+    if has("payment", "refund", "billing", "subscription", "upgrade", "plan", "buy", "paid", "price"):
+        cat    = "Billing"
+        routed = True
+        color  = 0xFF9900
+        resp   = (
+            "**Billing / Payment Issue**\n\n"
+            "I have notified the admin team right away!\n\n"
+            "**Quick info:**\n"
+            "> Tournament entry is FREE for all members\n"
+            "> Prize payouts handled by host after tournament\n"
+            "> For plan/subscription issues, the owner will DM you\n\n"
             "A staff member will respond here shortly!"
         )
-        color = 0xFF9900
-        suggestions = [
-            "Check if user made a payment and verify receipt",
-            "Review subscription records in admin panel",
+        tips = [
+            "Verify if a payment was made -- check admin panel",
             "Reply to the user in #support-ticket directly",
+            "Check subscription records if SaaS-related",
         ]
 
-    elif has(["account","banned","kick","muted","hack","stolen","password","login","suspended"]):
-        category = "Account"
-        routed   = True
-        resp     = (
-            "🔐 **Account Issue Detected**
-
-"
-            "This needs a **human moderator** — staff have been alerted! 🔔
-
-"
-            "**While you wait:**
-"
-            "> • If hacked: change your Discord password immediately
-"
-            "> • If wrongly banned: clearly explain your case
-"
-            "> • Never share your password with anyone
-
-"
-            "A moderator will respond soon! ⏱️"
+    elif has("account", "banned", "kick", "muted", "hacked", "stolen", "password", "login", "suspended"):
+        cat    = "Account"
+        routed = True
+        color  = 0xFF4444
+        resp   = (
+            "**Account Issue Detected**\n\n"
+            "Flagged to human moderators -- staff alerted!\n\n"
+            "**While you wait:**\n"
+            "> If hacked, change your Discord password now\n"
+            "> If wrongly banned, explain your case clearly\n"
+            "> Never share your password with anyone\n\n"
+            "A moderator will respond soon!"
         )
-        color = 0xFF4444
-        suggestions = [
+        tips = [
             "Check audit log for ban/kick/mute action",
-            "Review the user's recent messages for context",
+            "Review user recent messages for context",
             "DM the user if action was a mistake",
         ]
 
-    elif has(["cheat","report","toxic","abuse","harass","unfair","complaint","issue with"]):
-        category = "Complaint / Report"
-        routed   = True
-        resp     = (
-            "⚠️ **Report / Complaint Received**
-
-"
-            "Flagged for **moderation team** immediately! 🔔
-
-"
-            "**To help us resolve faster:**
-"
-            "> • Describe exactly what happened
-"
-            "> • Provide screenshots if possible
-"
-            "> • Include the username of the person involved
-
-"
-            "A moderator will review and take action. Thank you! 🛡️"
+    elif has("cheat", "report", "toxic", "abuse", "harass", "unfair", "complaint"):
+        cat    = "Complaint"
+        routed = True
+        color  = 0xFF4444
+        resp   = (
+            "**Report / Complaint Received**\n\n"
+            "Flagged for moderation immediately!\n\n"
+            "**To help resolve faster:**\n"
+            "> Describe exactly what happened\n"
+            "> Attach screenshots if possible\n"
+            "> Include the username of the person involved\n\n"
+            "A moderator will review and take action. Thank you!"
         )
-        color = 0xFF4444
-        suggestions = [
+        tips = [
             "Review recent messages in the relevant channel",
-            "Check if the accused player is registered in a tournament",
+            "Check if accused player is registered in a tournament",
             "Take action: warn / mute / kick / ban as appropriate",
         ]
 
-    elif has(["crash","lag","disconnect","not working","error","bug","broken","glitch","can't","cannot","doesn't work"]):
-        category = "Technical"
-        routed   = True
-        resp     = (
-            "🔧 **Technical Issue Detected**
-
-"
-            "Notified the **tech team** — they'll look into it! 🔔
-
-"
-            "**Try these first:**
-"
-            "> 1️⃣ Restart your Discord app
-"
-            "> 2️⃣ Check your internet connection
-"
-            "> 3️⃣ Clear Discord cache (Settings → Advanced)
-"
-            "> 4️⃣ Try mobile if on PC (or vice versa)
-
-"
-            "If none of that works, staff will help shortly!"
+    elif has("crash", "lag", "disconnect", "not working", "error", "bug", "broken", "glitch"):
+        cat    = "Technical"
+        routed = True
+        color  = 0xFF9900
+        resp   = (
+            "**Technical Issue Detected**\n\n"
+            "Notified the tech team -- they will look into it!\n\n"
+            "**Try these first:**\n"
+            "> 1. Restart your Discord app\n"
+            "> 2. Check your internet connection\n"
+            "> 3. Clear Discord cache (Settings > Advanced)\n"
+            "> 4. Try mobile if on PC, or vice versa\n\n"
+            "If none of that helps, staff will assist shortly!"
         )
-        color = 0xFF9900
-        suggestions = [
-            "Ask user which device/OS they are on",
-            "Check if the bot or server has any known outages",
-            "Try reproducing the issue yourself",
+        tips = [
+            "Ask user: which device/OS?",
+            "Check for known bot or server outages",
+            "Try to reproduce the issue yourself",
         ]
 
-    elif has(["register","sign up","join tournament","how to join","enroll","how do i","want to join","i want to register"]):
-        category = "Registration"
-        if active and t_status == "registration_open":
+    elif has("register", "sign up", "join tournament", "how to join", "enroll", "want to register", "want to join"):
+        cat   = "Registration"
+        color = 0x00FF7F
+        if active and ts == "registration_open":
             resp = (
-                f"📋 **Registration for {t_name} is OPEN!** 🟢
-
-"
-                f"**How to Register:**
-"
-                f"> 1️⃣ Go to <#{CH_REGISTRATION}>
-"
-                f"> 2️⃣ Use `/register` and enter your in-game name
-"
-                f"> 3️⃣ You'll get a confirmation ✅
-
-"
-                f"**📊 Slots:** {t_count}/{t_max} filled | **🎮 Game:** {t_game} | **📅 Date:** {t_date}"
+                "Registration for " + str(tn) + " is OPEN!\n\n"
+                "How to Register:\n"
+                "> 1. Go to #tourney-registration\n"
+                "> 2. Use /register and enter your in-game name\n"
+                "> 3. You will get a confirmation\n\n"
+                "Slots: " + str(tcnt) + "/" + str(tmx) + " filled | "
+                "Game: " + str(tg) + " | Date: " + str(td)
             )
-            color = 0x00FF7F
-            suggestions = [f"Slots filling: {t_count}/{t_max}", "Registration is open — no action needed"]
+            tips = ["Slots: " + str(tcnt) + "/" + str(tmx), "Registration is open -- no action needed"]
         elif active:
             resp = (
-                f"📋 Registration for **{t_name}** is **CLOSED** 🔒 (`{t_status}`)
-
-"
-                f"Watch <#{CH_ANNOUNCEMENTS}> for when the next tournament opens!
-"
-                f"💡 Enable server notifications so you never miss it!"
+                "Registration for " + str(tn) + " is CLOSED (status: " + str(ts) + ")\n\n"
+                "Watch #tourney-announcements for the next tournament!\n"
+                "Tip: Enable server notifications so you never miss it!"
             )
-            color = 0xFF9900
-            suggestions = ["Registration closed — inform user to watch announcements"]
+            tips = ["Registration closed -- inform user to watch announcements"]
         else:
             resp = (
-                f"📋 **No active tournament registration right now.**
-
-"
-                f"Watch <#{CH_ANNOUNCEMENTS}> — tournaments are posted regularly!
-"
-                f"💡 Enable server notifications to be first to know."
+                "No active tournament registration right now.\n\n"
+                "Watch #tourney-announcements -- tournaments are posted regularly!\n"
+                "Tip: Enable server notifications to be first to know."
             )
-            color = 0xFF9900
-            suggestions = ["No active tournament — consider creating one soon"]
+            tips = ["No active tournament -- consider creating one"]
 
-    elif has(["when","schedule","time","date","match time","fixture","next match","what time"]):
-        category = "Schedule"
+    elif has("when", "schedule", "time", "date", "match time", "fixture", "next match"):
+        cat   = "Schedule"
+        color = 0x1E90FF
         if active:
             resp = (
-                f"📅 **{t_name} — Schedule**
-
-"
-                f"**🎮 Game:** {t_game} | **📅 Date:** {t_date} | **Status:** `{t_status}`
-
-"
-                f"Full match schedule is in <#{CH_BRACKETS}> after group draw.
-"
-                f"⚠️ Be ready **10 min before** your match — late = forfeit!"
+                str(tn) + " Schedule:\n\n"
+                "Game: " + str(tg) + " | Date: " + str(td) + " | Status: " + str(ts) + "\n\n"
+                "Full match schedule is in #brackets-results after group draw.\n"
+                "Be ready 10 min before your match -- late = forfeit!"
             )
-            suggestions = [f"Tournament date: {t_date}", "Schedule in #brackets-results"]
+            tips = ["Date: " + str(td), "Schedule visible in #brackets-results"]
         else:
-            resp = f"📅 No active tournament right now. Watch <#{CH_ANNOUNCEMENTS}> for upcoming dates!"
-            suggestions = ["No active tournament — nothing to schedule yet"]
-        color = 0x1E90FF
+            resp = "No active tournament right now. Watch #tourney-announcements for upcoming dates!"
+            tips = ["No active tournament"]
 
-    elif has(["prize","reward","cash","winning","money","payout","how much"]):
-        category = "Prize"
-        resp = (
-            f"🏅 **Prize Pool — {t_name}:** 💰 **{t_prize}**
-
-Game: {t_game} | Date: {t_date}
-
-Prize breakdown announced before match day. Give it your all! 🔥"
-        ) if active else "🏅 Prize details are announced with each new tournament! Watch #tourney-announcements."
+    elif has("prize", "reward", "cash", "winning", "money", "payout", "how much"):
+        cat   = "Prize"
         color = 0xFFD700
-        suggestions = [f"Prize: {t_prize}" if active else "No active tournament"]
+        if active:
+            resp = (
+                "Prize Pool -- " + str(tn) + "\n\n"
+                "Total: " + str(tp) + "\n"
+                "Game: " + str(tg) + " | Date: " + str(td) + "\n\n"
+                "Prize breakdown announced before match day. Give it your all!"
+            )
+        else:
+            resp = "Prize details are announced with each new tournament! Watch #tourney-announcements."
+        tips = ["Prize: " + str(tp)]
 
-    elif has(["rule","regulation","fair","allowed","disqualify","dq","no-show"]):
-        category = "Rules"
-        resp = (
-            "📜 **NexPlay Tournament Rules**
-
-"
-            "1️⃣ No cheating/hacking → instant permanent DQ
-"
-            "2️⃣ Be in voice channel **10 min before** your match
-"
-            "3️⃣ Screenshot all results and post in results channel
-"
-            "4️⃣ Respect all players — toxic behavior = ban
-"
-            "5️⃣ No-show after 5 min = automatic forfeit
-"
-            "6️⃣ Host decision is **final** — no arguments
-"
-            "7️⃣ One account per player — multi-account = DQ
-
-"
-            f"Full rules: <#1525468068426547323>"
-        )
+    elif has("rule", "regulation", "fair", "allowed", "disqualify", "dq", "no-show"):
+        cat   = "Rules"
         color = 0x00FF7F
-        suggestions = ["User asking about rules — no action needed unless they mention a violation"]
+        resp  = (
+            "NexPlay Tournament Rules:\n\n"
+            "1. No cheating/hacking -- instant permanent DQ\n"
+            "2. Be in voice channel 10 min before your match\n"
+            "3. Screenshot all results and post in results channel\n"
+            "4. Respect everyone -- toxic = ban\n"
+            "5. No-show after 5 min = automatic forfeit\n"
+            "6. Host decision is final\n"
+            "7. One account per player -- multi-account = DQ\n\n"
+            "Full rules: #tourney-rules"
+        )
+        tips = ["Rules question -- no action needed unless violation mentioned"]
 
-    elif has(["bracket","group","draw","round","opponent","my group","who do i play","matchup"]):
-        category = "Brackets"
-        if active and t_status in ["groups_generated", "scheduled", "in_progress"]:
+    elif has("bracket", "group", "draw", "round", "opponent", "my group", "who do i play", "matchup"):
+        cat   = "Brackets"
+        color = 0x9B59B6
+        if active and ts in ("groups_generated", "scheduled", "in_progress"):
             resp = (
-                f"🎯 **{t_name} — Groups & Brackets**
-
-"
-                f"Groups are drawn! Check <#{CH_BRACKETS}> to see:
-"
-                f"> 📊 Your group | ⚔️ Your opponents | 📅 Match times
-
-"
-                f"**Status:** `{t_status}` {'🔥 LIVE!' if t_status == 'in_progress' else ''}"
+                str(tn) + " Groups & Brackets:\n\n"
+                "Groups are drawn! Check #brackets-results to see:\n"
+                "> Your group | Your opponents | Match times\n\n"
+                "Status: " + str(ts) + (" -- LIVE!" if ts == "in_progress" else "")
             )
-            suggestions = [f"Tournament is {t_status} — brackets visible in #brackets-results"]
+            tips = ["Brackets visible in #brackets-results"]
         else:
             resp = (
-                f"🎯 Groups haven't been drawn yet!
-
-"
-                f"Brackets appear in <#{CH_BRACKETS}> after registration closes.
-"
-                + (f"Current status: `{t_status}`" if active else "No active tournament right now.")
+                "Groups have not been drawn yet!\n\n"
+                "Brackets appear in #brackets-results after registration closes.\n"
+                + ("Current status: " + str(ts) if active else "No active tournament right now.")
             )
-            suggestions = ["Brackets not drawn — use /generate_groups when ready"]
-        color = 0x9B59B6
+            tips = ["Use /generate_groups when ready"]
 
-    elif has(["result","score","winner","who won","standing","leaderboard","match result"]):
-        category = "Results"
-        resp = (
-            f"📊 Results are posted in <#{CH_BRACKETS}> after each match.
-"
-            f"Final champion is revealed in <#{CH_CHAMPIONS}>!
-
-"
-            + (f"Current: **{t_name}** | `{t_status}`" if active else "No active tournament.")
-        )
+    elif has("result", "score", "winner", "who won", "standing", "leaderboard"):
+        cat   = "Results"
         color = 0x1E90FF
-        suggestions = ["Results in #brackets-results — no action needed"]
-
-    elif has(["command","slash","bot","how to use","help","what can","bot do"]):
-        category = "Bot Help"
-        resp = (
-            "🤖 **NexPlay Bot Commands**
-
-"
-            "**Player commands:**
-"
-            "> `/register` — Join a tournament
-"
-            "> `/tournament_status` — View active tournaments
-"
-            "> `/help` — Full command list
-
-"
-            "**Staff commands (Host/Admin):**
-"
-            "> `/create_tournament` `/close_registration` `/generate_groups`
-"
-            "> `/post_schedule` `/post_result` `/complete_tournament` `/announce`
-
-"
-            "Type `/` in any channel to see all commands! 🚀"
+        resp  = (
+            "Results are posted in #brackets-results after each match.\n"
+            "Final champion revealed in #hall-of-champions!\n\n"
+            + ("Current: " + str(tn) + " | " + str(ts) if active else "No active tournament.")
         )
+        tips = ["Results in #brackets-results -- no action needed"]
+
+    elif has("command", "slash", "bot", "how to use", "help", "what can"):
+        cat   = "Bot Help"
         color = 0xFFD700
-        suggestions = ["User needs bot help — no action needed, directed to /help"]
+        resp  = (
+            "NexPlay Bot Commands:\n\n"
+            "Player commands:\n"
+            "> /register -- Join a tournament\n"
+            "> /tournament_status -- View active tournaments\n"
+            "> /help -- Full command list\n\n"
+            "Staff commands (Host/Admin):\n"
+            "> /create_tournament  /close_registration  /generate_groups\n"
+            "> /post_schedule  /post_result  /complete_tournament  /announce\n\n"
+            "Type / in any channel to see all commands!"
+        )
+        tips = ["Bot help question -- no action needed"]
 
     else:
-        category = "Unknown"
-        routed   = True
-        resp = (
-            "🤔 **I'm not 100% sure about that one!**
-
-"
-            "I've flagged your message to the **staff team** — they'll respond shortly! 🔔
-
-"
-            "**Quick self-help:**
-"
-            f"> 🏆 Tournaments → <#{CH_ANNOUNCEMENTS}>
-"
-            f"> 📋 Register → <#{CH_REGISTRATION}>
-"
-            f"> 📊 Brackets → <#{CH_BRACKETS}>
-"
-            f"> ❓ Commands → `/help`"
+        cat    = "Unknown"
+        routed = True
+        color  = 0x9B59B6
+        resp   = (
+            "Not 100% sure about that one -- flagged to staff team!\n\n"
+            "Quick self-help:\n"
+            "> Tournaments  -> #tourney-announcements\n"
+            "> Register     -> #tourney-registration\n"
+            "> Brackets     -> #brackets-results\n"
+            "> Commands     -> /help"
         )
-        color = 0x9B59B6
-        suggestions = [
+        tips = [
             "Read the full question and respond manually",
-            "Consider adding this question to the bot knowledge base",
+            "Consider adding this Q to the bot knowledge base",
         ]
 
-    # ── Reply to user ────────────────────────────────────────────────────
-    user_embed = discord.Embed(
-        description=(
-            f"**Hey {message.author.mention}!** Here's what I found:
-
-"
-            + resp
-        ),
+    # ---------- reply to user ----------
+    ue = discord.Embed(
+        description="Hey " + message.author.mention + "! Here is what I found:\n\n" + resp,
         color=color
     )
-    user_embed.set_author(name="🤖 NexPlay AI Support", icon_url="https://cdn.discordapp.com/embed/avatars/0.png")
+    ue.set_author(name="NexPlay AI Support", icon_url="https://cdn.discordapp.com/embed/avatars/0.png")
     if routed:
-        user_embed.add_field(
-            name="📣 Staff Notified",
-            value="The team has been alerted and will assist you shortly! ⏱️",
-            inline=False
-        )
-    user_embed.set_footer(text="🇳🇵 NexPlay AI Support • Type your question anytime!")
-    user_embed.timestamp = datetime.utcnow()
-    await message.channel.send(embed=user_embed)
+        ue.add_field(name="Staff Notified", value="The team has been alerted and will assist you shortly!", inline=False)
+    ue.set_footer(text="NexPlay AI Support -- Type your question anytime!")
+    ue.timestamp = datetime.utcnow()
+    await message.channel.send(embed=ue)
 
-    # ── Staff Log Alert ──────────────────────────────────────────────────
+    # ---------- staff log alert ----------
     if routed:
-        priority_color = 0xFF4444 if category in ("Account", "Complaint / Report") else 0xFF9900
-        urgency = "🚨 ESCALATED" if category in ("Account", "Complaint / Report") else "⚠️ FLAGGED"
-
-        staff_embed = discord.Embed(
-            title=f"{urgency} — Support Alert #{category}",
-            color=priority_color,
+        high = cat in ("Account", "Complaint")
+        se   = discord.Embed(
+            title=("ESCALATED" if high else "FLAGGED") + " -- Support Alert | " + cat,
+            color=0xFF4444 if high else 0xFF9900,
             timestamp=datetime.utcnow()
         )
-        staff_embed.add_field(
-            name="👤 User",
-            value=f"{message.author.mention} (`{message.author.display_name}` | ID: `{message.author.id}`)",
+        se.add_field(name="User",      value=message.author.mention + " (" + message.author.display_name + " | " + str(message.author.id) + ")", inline=False)
+        se.add_field(name="Category",  value=cat,                                                                                inline=True)
+        se.add_field(name="Priority",  value="High" if high else "Medium",                                                       inline=True)
+        se.add_field(name="Message",   value=">>> " + q[:400],                                                                   inline=False)
+        se.add_field(name="AI Replied",value=resp[:280],                                                                         inline=False)
+        if tips:
+            se.add_field(name="Suggested Staff Actions", value="\n".join("* " + t for t in tips), inline=False)
+        se.add_field(
+            name="Jump",
+            value="[View conversation](https://discord.com/channels/" + str(message.guild.id) + "/" + str(CH_SUPP) + "/" + str(message.id) + ")",
             inline=False
         )
-        staff_embed.add_field(name="📂 Category", value=f"`{category}`", inline=True)
-        staff_embed.add_field(
-            name="⚡ Priority",
-            value="🔴 High" if category in ("Account","Complaint / Report") else "🟡 Medium",
-            inline=True
-        )
-        staff_embed.add_field(
-            name="💬 Their Message",
-            value=f">>> {q[:400]}",
-            inline=False
-        )
-        staff_embed.add_field(
-            name="🤖 AI Response Sent",
-            value=f"```{resp[:300]}```",
-            inline=False
-        )
-        if suggestions:
-            staff_embed.add_field(
-                name="💡 Suggested Staff Actions",
-                value="
-".join([f"• {s}" for s in suggestions]),
-                inline=False
-            )
-        staff_embed.add_field(
-            name="📍 Jump To",
-            value=f"<#{CH_SUPPORT}> → [Click to view conversation](https://discord.com/channels/{message.guild.id}/{CH_SUPPORT}/{message.id})",
-            inline=False
-        )
-        staff_embed.set_thumbnail(url=str(message.author.display_avatar.url) if message.author.display_avatar else "")
-        staff_embed.set_footer(text=f"NexPlay Support AI • {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}")
+        if message.author.display_avatar:
+            se.set_thumbnail(url=str(message.author.display_avatar.url))
+        se.set_footer(text="NexPlay Support AI -- " + datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"))
+        await discord_post(CH_STAFF, se, content="@here" if high else "")
 
-        ping = "@here" if category in ("Account", "Complaint / Report") else ""
-        await discord_post(CH_STAFF_LOG, staff_embed, content=ping)
-
-    # ── Save to DB ───────────────────────────────────────────────────────
+    # ---------- save to DB ----------
     await b44_create("SupportMessage", {
-        "guild_id": guild_id,
+        "guild_id": gid,
         "tournament_id": active.get("id", "") if active else "",
         "user_discord_id": str(message.author.id),
         "user_username": message.author.display_name,
@@ -586,19 +461,10 @@ Prize breakdown announced before match day. Give it your all! 🔥"
         "ai_response": resp,
         "confidence_score": 0.4 if routed else 0.9,
         "routed_to_human": routed,
-        "category": category
-    })      "routed_to_human": routed,
-        "category": "support"
+        "category": cat,
     })
 
 
-# ────────────────────────────────────────────────────────────────────────────
-# SLASH COMMANDS
-# ────────────────────────────────────────────────────────────────────────────
-
-@tree.command(name="create_tournament", description="🏆 Create and announce a new tournament", guild=discord.Object(id=GUILD_ID))
-@app_commands.describe(name="Tournament name", game="Game", prize_pool="Prize pool (e.g. $500 / NPR 5000)", date="Date (e.g. 2026-07-20)", format="Format", max_players="Max players", description="Short description (optional)")
-@app_commands.choices(game=[app_commands.Choice(name="Free Fire", value="Free Fire"), app_commands.Choice(name="Minecraft", value="Minecraft")])
 @app_commands.choices(format=[app_commands.Choice(name="Single Elimination", value="single_elim"), app_commands.Choice(name="Double Elimination", value="double_elim"), app_commands.Choice(name="Round Robin", value="round_robin")])
 async def cmd_create_tournament(interaction: discord.Interaction, name: str, game: str, prize_pool: str, date: str, format: str = "single_elim", max_players: int = 16, description: str = ""):
     if not is_staff(interaction.user):
