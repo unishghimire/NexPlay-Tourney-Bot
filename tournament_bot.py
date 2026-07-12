@@ -93,7 +93,9 @@ def image_url(tournament_name: str, game: str, image_type: str, extra: str = "")
         "champion": f'Champion victory "{extra}" wins "{tournament_name}" {game}, golden trophy, confetti, epic cinematic',
     }
     prompt = prompts.get(image_type, f'Professional esports graphic "{tournament_name}" {game}')
-    return f"https://image.pollinations.ai/prompt/{prompt.replace(' ', '%20').replace(',','%2C').replace('\"','%22')}?width=1280&height=640&nologo=true&seed={int(datetime.now().timestamp())}&model=flux"
+    encoded = prompt.replace(" ", "%20").replace(",", "%2C").replace('"', "%22")
+    seed = int(datetime.now().timestamp())
+    return f"https://image.pollinations.ai/prompt/{encoded}?width=1280&height=640&nologo=true&seed={seed}&model=flux"
 
 def is_staff(member: discord.Member) -> bool:
     return any(r.name in STAFF_ROLES for r in member.roles)
