@@ -6,15 +6,15 @@
 __pycache__/
 *.pyc
 *.pyo
-*.pyd
-*.egg-info/
-dist/
-build/
 
 # Logs
 *.log
-/tmp/
 
 # OS
 .DS_Store
 Thumbs.db
+
+# Not needed in public repo
+entities/
+functions/
+assign_roles.py
