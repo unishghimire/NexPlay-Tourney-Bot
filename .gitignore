@@ -1,7 +1,20 @@
+# Secrets — never commit these
 .env
 .agents/
+
+# Python
 __pycache__/
 *.pyc
 *.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+
+# Logs
 *.log
+/tmp/
+
+# OS
 .DS_Store
+Thumbs.db

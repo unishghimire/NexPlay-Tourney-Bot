@@ -1,13 +1,25 @@
 #!/bin/bash
-# NexPlay Tournament Bot — Auto-restart wrapper
-source /app/.agents/.env
+# NexPlay Tournament Bot — Auto-restart production runner
+# Keeps the bot online indefinitely. Any crash restarts in 5 seconds.
 
-echo "[$(date)] Starting NexPlay Tournament Bot..."
+set -e
+cd "$(dirname "$0")"
+
+# Load secrets
+if [ -f .agents/.env ]; then
+    source .agents/.env
+elif [ -f .env ]; then
+    source .env
+fi
+
+echo "[$(date)] ═══════════════════════════════════"
+echo "[$(date)] NexPlay Tournament Bot — STARTING"
+echo "[$(date)] ═══════════════════════════════════"
 
 while true; do
-    echo "[$(date)] Bot starting..."
-    python3 /app/tournament_bot.py >> /tmp/nexplay_bot.log 2>&1
-    EXIT_CODE=$?
-    echo "[$(date)] Bot exited with code $EXIT_CODE. Restarting in 5s..."
+    echo "[$(date)] Bot process starting..."
+    python3 -u tournament_bot.py >> /tmp/nexplay_bot.log 2>&1
+    EXIT=$?
+    echo "[$(date)] Bot exited (code $EXIT). Restarting in 5s..." >> /tmp/nexplay_bot.log
     sleep 5
 done
