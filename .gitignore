@@ -1,20 +1,23 @@
-# Secrets — never commit these
-.env
-.agents/
-
 # Python
 __pycache__/
-*.pyc
+*.py[cod]
 *.pyo
-
-# Logs
+.env
+.env.local
 *.log
+venv/
+.venv/
 
-# OS
-.DS_Store
-Thumbs.db
-
-# Not needed in public repo
-entities/
-functions/
-assign_roles.py
+# Node/frontend — should NEVER be in this repo
+node_modules/
+dist/
+src/
+*.jsx
+*.tsx
+*.css
+index.html
+vite.config.*
+tailwind.config.*
+postcss.config.*
+package.json
+package-lock.json
