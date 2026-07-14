@@ -548,18 +548,29 @@ async def on_message(message: discord.Message):
     #     announcements, roadmap, groups, results, info, help, or private channels)
     #  2. Never fires in DMs or any tournament-specific channel
     #  3. If no staff responds within STAFF_RESPONSE_TIMEOUT, escalate to #staff-log
+    # Channels where bot should NEVER respond
     BLOCKED_SUFFIXES = (
         "-register", "-announcements", "-roadmap", "-results",
         "-groups", "-confirm-teams", "-info", "-help",
     )
-    CHAT_NAMES = ("general", "💬│general", "chat", "talk", "lounge",
-                  "ff-general", "mc-general", "tourney-chat", "community")
+    BLOCKED_EXACT = (
+        "staff-log", "mod-log", "admin-log", "staff", "moderators",
+        "bot-log", "audit-log",
+    )
 
     ch_name_lower = message.channel.name.lower()
-    is_blocked    = any(ch_name_lower.endswith(s) for s in BLOCKED_SUFFIXES)
-    is_chat       = any(c in ch_name_lower for c in CHAT_NAMES)
 
-    if is_chat and not is_blocked and len(message.content.strip()) > 3:
+    # Block tournament-specific channels
+    is_blocked = (
+        any(ch_name_lower.endswith(s) for s in BLOCKED_SUFFIXES)
+        or any(ch_name_lower == s for s in BLOCKED_EXACT)
+        or isinstance(message.channel, discord.DMChannel)
+    )
+
+    # Allow ALL public text channels except blocked ones
+    is_public_text = isinstance(message.channel, discord.TextChannel)
+
+    if is_public_text and not is_blocked and len(message.content.strip()) > 3:
         await handle_support(message)
         return
 
@@ -756,6 +767,54 @@ async def on_message(message: discord.Message):
 # ══════════════════════════════════════════════════════════
 
 # ── /setup ────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════
+#  /clearlog — Staff command to clear a user support lock
+# ══════════════════════════════════════════════════════════
+@tree.command(name="clearlog", description="[Staff] Clear a user support lock so they can ask again")
+@app_commands.describe(user="The user whose support lock to clear")
+async def clearlog(interaction: discord.Interaction, user: discord.Member):
+    if not has_tournament_role(interaction.user):
+        await interaction.response.send_message(
+            "❌ You need the **Tournament Host** role to use this command.", ephemeral=True
+        )
+        return
+
+    gid = str(interaction.guild.id)
+    uid = str(user.id)
+    guild_locks = _replied_users.get(gid, {})
+
+    if uid not in guild_locks:
+        await interaction.response.send_message(
+            f"✅ {user.mention} has no active support lock — they can already ask freely.",
+            ephemeral=True
+        )
+        return
+
+    rec_id = guild_locks.pop(uid, None)
+    if rec_id:
+        try:
+            await b44_update('SupportMessage', rec_id, {'status': 'resolved'})
+        except Exception:
+            pass
+
+    embed = discord.Embed(
+        title="🔓 Support Lock Cleared",
+        description=f"{user.mention} support lock has been cleared. They can now ask the bot again.",
+        color=0x00FF00
+    )
+    embed.set_footer(text=f"Cleared by {interaction.user.display_name}")
+    await interaction.response.send_message(embed=embed)
+
+    try:
+        notify = discord.Embed(
+            description=f"Hey {user.mention}, a staff member has cleared your support session. Feel free to ask anything! 😊",
+            color=0x00FF00
+        )
+        await interaction.channel.send(embed=notify)
+    except Exception:
+        pass
+
+
 @tree.command(name="setup", description="Initialize NexPlay in this server (server owner only)")
 async def cmd_setup(interaction: discord.Interaction):
     if interaction.user.id != interaction.guild.owner_id and not is_staff(interaction.user):
