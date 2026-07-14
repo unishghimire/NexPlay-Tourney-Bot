@@ -42,6 +42,11 @@ from discord import app_commands
 import aiohttp
 import os
 import asyncio
+import io
+import csv
+import openpyxl
+from openpyxl.styles import Font, PatternFill, Alignment
+from openpyxl.utils import get_column_letter
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 
@@ -98,6 +103,29 @@ class NexPlayBot(commands.Bot):
         # GLOBAL sync — commands appear in every server
         await self.tree.sync()
         print("[NexPlay] Global slash commands synced.")
+        # Start daily log scheduler
+        asyncio.create_task(self._daily_log_scheduler())
+
+    async def _daily_log_scheduler(self):
+        """Send daily Excel log at midnight (00:00 NPT = 18:15 UTC prev day).
+           We target 00:00 NPT = UTC 18:15 = offset -5h45m from NPT.
+           We compute seconds until next 18:15 UTC and sleep until then.
+        """
+        print("[NexPlay] Daily log scheduler started.", flush=True)
+        while True:
+            try:
+                now_utc = datetime.now(timezone.utc)
+                # Target: 18:15 UTC daily (= midnight NPT)
+                target = now_utc.replace(hour=18, minute=15, second=0, microsecond=0)
+                if now_utc >= target:
+                    target = target.replace(day=target.day + 1)
+                wait_secs = (target - now_utc).total_seconds()
+                print(f"[NexPlay] Daily log fires in {wait_secs/3600:.1f}h", flush=True)
+                await asyncio.sleep(wait_secs)
+                await send_daily_logs(self)
+            except Exception as e:
+                print(f"[NexPlay] Daily log scheduler error: {e}", flush=True)
+                await asyncio.sleep(3600)  # Retry in 1h on error
 
     async def close(self):
         if self.http_session:
@@ -372,6 +400,328 @@ def build_server_context(guild: discord.Guild, active_tournament: dict | None) -
 
     return ctx
 
+# ══════════════════════════════════════════════════════════
+#  EXCEL LOG BUILDER
+# ══════════════════════════════════════════════════════════
+def _xl_header_style(cell, bg="1F4E79"):
+    cell.font      = Font(bold=True, color="FFFFFF", size=10)
+    cell.fill      = PatternFill("solid", fgColor=bg)
+    cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+def _xl_border(cell):
+    thin = {"border_style": "thin", "color": "AAAAAA"}
+    from openpyxl.styles import Border, Side
+    cell.border = Border(
+        left=Side(**thin), right=Side(**thin),
+        top=Side(**thin), bottom=Side(**thin)
+    )
+
+async def build_daily_excel(guild: discord.Guild) -> io.BytesIO:
+    """Build a full-day Excel report for one guild."""
+    wb = openpyxl.Workbook()
+    gid = str(guild.id)
+    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    # ── Sheet 1: TOURNAMENTS ────────────────────────────────────────────
+    ws_t = wb.active
+    ws_t.title = "Tournaments"
+    t_headers = ["ID", "Name", "Game", "Status", "Slots", "Registered",
+                 "Prize Pool", "Date", "Time", "Format", "Created"]
+    for ci, h in enumerate(t_headers, 1):
+        c = ws_t.cell(row=1, column=ci, value=h)
+        _xl_header_style(c)
+        _xl_border(c)
+    ws_t.row_dimensions[1].height = 20
+
+    tournaments = await b44_list("Tournament", {"guild_id": gid})
+    for ri, t in enumerate(tournaments, 2):
+        row = [
+            t.get("id","")[:8], t.get("name",""), t.get("game",""),
+            t.get("status",""), t.get("max_players",""), t.get("registered_count",0),
+            t.get("prize_pool",""), t.get("tournament_date",""),
+            t.get("tournament_time",""), t.get("format",""),
+            t.get("created_date","")[:10] if t.get("created_date") else ""
+        ]
+        for ci, val in enumerate(row, 1):
+            c = ws_t.cell(row=ri, column=ci, value=str(val))
+            _xl_border(c)
+            c.alignment = Alignment(vertical="center")
+        # Color by status
+        status_colors = {
+            "registration_open": "C6EFCE", "registration_closed": "FFEB9C",
+            "groups_generated": "BDD7EE", "scheduled": "FCE4D6",
+            "completed": "E2EFDA", "deleted": "DDDDDD"
+        }
+        sc = status_colors.get(t.get("status",""), "FFFFFF")
+        ws_t.cell(row=ri, column=4).fill = PatternFill("solid", fgColor=sc)
+
+    for ci in range(1, len(t_headers)+1):
+        ws_t.column_dimensions[get_column_letter(ci)].width = [8,25,14,18,6,10,12,12,12,16,12][ci-1]
+
+    # ── Sheet 2: REGISTRATIONS ─────────────────────────────────────────
+    ws_r = wb.create_sheet("Registrations")
+    r_headers = ["Team Name", "Tournament", "Players", "Discord User",
+                 "Registered At", "Group", "Status", "Slot #"]
+    for ci, h in enumerate(r_headers, 1):
+        c = ws_r.cell(row=1, column=ci, value=h)
+        _xl_header_style(c, "375623")
+        _xl_border(c)
+    ws_r.row_dimensions[1].height = 20
+
+    all_regs = await b44_list("Registration", {"guild_id": gid})
+    t_map = {t["id"]: t.get("name","?") for t in tournaments}
+    for ri, r in enumerate(all_regs, 2):
+        row = [
+            r.get("player_name",""), t_map.get(r.get("tournament_id",""),"?"),
+            r.get("player_username",""), r.get("player_discord_tag",""),
+            r.get("registered_at","")[:16] if r.get("registered_at") else "",
+            r.get("group_label","—"), r.get("status","registered"), r.get("seed_number","")
+        ]
+        for ci, val in enumerate(row, 1):
+            c = ws_r.cell(row=ri, column=ci, value=str(val))
+            _xl_border(c)
+            c.alignment = Alignment(vertical="center")
+
+    for ci, w in enumerate([18,22,30,18,16,8,12,7], 1):
+        ws_r.column_dimensions[get_column_letter(ci)].width = w
+
+    # ── Sheet 3: SUPPORT LOG ───────────────────────────────────────────
+    ws_s = wb.create_sheet("Support Log")
+    s_headers = ["ID", "Message", "Status", "Created"]
+    for ci, h in enumerate(s_headers, 1):
+        c = ws_s.cell(row=1, column=ci, value=h)
+        _xl_header_style(c, "843C0C")
+        _xl_border(c)
+
+    support_msgs = await b44_list("SupportMessage", {"guild_id": gid})
+    for ri, sm in enumerate(support_msgs, 2):
+        row = [
+            sm.get("id","")[:8], sm.get("message","")[:200],
+            sm.get("status",""), sm.get("created_date","")[:16] if sm.get("created_date") else ""
+        ]
+        for ci, val in enumerate(row, 1):
+            c = ws_s.cell(row=ri, column=ci, value=str(val))
+            _xl_border(c)
+            c.alignment = Alignment(vertical="center", wrap_text=(ci==2))
+        # Color by status
+        status_colors2 = {"resolved": "C6EFCE", "pending": "FFEB9C",
+                          "escalated": "FCE4D6", "dismissed": "DDDDDD", "saved": "BDD7EE"}
+        sc = status_colors2.get(sm.get("status",""), "FFFFFF")
+        ws_s.cell(row=ri, column=3).fill = PatternFill("solid", fgColor=sc)
+
+    for ci, w in enumerate([8, 60, 12, 16], 1):
+        ws_s.column_dimensions[get_column_letter(ci)].width = w
+    ws_s.row_dimensions[1].height = 20
+
+    # ── Sheet 4: MATCH RESULTS ─────────────────────────────────────────
+    ws_m = wb.create_sheet("Match Results")
+    m_headers = ["Tournament", "Round", "Player 1", "Player 2", "Winner", "Score", "Status"]
+    for ci, h in enumerate(m_headers, 1):
+        c = ws_m.cell(row=1, column=ci, value=h)
+        _xl_header_style(c, "4472C4")
+        _xl_border(c)
+
+    matches = await b44_list("Match", {"guild_id": gid})
+    for ri, m in enumerate(matches, 2):
+        row = [
+            t_map.get(m.get("tournament_id",""),"?"), m.get("round_number",""),
+            m.get("player1_username",""), m.get("player2_username",""),
+            m.get("winner_username",""), 
+            str(m.get("player1_score","")) + "-" + str(m.get("player2_score","")) if m.get("player1_score") else "N/A",
+            m.get("status","")
+        ]
+        for ci, val in enumerate(row, 1):
+            c = ws_m.cell(row=ri, column=ci, value=str(val))
+            _xl_border(c)
+
+    for ci, w in enumerate([22,7,18,18,18,8,12], 1):
+        ws_m.column_dimensions[get_column_letter(ci)].width = w
+
+    # ── Sheet 5: SUMMARY ──────────────────────────────────────────────
+    ws_sum = wb.create_sheet("Summary")
+    ws_sum["A1"] = f"NexPlay Daily Report — {guild.name}"
+    ws_sum["A1"].font = Font(bold=True, size=14, color="1F4E79")
+    ws_sum["A2"] = f"Generated: {today_str} (12:00 AM NPT)"
+    ws_sum["A2"].font = Font(italic=True, size=10, color="666666")
+    ws_sum.merge_cells("A1:D1")
+    ws_sum.merge_cells("A2:D2")
+
+    stats = [
+        ("", ""),
+        ("📊 SUMMARY", ""),
+        ("Total Tournaments", len(tournaments)),
+        ("Active Tournaments", len([t for t in tournaments if t.get("status") not in ("completed","deleted")])),
+        ("Total Registrations", len(all_regs)),
+        ("Support Messages Today", len(support_msgs)),
+        ("Pending Support",       len([s for s in support_msgs if s.get("status") == "pending"])),
+        ("Resolved Support",      len([s for s in support_msgs if s.get("status") == "resolved"])),
+        ("Total Matches Played",  len(matches)),
+    ]
+    for ri, (k, v) in enumerate(stats, 3):
+        ws_sum.cell(row=ri, column=1, value=k).font = Font(bold=(k.startswith("📊")), size=11)
+        ws_sum.cell(row=ri, column=2, value=v)
+    ws_sum.column_dimensions["A"].width = 28
+    ws_sum.column_dimensions["B"].width = 15
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf
+
+
+async def send_daily_logs(bot_instance: "NexPlayBot"):
+    """Send daily Excel report to server owners + NexPlay admin."""
+    print("[NexPlay] Sending daily logs...", flush=True)
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    servers = await b44_list("Server")
+    for srv in servers:
+        gid = srv.get("guild_id","")
+        owner_id = srv.get("owner_id","")
+        guild = bot_instance.get_guild(int(gid)) if gid else None
+        if not guild or not owner_id:
+            continue
+        try:
+            xl_buf = await build_daily_excel(guild)
+            owner = await bot_instance.fetch_user(int(owner_id))
+            if owner:
+                dm = await owner.create_dm()
+                file = discord.File(xl_buf, filename=f"NexPlay_DailyLog_{guild.name}_{today}.xlsx")
+                summary_e = discord.Embed(
+                    title=f"📊 NexPlay Daily Report — {guild.name}",
+                    description=(
+                        f"Your daily server report for **{today}** is attached!\n\n"
+                        f"The Excel file contains:\n"
+                        f"• 🏆 All Tournaments & their status\n"
+                        f"• 👥 All Team Registrations\n"
+                        f"• 💬 Support Message Log\n"
+                        f"• ⚔️ Match Results\n"
+                        f"• 📈 Summary Stats\n\n"
+                        f"*Sent automatically every day at 12:00 AM NPT by NexPlay Bot*"
+                    ),
+                    color=0x1F4E79, timestamp=datetime.now(timezone.utc)
+                )
+                summary_e.set_footer(text="NexPlay Tournament System")
+                await dm.send(embed=summary_e, file=file)
+                print(f"[NexPlay] Daily log sent to {owner} for {guild.name}", flush=True)
+        except Exception as e:
+            print(f"[NexPlay] Daily log error for {gid}: {e}", flush=True)
+
+
+
+# ══════════════════════════════════════════════════════════
+#  STAFF LOG BUTTON VIEW
+# ══════════════════════════════════════════════════════════
+class StaffLogView(discord.ui.View):
+    """Persistent button panel on staff-log messages."""
+
+    def __init__(self, uid: str, rec_id: str, guild_locks: dict,
+                 user: discord.Member, user_channel: discord.TextChannel):
+        super().__init__(timeout=None)  # No timeout — stays until resolved
+        self.uid          = uid
+        self.rec_id       = rec_id
+        self.guild_locks  = guild_locks
+        self.user         = user
+        self.user_channel = user_channel
+        self.message      = None
+        self._status      = "pending"   # pending | resolved | saved | unsaved
+
+    # ── ✅ RESOLVE ────────────────────────────────────────────────────────
+    @discord.ui.button(label="✅ Resolve", style=discord.ButtonStyle.success, custom_id="staff_resolve")
+    async def btn_resolve(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_staff(interaction.user):
+            return await interaction.response.send_message("❌ Staff only.", ephemeral=True)
+        self._status = "resolved"
+        self.guild_locks.pop(self.uid, None)
+        if self.rec_id:
+            await b44_update("SupportMessage", self.rec_id, {"status": "resolved"})
+        await self._update_embed(interaction, "✅ RESOLVED", 0x00FF00,
+                                  f"Resolved by {interaction.user.display_name}")
+        # Notify user
+        try:
+            notify = discord.Embed(
+                description=f"Hey {self.user.mention}, a staff member resolved your query! Feel free to ask again. 😊",
+                color=0x00FF00
+            )
+            await self.user_channel.send(embed=notify)
+        except Exception:
+            pass
+        await interaction.response.send_message("✅ Resolved & user lock cleared.", ephemeral=True)
+
+    # ── 💾 SAVE / UNSAVE TOGGLE ───────────────────────────────────────────
+    @discord.ui.button(label="💾 Save", style=discord.ButtonStyle.secondary, custom_id="staff_save")
+    async def btn_save(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_staff(interaction.user):
+            return await interaction.response.send_message("❌ Staff only.", ephemeral=True)
+        if self._status == "saved":
+            # Unsave
+            self._status = "pending"
+            if self.rec_id:
+                await b44_update("SupportMessage", self.rec_id, {"status": "pending"})
+            button.label = "💾 Save"
+            button.style = discord.ButtonStyle.secondary
+            await interaction.response.edit_message(view=self)
+            await interaction.followup.send("📌 Log unsaved.", ephemeral=True)
+        else:
+            # Save
+            self._status = "saved"
+            if self.rec_id:
+                await b44_update("SupportMessage", self.rec_id, {"status": "saved"})
+            button.label = "📌 Saved"
+            button.style = discord.ButtonStyle.primary
+            await interaction.response.edit_message(view=self)
+            await interaction.followup.send("💾 Log saved for records.", ephemeral=True)
+
+    # ── 🔔 ESCALATE ───────────────────────────────────────────────────────
+    @discord.ui.button(label="🔔 Escalate", style=discord.ButtonStyle.danger, custom_id="staff_escalate")
+    async def btn_escalate(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_staff(interaction.user):
+            return await interaction.response.send_message("❌ Staff only.", ephemeral=True)
+        if self.rec_id:
+            await b44_update("SupportMessage", self.rec_id, {"status": "escalated"})
+        self._status = "escalated"
+        await self._update_embed(interaction, "🚨 ESCALATED", 0xFF6600,
+                                  f"Escalated by {interaction.user.display_name}")
+        await interaction.response.send_message(
+            f"🚨 Escalated! <@&{interaction.guild.id}> please review.", ephemeral=True
+        )
+
+    # ── 🗑️ DISMISS ────────────────────────────────────────────────────────
+    @discord.ui.button(label="🗑️ Dismiss", style=discord.ButtonStyle.secondary, custom_id="staff_dismiss")
+    async def btn_dismiss(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_staff(interaction.user):
+            return await interaction.response.send_message("❌ Staff only.", ephemeral=True)
+        self.guild_locks.pop(self.uid, None)
+        if self.rec_id:
+            await b44_update("SupportMessage", self.rec_id, {"status": "dismissed"})
+        await self._update_embed(interaction, "🗑️ DISMISSED", 0x555555,
+                                  f"Dismissed by {interaction.user.display_name}")
+        self.stop()
+        await interaction.response.send_message("🗑️ Dismissed & lock cleared.", ephemeral=True)
+
+    async def _update_embed(self, interaction: discord.Interaction,
+                             new_title: str, color: int, footer_note: str):
+        """Rebuild embed with new status and disable all buttons."""
+        if self.message:
+            try:
+                old = self.message.embeds[0] if self.message.embeds else None
+                if old:
+                    new_e = discord.Embed(
+                        title=new_title,
+                        description=old.description,
+                        color=color,
+                        timestamp=datetime.now(timezone.utc)
+                    )
+                    for field in old.fields:
+                        new_e.add_field(name=field.name, value=field.value, inline=field.inline)
+                    new_e.set_footer(text=footer_note)
+                    # Disable all buttons
+                    for child in self.children:
+                        child.disabled = True
+                    await self.message.edit(embed=new_e, view=self)
+            except Exception as e:
+                print(f"[StaffLogView] embed update error: {e}")
+
+
 async def handle_support(message: discord.Message) -> None:
     gid = str(message.guild.id)
     uid = str(message.author.id)
@@ -488,40 +838,15 @@ INSTRUCTIONS:
     staff_embed.set_footer(text=f"User ID: {uid} | DB Record: {rec_id}")
 
     try:
-        log_msg = await ch_staff.send(embed=staff_embed)
-
-        # ── Watch for staff ✅ reaction to clear the user lock ─────────────
-        async def wait_for_staff_clear():
-            def check(rxn, usr):
-                return (
-                    str(rxn.emoji) == '✅'
-                    and rxn.message.id == log_msg.id
-                    and not usr.bot
-                )
-            try:
-                await bot.wait_for('reaction_add', check=check, timeout=86400)  # 24h timeout
-                # Staff reacted — clear the lock
-                guild_locks.pop(uid, None)
-                if rec_id:
-                    await b44_update('SupportMessage', rec_id, {'status': 'resolved'})
-                # Edit staff embed to show resolved
-                resolved_embed = staff_embed.copy()
-                resolved_embed.title = '✅ RESOLVED BY STAFF'
-                resolved_embed.color = 0x00FF00
-                await log_msg.edit(embed=resolved_embed)
-                # Notify user in original channel
-                try:
-                    notify = discord.Embed(
-                        description=f"Hey {message.author.mention}, a staff member has looked into your query! Feel free to ask if you need anything else. 😊",
-                        color=0x00FF00
-                    )
-                    await message.channel.send(embed=notify)
-                except Exception:
-                    pass
-            except asyncio.TimeoutError:
-                guild_locks.pop(uid, None)  # Auto-clear after 24h
-
-        asyncio.create_task(wait_for_staff_clear())
+        view = StaffLogView(
+            uid=uid,
+            rec_id=rec_id,
+            guild_locks=guild_locks,
+            user=message.author,
+            user_channel=message.channel,
+        )
+        log_msg = await ch_staff.send(embed=staff_embed, view=view)
+        view.message = log_msg
 
     except Exception as e:
         print(f"[Support] staff-log error: {e}", flush=True)
@@ -530,7 +855,7 @@ INSTRUCTIONS:
     if needs_staff:
         try:
             await ch_staff.send(
-                f"@here 🔴 **{message.author.display_name}** needs help in {message.channel.mention} — please reply and react ✅ above to clear their lock."
+                f"@here 🔴 **{message.author.display_name}** needs help in {message.channel.mention} — please review above."
             )
         except Exception:
             pass
@@ -2055,6 +2380,277 @@ async def cmd_manage(interaction: discord.Interaction, tournament_name: str):
     embed = build_manage_embed(t)
     view  = ManagementView(t)
     await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+
+
+# ══════════════════════════════════════════════════════════
+#  /send_daily_log  — Manual trigger (admin only)
+# ══════════════════════════════════════════════════════════
+@tree.command(name="send_daily_log", description="[Admin] Manually send today's Excel report to your DM")
+async def cmd_send_daily_log(interaction: discord.Interaction):
+    if not is_staff(interaction.user):
+        return await interaction.response.send_message(embed=err_e("Staff only!"), ephemeral=True)
+    await interaction.response.defer(thinking=True, ephemeral=True)
+    gid = str(interaction.guild.id)
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    try:
+        xl_buf = await build_daily_excel(interaction.guild)
+        file = discord.File(xl_buf, filename=f"NexPlay_Log_{interaction.guild.name}_{today}.xlsx")
+        dm = await interaction.user.create_dm()
+        summary_e = discord.Embed(
+            title=f"📊 NexPlay Daily Report — {interaction.guild.name}",
+            description=(
+                f"Manual export for **{today}**\n\n"
+                f"**Sheets included:**\n"
+                f"• 🏆 Tournaments\n"
+                f"• 👥 Registrations\n"
+                f"• 💬 Support Log\n"
+                f"• ⚔️ Match Results\n"
+                f"• 📈 Summary"
+            ),
+            color=0x1F4E79, timestamp=datetime.now(timezone.utc)
+        )
+        summary_e.set_footer(text="NexPlay Tournament System")
+        await dm.send(embed=summary_e, file=file)
+        await interaction.followup.send(embed=ok_e("Report Sent! 📊", f"Excel report sent to your DM!"), ephemeral=True)
+    except Exception as e:
+        await interaction.followup.send(embed=err_e(f"Failed to generate report: {e}"), ephemeral=True)
+
+
+# ══════════════════════════════════════════════════════════
+#  /download_registrations — Download tournament register sheet
+# ══════════════════════════════════════════════════════════
+@tree.command(name="download_registrations", description="Download tournament registrations as Excel sheet")
+@app_commands.describe(tournament_name="Tournament name to export")
+async def cmd_download_regs(interaction: discord.Interaction, tournament_name: str):
+    if not is_staff(interaction.user):
+        return await interaction.response.send_message(embed=err_e("Staff only!"), ephemeral=True)
+    await interaction.response.defer(thinking=True, ephemeral=True)
+    gid = str(interaction.guild.id)
+
+    ts = await b44_list("Tournament", {"guild_id": gid, "name": tournament_name})
+    if not ts:
+        all_t = await b44_list("Tournament", {"guild_id": gid})
+        fuzzy = [t for t in all_t if tournament_name.lower() in t.get("name","").lower()]
+        if not fuzzy:
+            return await interaction.followup.send(embed=err_e(f'No tournament named "{tournament_name}" found.'), ephemeral=True)
+        ts = fuzzy
+    t = ts[0]
+
+    regs = await b44_list("Registration", {"tournament_id": t["id"]})
+    if not regs:
+        return await interaction.followup.send(embed=err_e("No registrations found yet."), ephemeral=True)
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Registrations"
+
+    # Header row
+    headers = ["#", "Team Name", "Player 1", "Player 2", "Player 3", "Player 4",
+               "All Players", "Discord User", "Registered At", "Group", "Status"]
+    for ci, h in enumerate(headers, 1):
+        c = ws.cell(row=1, column=ci, value=h)
+        _xl_header_style(c, "1F4E79")
+        _xl_border(c)
+    ws.row_dimensions[1].height = 22
+
+    # Title row above headers
+    ws.insert_rows(1)
+    title_cell = ws.cell(row=1, column=1,
+                         value=f"NexPlay — {t.get('name','')} | Registration Sheet | {t.get('game','')} | Prize: {t.get('prize_pool','')} | Date: {t.get('tournament_date','')}")
+    title_cell.font = Font(bold=True, size=12, color="1F4E79")
+    title_cell.fill = PatternFill("solid", fgColor="BDD7EE")
+    ws.merge_cells(f"A1:{get_column_letter(len(headers))}1")
+    ws.row_dimensions[1].height = 24
+
+    team_size = int(t.get("team_size", 4))
+
+    for ri, r in enumerate(regs, 3):
+        all_players = r.get("player_username","")
+        player_list = [p.strip() for p in all_players.split(",") if p.strip()]
+        # Pad to 4 player columns
+        while len(player_list) < 4:
+            player_list.append("")
+
+        row_data = [
+            r.get("seed_number", ri-2),
+            r.get("player_name",""),
+            player_list[0] if len(player_list) > 0 else "",
+            player_list[1] if len(player_list) > 1 else "",
+            player_list[2] if len(player_list) > 2 else "",
+            player_list[3] if len(player_list) > 3 else "",
+            all_players,
+            r.get("player_discord_tag",""),
+            r.get("registered_at","")[:16] if r.get("registered_at") else "",
+            r.get("group_label","—"),
+            r.get("status","registered"),
+        ]
+        for ci, val in enumerate(row_data, 1):
+            c = ws.cell(row=ri, column=ci, value=str(val))
+            _xl_border(c)
+            c.alignment = Alignment(vertical="center")
+
+        # Alternating row color
+        if ri % 2 == 0:
+            for ci in range(1, len(headers)+1):
+                ws.cell(row=ri, column=ci).fill = PatternFill("solid", fgColor="F5F5F5")
+
+    # Column widths
+    for ci, w in enumerate([5,20,18,18,18,18,40,18,16,8,12], 1):
+        ws.column_dimensions[get_column_letter(ci)].width = w
+
+    # Summary at the bottom
+    end_row = len(regs) + 4
+    ws.cell(row=end_row, column=1, value=f"Total Teams: {len(regs)} / {t.get('max_players','?')}").font = Font(bold=True)
+    ws.cell(row=end_row+1, column=1, value=f"Status: {t.get('status','')}").font = Font(italic=True)
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+
+    safe_name = t.get("name","tournament").replace(" ","_")[:30]
+    file = discord.File(buf, filename=f"NexPlay_{safe_name}_Registrations.xlsx")
+    await interaction.followup.send(
+        embed=ok_e(
+            f"📥 Registration Sheet — {t.get('name','')}",
+            f"**{len(regs)}** teams exported!\n\nSheet includes:\n"
+            f"• Team names\n• All player in-game names (individual columns)\n"
+            f"• Discord tags\n• Registration time\n• Group assignments"
+        ),
+        file=file,
+        ephemeral=True
+    )
+
+
+# ══════════════════════════════════════════════════════════
+#  /import_registrations — Import teams from Excel/CSV
+# ══════════════════════════════════════════════════════════
+@tree.command(name="import_registrations", description="[Staff] Import team registrations from an Excel/CSV file")
+@app_commands.describe(
+    tournament_name="Tournament to import into",
+    attachment="Excel (.xlsx) or CSV file with columns: team_name, player1, player2, player3, player4"
+)
+async def cmd_import_regs(interaction: discord.Interaction, tournament_name: str, attachment: discord.Attachment):
+    if not is_staff(interaction.user):
+        return await interaction.response.send_message(embed=err_e("Staff only!"), ephemeral=True)
+    await interaction.response.defer(thinking=True, ephemeral=True)
+    gid = str(interaction.guild.id)
+
+    # Find tournament
+    ts = await b44_list("Tournament", {"guild_id": gid, "name": tournament_name})
+    if not ts:
+        all_t = await b44_list("Tournament", {"guild_id": gid})
+        fuzzy = [t for t in all_t if tournament_name.lower() in t.get("name","").lower()]
+        if not fuzzy:
+            return await interaction.followup.send(embed=err_e(f'No tournament named "{tournament_name}" found.'), ephemeral=True)
+        ts = fuzzy
+    t = ts[0]
+    tid = t["id"]
+
+    # Download file
+    file_bytes = await attachment.read()
+    filename   = attachment.filename.lower()
+
+    rows = []
+    try:
+        if filename.endswith(".xlsx") or filename.endswith(".xls"):
+            wb = openpyxl.load_workbook(io.BytesIO(file_bytes))
+            ws = wb.active
+            headers_row = [str(c.value or "").lower().strip() for c in ws[1]]
+            for row in ws.iter_rows(min_row=2, values_only=True):
+                if not any(row):
+                    continue
+                row_dict = {headers_row[i]: str(row[i] or "").strip() for i in range(len(headers_row))}
+                rows.append(row_dict)
+        elif filename.endswith(".csv"):
+            decoded = file_bytes.decode("utf-8-sig")
+            reader  = csv.DictReader(io.StringIO(decoded))
+            for row in reader:
+                rows.append({k.lower().strip(): v.strip() for k, v in row.items()})
+        else:
+            return await interaction.followup.send(embed=err_e("Only .xlsx or .csv files supported."), ephemeral=True)
+    except Exception as e:
+        return await interaction.followup.send(embed=err_e(f"Failed to read file: {e}"), ephemeral=True)
+
+    if not rows:
+        return await interaction.followup.send(embed=err_e("File is empty or has no valid rows."), ephemeral=True)
+
+    # Get existing registrations to find slot number
+    existing = await b44_list("Registration", {"tournament_id": tid})
+    slot = len(existing)
+    max_p = int(t.get("max_players", 16))
+
+    imported = 0
+    skipped  = 0
+    errors   = []
+
+    for row in rows:
+        # Try multiple column name variants
+        team_name = (row.get("team_name") or row.get("team") or row.get("name") or "").strip()
+        if not team_name:
+            skipped += 1
+            continue
+
+        # Check if already registered
+        already = [r for r in existing if r.get("player_name","").lower() == team_name.lower()]
+        if already:
+            skipped += 1
+            continue
+
+        if slot >= max_p:
+            errors.append(f"Slot limit reached ({max_p}) — stopped at {team_name}")
+            break
+
+        # Collect players from columns player1..player4 or p1..p4 or just players
+        players = []
+        for key in ["player1","player2","player3","player4","p1","p2","p3","p4"]:
+            v = row.get(key,"").strip()
+            if v:
+                players.append(v)
+        if not players:
+            # Try "players" column (comma-separated)
+            p_col = row.get("players") or row.get("ingame_names","")
+            players = [p.strip() for p in p_col.split(",") if p.strip()]
+
+        slot += 1
+        try:
+            await b44_create("Registration", {
+                "tournament_id": tid,
+                "guild_id": gid,
+                "player_name": team_name,
+                "player_discord_id": str(interaction.user.id),
+                "player_discord_tag": f"[IMPORTED by {interaction.user.display_name}]",
+                "player_username": ", ".join(players),
+                "registered_at": now_iso(),
+                "status": "registered",
+                "seed_number": slot,
+            })
+            existing.append({"player_name": team_name})  # prevent dupe in same file
+            imported += 1
+        except Exception as e:
+            errors.append(f"{team_name}: {e}")
+
+    await b44_update("Tournament", tid, {"registered_count": slot})
+
+    # Auto-lock if full
+    if slot >= max_p:
+        short = t.get("short_name","")
+        if short:
+            ch_reg = discord.utils.get(interaction.guild.text_channels, name=f"{short}-register")
+            if ch_reg:
+                await lock_register_channel(interaction.guild, ch_reg)
+
+    result_desc = (
+        f"**Imported:** {imported} teams\n"
+        f"**Skipped (duplicates/empty):** {skipped}\n"
+        f"**Slots used:** {slot}/{max_p}"
+    )
+    if errors:
+        result_desc += f"\n\n⚠️ **Errors:**\n" + "\n".join(errors[:5])
+
+    await interaction.followup.send(
+        embed=ok_e(f"📥 Import Complete — {t.get('name','')}", result_desc),
+        ephemeral=True
+    )
 
 
 @tree.command(name="help", description="Show all NexPlay bot commands")
