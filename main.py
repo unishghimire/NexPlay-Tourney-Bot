@@ -941,11 +941,15 @@ async def make_tournament_channels(guild: discord.Guild, tournament_name: str) -
 
 @tree.command(name="create_tournament", description="Create and announce a new tournament")
 @app_commands.describe(
-    name="Tournament name", game="Game",
-    prize_pool="Prize pool e.g. NPR 5000", date="Date e.g. 2026-08-01",
+    name="Tournament name (e.g. NexPlay Cup 2026)",
+    game="Select the game",
+    max_players="Total slots / max teams (e.g. 16)",
+    group_size="Teams per group (e.g. 4)",
+    team_size="Players per team (e.g. 4 for squads)",
+    prize_pool="Prize pool e.g. NPR 5000",
+    date="Match date e.g. 2026-08-01",
     time="Match time e.g. 5:00 PM NPT",
-    fmt="Match format", max_players="Max teams (default 16)",
-    team_size="Players per team (default 4)",
+    fmt="Match format",
     description="Short description (optional)"
 )
 @app_commands.choices(game=[
@@ -963,9 +967,16 @@ async def make_tournament_channels(guild: discord.Guild, tournament_name: str) -
 ])
 async def cmd_create(
     interaction: discord.Interaction,
-    name: str, game: str, prize_pool: str, date: str,
-    time: str = "TBD", fmt: str = "single_elim",
-    max_players: int = 16, team_size: int = 4, description: str = ""
+    name: str,
+    game: str,
+    max_players: int,
+    group_size: int,
+    team_size: int,
+    prize_pool: str,
+    date: str,
+    time: str = "TBD",
+    fmt: str = "single_elim",
+    description: str = ""
 ):
     if not is_staff(interaction.user):
         return await interaction.response.send_message(embed=err_e("You need Tournament Host or higher!"), ephemeral=True)
@@ -997,7 +1008,7 @@ async def cmd_create(
         "guild_id": gid, "name": name, "game": game, "format": fmt,
         "prize_pool": prize_pool, "description": description,
         "status": "registration_open", "max_players": max_players,
-        "team_size": team_size,
+        "team_size": team_size, "group_size": group_size,
         "registered_count": 0, "tournament_date": date,
         "tournament_time": time,
         "poster_image_url": poster, "roadmap_image_url": roadmap,
@@ -1073,18 +1084,30 @@ async def cmd_create(
 
     # ── 4. #register — registration instructions ─────────────────────────────
     if ch_reg_id:
+        player_lines = "\n".join([f"Player {i+1}: @mention" for i in range(int(team_size))])
         reg_e = discord.Embed(
             title="✍️ Registration OPEN — " + name,
             description=(
-                "**Slots:** " + str(max_players) + " players\n"
-                "**Game:** " + game + " | **Prize:** " + prize_pool + "\n\n"
-                "**How to register:**\n"
-                "> Use `/register` and enter your in-game name\n\n"
-                "After registering, go to <#" + str(ch_cfm_id) + "> to confirm your team."
+                "**Game:** " + game + " | **Prize:** " + prize_pool + "\n"
+                "**Date:** " + date + " | **Time:** " + time + "\n"
+                "**Total Slots:** " + str(max_players) + " teams"
+                " | **Teams per Group:** " + str(group_size) + "\n"
+                "**Team Size:** " + str(team_size) + " players per team\n\n"
+                "**📝 How to Register — send a message in THIS channel:**\n"
+                "```\n"
+                "Team Name: <your team name>\n"
+                + player_lines + "\n"
+                "```\n"
+                "⚠️ **Rules:**\n"
+                "> ✅ All player mentions must be valid Discord tags\n"
+                "> ✅ Exactly " + str(team_size) + " players required\n"
+                "> ❌ Duplicate registrations will be rejected\n"
+                "> ❌ Channel locks when all " + str(max_players) + " slots are filled\n\n"
+                "After slots fill, confirm your team in <#" + str(ch_cfm_id) + ">"
             ),
             color=0x00FF7F, timestamp=datetime.now(timezone.utc)
         )
-        reg_e.set_footer(text="NexPlay | Use /register to join")
+        reg_e.set_footer(text="NexPlay | Type your team info above to register")
         await dpost(ch_reg_id, reg_e)
 
     # ── 5. #confirm-teams — confirmation instructions ─────────────────────────
