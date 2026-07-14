@@ -2208,7 +2208,7 @@ async def cmd_help(interaction: discord.Interaction):
 
 
 # ══════════════════════════════════════════════════════════
-#  HEALTH-CHECK HTTP SERVER (required for Render Web Service / port check)
+#  HEALTH-CHECK HTTP SERVER (required for Render Web Service)
 # ══════════════════════════════════════════════════════════
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -2219,13 +2219,13 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "text/plain")
         self.end_headers()
         self.wfile.write(b"NexPlay bot is running.")
-    def log_message(self, format, *args):
-        pass  # suppress request logs
+    def log_message(self, fmt, *args):
+        pass  # suppress access logs
 
 def run_health_server():
     port = int(os.environ.get("PORT", 8080))
     server = HTTPServer(("0.0.0.0", port), HealthHandler)
-    print(f"[NexPlay] Health server listening on port {port}")
+    print(f"[NexPlay] Health server bound to 0.0.0.0:{port}", flush=True)
     server.serve_forever()
 
 # ══════════════════════════════════════════════════════════
@@ -2238,16 +2238,26 @@ if __name__ == "__main__":
     if not SVC_TOKEN:
         missing.append("BASE44_SERVICE_TOKEN")
     if missing:
-        print("[NexPlay] ══════════════════════════════════════════")
-        print("[NexPlay] STARTUP FAILED — missing environment vars:")
+        print("[NexPlay] STARTUP FAILED — missing env vars:", flush=True)
         for m in missing:
-            print("[NexPlay]   ✗ " + m + " is not set")
-        print("[NexPlay] Set these in Render → Environment → Add Env Var")
-        print("[NexPlay] ══════════════════════════════════════════")
+            print(f"[NexPlay]   ✗ {m} is not set", flush=True)
         raise SystemExit(1)
-    print("[NexPlay] All environment variables verified.")
-    print("[NexPlay] Guild ID: " + str(HOME_GUILD))
-    # Start health-check server in background thread (satisfies Render port check)
-    health_thread = threading.Thread(target=run_health_server, daemon=True)
+
+    print("[NexPlay] Env vars OK. Starting health server...", flush=True)
+
+    # Start health server FIRST — non-daemon so it keeps process alive
+    # even if bot.run() has a temporary hiccup
+    health_thread = threading.Thread(target=run_health_server, daemon=False)
     health_thread.start()
-    bot.run(BOT_TOKEN, log_level=20)
+
+    import time
+    time.sleep(0.5)  # Give health server 500ms to bind before bot connects
+    print(f"[NexPlay] Guild ID: {HOME_GUILD}", flush=True)
+
+    try:
+        bot.run(BOT_TOKEN, log_level=20)
+    except Exception as e:
+        print(f"[NexPlay] bot.run() crashed: {e}", flush=True)
+        # Health server keeps running so Render doesn't kill the dyno
+        # Bot will reconnect on next deploy/restart
+        health_thread.join()
