@@ -2208,7 +2208,7 @@ async def cmd_help(interaction: discord.Interaction):
 
 
 # ══════════════════════════════════════════════════════════
-#  HEALTH-CHECK HTTP SERVER (required for Render Web Service)
+#  HEALTH-CHECK HTTP SERVER (Background Worker — optional keepalive)
 # ══════════════════════════════════════════════════════════
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -2220,10 +2220,12 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b"NexPlay bot is running.")
     def log_message(self, fmt, *args):
-        pass  # suppress access logs
+        pass
 
 def run_health_server():
-    port = int(os.environ.get("PORT", 8080))
+    port = int(os.environ.get("PORT", 0))
+    if not port:
+        return  # Background Worker — no port needed
     server = HTTPServer(("0.0.0.0", port), HealthHandler)
     print(f"[NexPlay] Health server bound to 0.0.0.0:{port}", flush=True)
     server.serve_forever()
