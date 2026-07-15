@@ -702,6 +702,7 @@ class TournamentStatusModal(discord.ui.Modal, title="🔄 Change Tournament Stat
         await interaction.followup.send(embed=ok_e("Status Updated!", f"Tournament status → **{new_status}**"), ephemeral=True)
 
 
+@bot.event
 async def on_ready():
     """Fires when bot connects. Clears all in-memory support locks so every
     restart gives users a completely fresh support session."""
