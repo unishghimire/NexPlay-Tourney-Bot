@@ -44,6 +44,7 @@ import os
 import asyncio
 import io
 import csv
+import re
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
@@ -165,6 +166,12 @@ async def check_feature(guild_id: str, feature: str, interaction: discord.Intera
 
 # Shared HTTP timeout
 HTTP_TIMEOUT = aiohttp.ClientTimeout(total=10)
+
+def log(msg: str):
+    """Simple print-based logger with flush for Railway."""
+    print(msg, flush=True)
+
+
 
 
 # ══════════════════════════════════════════════════════════
@@ -771,6 +778,164 @@ async def make_tournament_channels(guild: discord.Guild, tournament_name: str) -
     log(f"[Channels] Created tournament channels for '{tournament_name}' → category '{cat_name}'")
     return result
 
+
+class TournamentEditModal(discord.ui.Modal, title="✏️ Edit Tournament"):
+    t_prize     = discord.ui.TextInput(label="Prize Pool",         max_length=60)
+    t_date      = discord.ui.TextInput(label="Tournament Date",    max_length=30)
+    t_time      = discord.ui.TextInput(label="Match Time",         max_length=30)
+    t_rules     = discord.ui.TextInput(label="Rules / Notes",      max_length=400, required=False, style=discord.TextStyle.paragraph)
+    t_stream    = discord.ui.TextInput(label="Stream Channel",     max_length=100, required=False)
+
+    def __init__(self, tournament: dict):
+        super().__init__()
+        self.tournament = tournament
+        # Pre-fill with existing values
+        self.t_prize.default  = tournament.get("prize_pool", "")
+        self.t_date.default   = tournament.get("tournament_date", "")
+        self.t_time.default   = tournament.get("tournament_time", "TBD")
+        self.t_rules.default  = tournament.get("rules", "")
+        self.t_stream.default = tournament.get("stream_channel", "")
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        t = self.tournament
+
+        updates = {
+            "prize_pool":        self.t_prize.value.strip(),
+            "tournament_date":   self.t_date.value.strip(),
+            "tournament_time":   self.t_time.value.strip(),
+            "rules":             self.t_rules.value.strip(),
+            "stream_channel":    self.t_stream.value.strip(),
+        }
+        await b44_update("Tournament", t["id"], updates)
+
+        # Refresh #info channel embed
+        gid   = str(interaction.guild.id)
+        t.update(updates)
+        ch_info_id = None
+        short = t.get("short_name", "")
+        if short:
+            info_ch = discord.utils.get(interaction.guild.text_channels, name=short + "-info")
+            if info_ch: ch_info_id = info_ch.id
+
+        if ch_info_id:
+            nations = t.get("eligible_nations", "🇳🇵")
+            updated_e = discord.Embed(
+                title=f"📋 {t['name']} — Tournament Info (Updated)",
+                description=(
+                    f"**🎮 Game:** {t.get('game','')}\n"
+                    f"**💰 Prize Pool:** {updates['prize_pool']}\n"
+                    f"**📅 Date:** {updates['tournament_date']}  |  ⏰ {updates['tournament_time']}\n"
+                    f"**👥 Max Teams:** {t.get('max_players','')}  |  Team Size: {t.get('team_size','')}v{t.get('team_size','')}\n"
+                    f"**🎯 Group Size:** {t.get('group_size','')} teams/group  |  Rounds: {t.get('rounds','')}\n"
+                    f"**🌏 Nations:** {nations}\n"
+                    + (f"\n**📜 Rules:**\n{updates['rules']}\n" if updates['rules'] else "")
+                    + (f"\n**📺 Stream:** {updates['stream_channel']}\n" if updates['stream_channel'] else "")
+                ),
+                color=0xFFA500, timestamp=datetime.now(timezone.utc)
+            )
+            updated_e.set_footer(text="NexPlay | Tournament details updated")
+            await dpost(ch_info_id, updated_e)
+
+        await interaction.followup.send(embed=ok_e("Tournament Updated!", f"**{t['name']}** details have been updated and #info channel refreshed."), ephemeral=True)
+
+
+class TournamentEditSlotView(discord.ui.View):
+    """Second edit modal covering slots/format/nations."""
+    def __init__(self, tournament: dict):
+        super().__init__(timeout=120)
+        self.tournament = tournament
+
+    @discord.ui.button(label="Edit Basic Info", style=discord.ButtonStyle.primary, emoji="✏️")
+    async def edit_basic(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(TournamentEditModal(self.tournament))
+
+    @discord.ui.button(label="Edit Slots & Nations", style=discord.ButtonStyle.secondary, emoji="🎯")
+    async def edit_slots(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(TournamentEditSlotsModal(self.tournament))
+
+    @discord.ui.button(label="Change Status", style=discord.ButtonStyle.danger, emoji="🔄")
+    async def change_status(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(TournamentStatusModal(self.tournament))
+
+
+class TournamentEditSlotsModal(discord.ui.Modal, title="✏️ Edit Tournament — Slots & Nations"):
+    t_max     = discord.ui.TextInput(label="Max Teams",          max_length=4)
+    t_tsize   = discord.ui.TextInput(label="Team Size",          max_length=3)
+    t_gsize   = discord.ui.TextInput(label="Teams Per Group",    max_length=3)
+    t_rounds  = discord.ui.TextInput(label="Number of Rounds",   max_length=3)
+    t_nations = discord.ui.TextInput(label="Eligible Nations",   max_length=60, required=False)
+
+    def __init__(self, tournament: dict):
+        super().__init__()
+        self.tournament = tournament
+        self.t_max.default     = str(tournament.get("max_players", ""))
+        self.t_tsize.default   = str(tournament.get("team_size", ""))
+        self.t_gsize.default   = str(tournament.get("group_size", ""))
+        self.t_rounds.default  = str(tournament.get("rounds", ""))
+        self.t_nations.default = tournament.get("eligible_nations", "🇳🇵")
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        def safe_int(v, d):
+            try: return int(v)
+            except: return d
+        t = self.tournament
+        updates = {
+            "max_players":      safe_int(self.t_max.value, t.get("max_players", 16)),
+            "team_size":        safe_int(self.t_tsize.value, t.get("team_size", 4)),
+            "group_size":       safe_int(self.t_gsize.value, t.get("group_size", 4)),
+            "rounds":           safe_int(self.t_rounds.value, t.get("rounds", 3)),
+            "eligible_nations": self.t_nations.value.strip() or "🇳🇵",
+        }
+        await b44_update("Tournament", t["id"], updates)
+        await interaction.followup.send(embed=ok_e("Slots Updated!", "Tournament structure updated successfully."), ephemeral=True)
+
+
+class TournamentStatusModal(discord.ui.Modal, title="🔄 Change Tournament Status"):
+    t_status = discord.ui.TextInput(
+        label="New Status",
+        placeholder="registration_open / registration_closed / in_progress / completed / cancelled",
+        max_length=30
+    )
+
+    def __init__(self, tournament: dict):
+        super().__init__()
+        self.tournament = tournament
+        self.t_status.default = tournament.get("status", "registration_open")
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        valid = {"registration_open", "registration_closed", "in_progress", "completed", "cancelled"}
+        new_status = self.t_status.value.strip().lower()
+        if new_status not in valid:
+            return await interaction.followup.send(embed=err_e(f"Invalid status. Choose from: {', '.join(valid)}"), ephemeral=True)
+        await b44_update("Tournament", self.tournament["id"], {"status": new_status})
+        await interaction.followup.send(embed=ok_e("Status Updated!", f"Tournament status → **{new_status}**"), ephemeral=True)
+
+
+@bot.event
+async def on_ready():
+    """Fires when bot connects. Clears all in-memory support locks so every
+    restart gives users a completely fresh support session."""
+    global _replied_users
+    _replied_users = {}   # ← wipe all per-guild locks on every startup
+
+    guilds = bot.guilds
+    print("=" * 60, flush=True)
+    print(f"[NexPlay] ✅ BOT ONLINE — {bot.user} (ID: {bot.user.id})", flush=True)
+    print(f"[NexPlay] Serving {len(guilds)} server(s)", flush=True)
+    for g in guilds:
+        print(f"[NexPlay]   • {g.name} ({g.id}) — {g.member_count} members", flush=True)
+    print(f"[NexPlay] Support locks cleared — fresh session started", flush=True)
+    print("=" * 60, flush=True)
+
+
+# ══════════════════════════════════════════════════════════
+#  BASE44 ENTITY HELPERS
+# ══════════════════════════════════════════════════════════
+def _b44_headers() -> dict:
+    return {"Authorization": "Bearer " + SVC_TOKEN, "Content-Type": "application/json"}
 
 async def b44_list(entity: str, filters: dict | None = None) -> list:
     url = BASE44_API + "/" + entity
@@ -1545,6 +1710,112 @@ INSTRUCTIONS:
             )
         except Exception:
             pass
+def parse_registration(text: str, team_size: int) -> dict | None:
+    """
+    Parse a team registration message. Returns dict or None if invalid.
+    Expected format (case-insensitive keys):
+        Team Name: <name>
+        Player 1: @mention
+        Player 2: @mention
+        ...
+    """
+    lines = [l.strip() for l in text.strip().splitlines() if l.strip()]
+    result = {}
+
+    # Find team name line
+    team_line = next((l for l in lines if re.match(r"team\s*name\s*:", l, re.I)), None)
+    if not team_line:
+        return None
+    result["team_name"] = re.sub(r"^team\s*name\s*:\s*", "", team_line, flags=re.I).strip()
+    if not result["team_name"]:
+        return None
+
+    # Find player lines
+    players = []
+    for i in range(1, team_size + 1):
+        pat = re.compile(r"player\s*" + str(i) + r"\s*:\s*(.*)", re.I)
+        pline = next((l for l in lines if pat.match(l)), None)
+        if not pline:
+            return None
+        raw = pat.match(pline).group(1).strip()
+        # Extract mention user ID
+        uid_match = re.search(r"<@!?(\d+)>", raw)
+        if not uid_match:
+            return None
+        players.append(uid_match.group(1))
+
+    if len(players) != team_size:
+        return None
+
+    result["players"] = players
+    return result
+
+
+
+
+async def lock_register_channel(guild: discord.Guild, channel: discord.TextChannel):
+    """Deny @everyone from sending messages in a channel."""
+    try:
+        everyone = guild.default_role
+        overwrite = channel.overwrites_for(everyone)
+        overwrite.send_messages = False
+        await channel.set_permissions(everyone, overwrite=overwrite, reason="NexPlay: Registration full")
+    except Exception as e:
+        log(f"[WARN] Could not lock channel #{channel.name}: {e}")
+
+
+
+
+async def update_reg_announcement(tournament: dict, guild: discord.Guild, registered: int):
+    """Edit the pinned registration announcement to update slot count."""
+    msg_id = tournament.get("registration_msg_id")
+    ch_id  = tournament.get("registration_channel_id")
+    if not msg_id or not ch_id:
+        return
+    try:
+        ch = guild.get_channel(int(ch_id))
+        if not ch:
+            return
+        msg = await ch.fetch_message(int(msg_id))
+        if not msg:
+            return
+        # Rebuild embed with updated count
+        t = tournament
+        max_p = t.get("max_players", 16)
+        name  = t.get("name", "Tournament")
+        game  = t.get("game", "")
+        prize = t.get("prize_pool", "")
+        date  = t.get("tournament_date", "")
+        tsize = t.get("team_size", 4)
+        short = t.get("short_name", "t")
+        bar   = "█" * registered + "░" * (max_p - registered)
+        filled = registered >= max_p
+
+        lines = "\n".join([f"Player {i+1}: @mention" for i in range(tsize)])
+        embed = discord.Embed(
+            title=("🔒 REGISTRATION CLOSED" if filled else "✍️ REGISTRATION OPEN") + " — " + name,
+            description=(
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"🎮 **Game:** {game}\n"
+                f"🎖️ **Prize:** {prize}\n"
+                f"📅 **Date:** {date}\n"
+                f"👥 **Slots:** {registered}/{max_p}  `{bar}`\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            ) + (
+                "\n🚫 **Registration is CLOSED. All slots filled!**" if filled else
+                "\n@everyone **Registration is OPEN!**\n\n"
+                f"Send a message in this channel with EXACTLY this format:\n"
+                f"```\nTeam Name: <your team name>\n" + "\n".join([f"Player {i+1}: @mention" for i in range(tsize)]) + "\n```"
+                "\n⚠️ All players must be mentioned. No duplicate registrations."
+            ),
+            color=0x555555 if filled else 0x00FF7F,
+            timestamp=datetime.now(timezone.utc)
+        )
+        embed.set_footer(text="NexPlay Tournament System")
+        await msg.edit(embed=embed)
+    except Exception as e:
+        log(f"[WARN] Could not update reg announcement: {e}")
+
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot:
@@ -1927,7 +2198,7 @@ async def on_message(message: discord.Message):
 @tree.command(name="clearlog", description="[Staff] Clear a user support lock so they can ask again")
 @app_commands.describe(user="The user whose support lock to clear")
 async def clearlog(interaction: discord.Interaction, user: discord.Member):
-    if not has_tournament_role(interaction.user):
+    if not is_staff(interaction.user):
         await interaction.response.send_message(
             "❌ You need the **Tournament Host** role to use this command.", ephemeral=True
         )
