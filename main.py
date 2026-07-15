@@ -377,16 +377,51 @@ import urllib.parse
 _replied_users: dict[str, dict[str, str]] = {}
 
 async def ai_generate(prompt: str) -> str:
-    """Call Pollinations free text AI — no API key needed."""
+    """Try Groq (fast, free) first — fallback to Pollinations if no key or error."""
+    GROQ_KEY = os.environ.get("GROQ_API_KEY", "")
+
+    # ── PRIMARY: Groq (llama-3.3-70b-versatile) ──────────────────────────
+    if GROQ_KEY:
+        try:
+            payload = {
+                "model": "llama-3.3-70b-versatile",
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 300,
+                "temperature": 0.7,
+            }
+            async with aiohttp.ClientSession() as s:
+                async with s.post(
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    json=payload,
+                    headers={"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"},
+                    timeout=aiohttp.ClientTimeout(total=12),
+                ) as r:
+                    if r.status == 200:
+                        data = await r.json()
+                        reply = data["choices"][0]["message"]["content"].strip()
+                        print(f"[AI] Groq OK — {len(reply)} chars", flush=True)
+                        return reply
+                    else:
+                        err = await r.text()
+                        print(f"[AI] Groq error {r.status}: {err[:200]}", flush=True)
+        except Exception as e:
+            print(f"[AI] Groq exception: {e}", flush=True)
+
+    # ── FALLBACK: Pollinations (no key needed) ────────────────────────────
     try:
-        encoded = urllib.parse.quote(prompt)
+        encoded = urllib.parse.quote(prompt[:1500])  # URL-safe trim
         url = f"https://text.pollinations.ai/{encoded}"
         async with aiohttp.ClientSession() as s:
-            async with s.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
+            async with s.get(url, timeout=aiohttp.ClientTimeout(total=15)) as r:
                 if r.status == 200:
-                    return (await r.text()).strip()
+                    reply = (await r.text()).strip()
+                    print(f"[AI] Pollinations OK — {len(reply)} chars", flush=True)
+                    return reply
+                else:
+                    print(f"[AI] Pollinations {r.status}", flush=True)
     except Exception as e:
-        print(f"[AI] Pollinations error: {e}", flush=True)
+        print(f"[AI] Pollinations exception: {e}", flush=True)
+
     return ""
 
 def build_server_context(guild: discord.Guild, active_tournament: dict | None) -> str:
@@ -880,6 +915,7 @@ INSTRUCTIONS:
             )
         except Exception:
             pass
+@bot.event
 async def on_message(message: discord.Message):
     if message.author.bot:
         return
@@ -887,6 +923,9 @@ async def on_message(message: discord.Message):
     if not message.guild:
         await bot.process_commands(message)
         return
+
+    # ── Debug log every message so we can verify receipt ─────────────────────
+    print(f"[MSG] #{message.channel.name} | {message.author} | {message.content[:80]}", flush=True)
 
     # ── Support / AI assistant handler ───────────────────────────────────────
     # RULES:
