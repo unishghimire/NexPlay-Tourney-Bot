@@ -218,6 +218,144 @@ bot  = NexPlayBot()
 tree = bot.tree
 
 
+# ══════════════════════════════════════════════════════════
+#  MEME / FUNNY VIDEO AUTO-POSTER  (Elite plan only)
+# ══════════════════════════════════════════════════════════
+
+MEME_SUBREDDITS = ["dankmemes", "gaming", "freefire", "PUBGMobile", "mildlyinfuriating"]
+MEME_INTERVAL   = 4 * 3600   # post every 4 hours
+
+async def fetch_reddit_meme(subreddit: str = "dankmemes") -> dict | None:
+    """Fetch a random hot meme from Reddit JSON API (no auth needed)."""
+    url = f"https://www.reddit.com/r/{subreddit}/hot.json?limit=25"
+    try:
+        async with bot.http_session.get(
+            url,
+            headers={"User-Agent": "NexPlayBot/4.0"},
+            timeout=aiohttp.ClientTimeout(total=8)
+        ) as r:
+            if r.status != 200:
+                return None
+            data = await r.json()
+            posts = data.get("data", {}).get("children", [])
+            import random
+            random.shuffle(posts)
+            for post in posts:
+                p = post.get("data", {})
+                if p.get("is_video") or p.get("over_18"):
+                    continue
+                url_hint = p.get("url", "")
+                if any(url_hint.endswith(ext) for ext in (".jpg", ".jpeg", ".png", ".gif", ".mp4", ".gifv")):
+                    return {"title": p.get("title",""), "url": url_hint, "permalink": "https://reddit.com" + p.get("permalink","")}
+    except Exception as e:
+        print(f"[NexPlay] meme fetch error: {e}", flush=True)
+    return None
+
+async def auto_meme_loop():
+    """Every MEME_INTERVAL seconds, post a meme to Elite-plan servers."""
+    await bot.wait_until_ready()
+    import random
+    while not bot.is_closed():
+        try:
+            for guild in bot.guilds:
+                # Check if server is Elite
+                ok, _ = await check_feature(str(guild.id), "meme_post")
+                if not ok:
+                    continue
+                # Find a channel named 'memes', 'funny', 'media' or 'general'
+                target = None
+                for name_hint in ("memes", "funny", "media", "general"):
+                    target = discord.utils.find(
+                        lambda c, h=name_hint: isinstance(c, discord.TextChannel) and h in c.name.lower(),
+                        guild.text_channels
+                    )
+                    if target:
+                        break
+                if not target:
+                    continue
+                sub = random.choice(MEME_SUBREDDITS)
+                meme = await fetch_reddit_meme(sub)
+                if not meme:
+                    continue
+                embed = discord.Embed(
+                    title=meme["title"][:256],
+                    url=meme["permalink"],
+                    color=0xFF6B35
+                )
+                embed.set_image(url=meme["url"])
+                embed.set_footer(text=f"r/{sub} • NexPlay Daily Meme 😂")
+                await target.send(embed=embed)
+                print(f"[NexPlay] Meme posted to #{target.name} in {guild.name}", flush=True)
+        except Exception as e:
+            print(f"[NexPlay] auto_meme_loop error: {e}", flush=True)
+        await asyncio.sleep(MEME_INTERVAL)
+
+
+# ══════════════════════════════════════════════════════════
+#  WELCOME MESSAGE  (Elite plan only)
+# ══════════════════════════════════════════════════════════
+
+@bot.event
+async def on_member_join(member: discord.Member):
+    """Send a warm welcome to new members in #welcome channel (Elite plan)."""
+    guild = member.guild
+    ok, _ = await check_feature(str(guild.id), "welcome_message")
+    if not ok:
+        return
+    # Find welcome channel
+    welcome_ch = discord.utils.find(
+        lambda c: isinstance(c, discord.TextChannel) and "welcome" in c.name.lower(),
+        guild.text_channels
+    )
+    if not welcome_ch:
+        return
+    embed = discord.Embed(
+        title=f"👋 Welcome to {guild.name}, {member.display_name}!",
+        description=(
+            f"Hey {member.mention}, we're glad you're here! 🎮\n\n"
+            f"**{guild.name}** is a competitive esports community hosting Free Fire & Battle Royale tournaments.\n\n"
+            f"📋 Check out our channels to get started\n"
+            f"🏆 Use **/register** in a tournament channel to join a competition\n"
+            f"❓ Use **/help** if you need assistance\n\n"
+            f"Good luck and have fun! 🔥"
+        ),
+        color=0x5865F2,
+        timestamp=datetime.now(timezone.utc)
+    )
+    embed.set_thumbnail(url=member.display_avatar.url)
+    embed.set_footer(text=f"Member #{guild.member_count} • NexPlay")
+    await welcome_ch.send(embed=embed)
+
+
+# ══════════════════════════════════════════════════════════
+#  ANNOUNCEMENT COMMAND  (all plans)
+# ══════════════════════════════════════════════════════════
+
+@tree.command(name="announce", description="[Host] Post a tournament announcement embed")
+@app_commands.describe(
+    title="Announcement title",
+    message="Announcement message body",
+    channel="Channel to post in (optional, defaults to current)"
+)
+async def cmd_announce(
+    interaction: discord.Interaction,
+    title: str,
+    message: str,
+    channel: discord.TextChannel = None
+):
+    if not is_staff(interaction):
+        return await interaction.response.send_message(embed=err_e("Staff only."), ephemeral=True)
+    await interaction.response.defer(thinking=True, ephemeral=True)
+    target = channel or interaction.channel
+    embed = discord.Embed(
+        title=f"📢 {title}",
+        description=message,
+        color=0xE74C3C,
+        timestamp=datetime.now(timezone.utc)
+    )
+    embed.set_footer(text=f"NexPlay Announcement • {interaction.guild.name}")
+    await target.send(embed=embed)
+    await interaction.followup.send(embed=ok_e("Announced!", f"Posted to {target.mention}"), ephemeral=True)
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  MULTI-STEP TOURNAMENT CREATION MODALS
