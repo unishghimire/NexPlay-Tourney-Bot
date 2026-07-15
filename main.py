@@ -1069,6 +1069,7 @@ async def on_message(message: discord.Message):
             "player_discord_id": str(message.author.id),
             "team_members":     players,
             "status":           "registered",
+            "logo_url":         "",
         })
 
         # Update tournament registered count
@@ -1082,6 +1083,8 @@ async def on_message(message: discord.Message):
         cfm_ch = discord.utils.get(message.guild.text_channels, name=cfm_ch_name)
         if cfm_ch:
             player_mentions = " ".join([f"<@{p}>" for p in players])
+            logo_ch = discord.utils.get(message.guild.text_channels, name=short_candidate + "-team-logo")
+            logo_ch_mention = f"<#{logo_ch.id}>" if logo_ch else f"#{short_candidate}-team-logo"
             cfm_embed = discord.Embed(
                 title="✅ TEAM REGISTERED!",
                 description=(
@@ -1094,6 +1097,8 @@ async def on_message(message: discord.Message):
                     "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                     "**Status: CONFIRMED ✅**\n\n"
                     f"📋 Check tournament info in <#{tournament.get('announcement_channel_id','')}>\n"
+                    f"🎨 **NEXT STEP:** Submit your team logo in {logo_ch_mention}\n"
+                    "`Team Name: <name>` + attach logo image (PNG/JPG)\n\n"
                     "Groups will be revealed after registration closes. Good luck! 🎮"
                 ),
                 color=0x00FF7F,
@@ -1128,6 +1133,154 @@ async def on_message(message: discord.Message):
             )
             close_embed.set_footer(text="NexPlay Tournament System")
             await message.channel.send(embed=close_embed)
+
+        return
+
+    # ── Logo submission channel handler ──────────────────────────────────────
+    if ch_name.endswith("-team-logo"):
+        short_candidate = ch_name[:-10]  # strip "-team-logo"
+
+        all_ts = await b44_list("Tournament", {"guild_id": gid})
+        tournament = next(
+            (t for t in all_ts
+             if t.get("short_name", "").lower() == short_candidate.lower()
+             and t.get("status") in ("registration_open", "registration_closed")),
+            None
+        )
+
+        if not tournament:
+            await bot.process_commands(message)
+            return
+
+        # Must have an image attachment
+        image_attachments = [a for a in message.attachments if a.content_type and a.content_type.startswith("image/")]
+
+        if not image_attachments:
+            await message.add_reaction("❌")
+            err = await message.reply(
+                embed=discord.Embed(
+                    title="❌ No Image Attached",
+                    description=(
+                        "Please attach your team logo image (PNG/JPG) AND include your team name.\n\n"
+                        "**Format:**\n"
+                        "```\nTeam Name: <your exact team name>\nTeam Logo: [attach image]\n```"
+                    ),
+                    color=0xFF4444
+                ),
+                mention_author=True
+            )
+            await asyncio.sleep(15)
+            try:
+                await err.delete()
+                await message.delete()
+            except:
+                pass
+            return
+
+        # Extract team name from message text
+        import re
+        text_content = message.content.strip()
+        team_name_match = re.search(r'team\s*name\s*:\s*(.+)', text_content, re.IGNORECASE)
+
+        if not team_name_match:
+            await message.add_reaction("❌")
+            err = await message.reply(
+                embed=discord.Embed(
+                    title="❌ Missing Team Name",
+                    description=(
+                        "Include your team name in the message.\n\n"
+                        "**Format:**\n"
+                        "```\nTeam Name: <your exact team name>\nTeam Logo: [attach image]\n```"
+                    ),
+                    color=0xFF4444
+                ),
+                mention_author=True
+            )
+            await asyncio.sleep(15)
+            try:
+                await err.delete()
+                await message.delete()
+            except:
+                pass
+            return
+
+        submitted_team_name = team_name_match.group(1).strip()
+
+        # Verify team is registered — match by name first, then by submitter Discord ID
+        existing_regs = await b44_list("Registration", {"tournament_id": tournament["id"]})
+        matched_reg = next(
+            (r for r in existing_regs if r.get("player_name", "").lower() == submitted_team_name.lower()),
+            None
+        )
+        if not matched_reg:
+            matched_reg = next(
+                (r for r in existing_regs if r.get("player_discord_id") == str(message.author.id)),
+                None
+            )
+            if matched_reg:
+                submitted_team_name = matched_reg.get("player_name", submitted_team_name)
+
+        if not matched_reg:
+            await message.add_reaction("❌")
+            err = await message.reply(
+                embed=discord.Embed(
+                    title="❌ Team Not Found",
+                    description=(
+                        f"**{submitted_team_name}** is not registered in this tournament.\n\n"
+                        "Make sure your team name matches exactly as you registered."
+                    ),
+                    color=0xFF4444
+                ),
+                mention_author=True
+            )
+            await asyncio.sleep(20)
+            try:
+                await err.delete()
+                await message.delete()
+            except:
+                pass
+            return
+
+        # Save logo URL to DB
+        logo_url = image_attachments[0].url
+        await b44_update("Registration", matched_reg["id"], {
+            "logo_url": logo_url,
+            "logo_submitted_at": datetime.now(timezone.utc).isoformat(),
+            "logo_submitted_by": str(message.author.id),
+        })
+
+        await message.add_reaction("✅")
+
+        confirm_embed = discord.Embed(
+            title="✅ Logo Accepted!",
+            description=(
+                f"**Team:** {submitted_team_name}\n"
+                f"**Submitted by:** {message.author.mention}\n"
+                f"**Tournament:** {tournament.get('name', '')}\n\n"
+                "Your logo is saved and will appear in group draws, match cards, and result graphics."
+            ),
+            color=0x00FF7F,
+            timestamp=datetime.now(timezone.utc)
+        )
+        confirm_embed.set_thumbnail(url=logo_url)
+        confirm_embed.set_footer(text="NexPlay Tournament System")
+        await message.channel.send(embed=confirm_embed)
+
+        # Notify in confirm-teams
+        cfm_ch = discord.utils.get(message.guild.text_channels, name=short_candidate + "-confirm-teams")
+        if cfm_ch:
+            logo_update = discord.Embed(
+                title="🎨 Logo Submitted",
+                description=(
+                    f"**{submitted_team_name}** has submitted their team logo ✅\n"
+                    f"Submitted by: {message.author.mention}"
+                ),
+                color=0xFF6B9D,
+                timestamp=datetime.now(timezone.utc)
+            )
+            logo_update.set_thumbnail(url=logo_url)
+            logo_update.set_footer(text="NexPlay | Logo will appear in all GFX")
+            await cfm_ch.send(embed=logo_update)
 
         return
 
