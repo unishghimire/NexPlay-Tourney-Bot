@@ -61,7 +61,7 @@ HOME_GUILD  = int(os.environ.get("DISCORD_GUILD_ID", "0"))   # owner's server on
 SVC_TOKEN   = os.environ.get("BASE44_SERVICE_TOKEN", "")
 APP_ID      = os.environ.get("APP_ID", "6a5226b5047f5c59d961130e")
 
-BASE44_API  = "https://base44.app/api/apps/" + APP_ID + "/entities"
+BASE44_API  = "https://api.base44.com/api/apps/" + APP_ID + "/entities"
 DISCORD_API = "https://discord.com/api/v10"
 
 # ── Role names that count as "staff" in any server ────────
@@ -957,18 +957,84 @@ async def get_server_record(guild_id: str) -> dict | None:
     return servers[0] if servers else None
 
 
-async def is_allowed(guild_id: str) -> tuple[bool, str]:
-    """Returns (allowed, reason). Only active/trial servers pass."""
+async def is_allowed(guild_id: str, guild: discord.Guild = None) -> tuple[bool, str]:
+    """Returns (allowed, reason). Auto-registers unregistered servers as Free Trial."""
     rec = await get_server_record(guild_id)
     if not rec:
-        return False, "This server is not registered with NexPlay. Ask your admin to run `/setup`."
-    status = rec.get("subscription_status", "")
+        # Auto-register instead of blocking — bot may have been added before on_guild_join fired
+        if guild:
+            owner = guild.owner
+            rec = await b44_create("Server", {
+                "guild_id":            guild_id,
+                "guild_name":          guild.name,
+                "owner_id":            str(owner.id) if owner else "",
+                "owner_name":          owner.display_name if owner else "Unknown",
+                "plan_name":           "Free Trial",
+                "subscription_status": "trial",
+                "tournaments_used":    0,
+                "tournament_limit":    3,
+                "member_count":        guild.member_count or 0,
+                "last_active":         __import__("datetime").datetime.utcnow().isoformat() + "Z",
+            })
+            print(f"[NexPlay] Auto-registered {guild.name} via is_allowed fallback", flush=True)
+        else:
+            return False, "This server is not registered with NexPlay. Please re-invite the bot."
+    status = rec.get("subscription_status", "trial")
     if status == "banned":
         return False, "This server has been banned from NexPlay. Contact support."
     if status in ("active", "trial"):
         return True, ""
-    return False, "This server's NexPlay subscription has expired.\nRenew at: https://nexplay-server-portal.vercel.app/subscription\nPlans from NPR 99/mo (Starter) · NPR 299/mo (Pro AI) · NPR 399/mo (Elite)"
+    return False, "This server\'s NexPlay subscription has expired.\nRenew at: https://nexplay-server-portal.vercel.app/subscription\nPlans from NPR 99/mo (Starter) · NPR 299/mo (Pro AI) · NPR 399/mo (Elite)"
 
+
+
+
+# ══════════════════════════════════════════════════════════
+#  AUTO-REGISTER ON JOIN
+# ══════════════════════════════════════════════════════════
+@bot.event
+async def on_guild_join(guild: discord.Guild):
+    """Auto-register new server as Free Trial when bot is added."""
+    print(f"[NexPlay] Joined new guild: {guild.name} ({guild.id})", flush=True)
+    existing = await b44_list("Server", {"guild_id": str(guild.id)})
+    if not existing:
+        owner = guild.owner
+        await b44_create("Server", {
+            "guild_id":            str(guild.id),
+            "guild_name":          guild.name,
+            "owner_id":            str(owner.id) if owner else "",
+            "owner_name":          owner.display_name if owner else "Unknown",
+            "plan_name":           "Free Trial",
+            "subscription_status": "trial",
+            "tournaments_used":    0,
+            "tournament_limit":    3,
+            "member_count":        guild.member_count or 0,
+            "last_active":         __import__("datetime").datetime.utcnow().isoformat() + "Z",
+        })
+        print(f"[NexPlay] Registered {guild.name} as Free Trial", flush=True)
+    else:
+        print(f"[NexPlay] {guild.name} already registered", flush=True)
+
+    # Try to send a welcome message to the first writable channel
+    for ch in guild.text_channels:
+        if ch.permissions_for(guild.me).send_messages:
+            embed = discord.Embed(
+                title="👋 NexPlay Tournament System",
+                description=(
+                    "Thanks for adding me! Here's how to get started:\n\n"
+                    "**1.** Make sure you have the `Tournament Host` or `Admin` role\n"
+                    "**2.** Run `/create_tournament` to create your first tournament\n"
+                    "**3.** Visit the portal: https://nexplay-server-portal.vercel.app\n\n"
+                    "Your server is on the **Free Trial** plan (3 tournaments). Upgrade anytime!"
+                ),
+                color=0x5865F2
+            )
+            embed.set_footer(text="NexPlay Esports Platform")
+            try:
+                await ch.send(embed=embed)
+            except:
+                pass
+            break
 
 # ══════════════════════════════════════════════════════════
 #  DYNAMIC CHANNEL RESOLVER
@@ -1061,10 +1127,13 @@ def now_ts() -> int:
     return int(datetime.now(timezone.utc).timestamp())
 
 def is_staff(member: discord.Member) -> bool:
+    # Server owner always has access
+    if member.guild.owner_id == member.id:
+        return True
     for role in member.roles:
-        clean = role.name
-        for prefix in ("👑 ", "⚔️ ", "🛡️ ", "🔧 ", "🎮 ", "🎯 ", "⚙️ ", "🏆 ", "🔥 ", "⛏️ ", "📋 ", "🌱 ", "🤖 "):
-            clean = clean.replace(prefix, "")
+        clean = role.name.strip()
+        for prefix in ("👑 ", "⚔️ ", "🛡️ ", "🔧 ", "🎮 ", "🎯 ", "⚙️ ", "🏆 ", "🔥 ", "⛏️ ", "📋 ", "🌱 ", "🤖 ", "🎯", "👑", "⚔️", "🛡️", "🔧", "🎮"):
+            clean = clean.replace(prefix, "").strip()
         if clean in STAFF_ROLE_NAMES:
             return True
     return False
@@ -2213,7 +2282,7 @@ async def make_tournament_channels(guild: discord.Guild, tournament_name: str) -
 async def cmd_create(interaction: discord.Interaction):
     if not is_staff(interaction.user):
         return await interaction.response.send_message(embed=err_e("❌ You need the **Tournament Host** role!"), ephemeral=True)
-    allowed, reason = await is_allowed(str(interaction.guild.id))
+    allowed, reason = await is_allowed(str(interaction.guild.id), interaction.guild)
     if not allowed:
         return await interaction.response.send_message(embed=err_e(reason), ephemeral=True)
     # Open step 1 modal
