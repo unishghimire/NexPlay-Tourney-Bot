@@ -105,6 +105,7 @@ class NexPlayBot(commands.Bot):
         print("[NexPlay] Global slash commands synced.")
         # Start daily log scheduler
         asyncio.create_task(self._daily_log_scheduler())
+        asyncio.create_task(auto_meme_loop())
 
     async def _daily_log_scheduler(self):
         """Send daily Excel log at midnight (00:00 NPT = 18:15 UTC prev day).
@@ -927,35 +928,21 @@ async def on_message(message: discord.Message):
     # ── Debug log every message so we can verify receipt ─────────────────────
     print(f"[MSG] #{message.channel.name} | {message.author} | {message.content[:80]}", flush=True)
 
-    # ── Support / AI assistant handler ───────────────────────────────────────
-    # RULES:
-    #  1. Only fires in general public chat channels (NOT register, confirm-teams,
-    #     announcements, roadmap, groups, results, info, help, or private channels)
-    #  2. Never fires in DMs or any tournament-specific channel
-    #  3. If no staff responds within STAFF_RESPONSE_TIMEOUT, escalate to #staff-log
-    # Channels where bot should NEVER respond
-    BLOCKED_SUFFIXES = (
-        "-register", "-announcements", "-roadmap", "-results",
-        "-groups", "-confirm-teams", "-info", "-help",
-    )
-    BLOCKED_EXACT = (
-        "staff-log", "mod-log", "admin-log", "staff", "moderators",
-        "bot-log", "audit-log",
-    )
-
+    # ── Support handler — ONLY in designated support/help channels ──────────────
     ch_name_lower = message.channel.name.lower()
 
-    # Block tournament-specific channels
-    is_blocked = (
-        any(ch_name_lower.endswith(s) for s in BLOCKED_SUFFIXES)
-        or any(ch_name_lower == s for s in BLOCKED_EXACT)
-        or isinstance(message.channel, discord.DMChannel)
+    SUPPORT_NAMES = (
+        "support", "support-ticket", "help", "nexplay-support",
+        "nexplay-help", "bot-help", "ask-here", "questions",
+    )
+    is_support_ch = (
+        ch_name_lower in SUPPORT_NAMES
+        or ch_name_lower.startswith("support")
+        or ch_name_lower.startswith("help")
+        or ch_name_lower.startswith("ask")
     )
 
-    # Allow ALL public text channels except blocked ones
-    is_public_text = isinstance(message.channel, discord.TextChannel)
-
-    if is_public_text and not is_blocked and len(message.content.strip()) > 3:
+    if is_support_ch and isinstance(message.channel, discord.TextChannel) and len(message.content.strip()) > 3:
         await handle_support(message)
         return
 
@@ -2742,6 +2729,459 @@ async def cmd_help(interaction: discord.Interaction):
     ), inline=False)
     e.set_footer(text="NexPlay Tournament System | nexplay.gg")
     await interaction.response.send_message(embed=e, ephemeral=True)
+
+
+
+# ══════════════════════════════════════════════════════════
+#  SUPPORT WEBHOOK LOGGER
+# ══════════════════════════════════════════════════════════
+async def post_support_webhook(guild, src_channel, user, question, ai_reply, needs_staff, ticket_id):
+    global _support_webhooks
+    log_ch = discord.utils.get(guild.text_channels, name="nexplay-support-log")
+    if not log_ch:
+        try:
+            overwrites = {
+                guild.default_role: discord.PermissionOverwrite(read_messages=False),
+                guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True, manage_webhooks=True),
+            }
+            for role in guild.roles:
+                rn = role.name.lower()
+                if any(k in rn for k in ("staff","mod","admin","host","owner")):
+                    overwrites[role] = discord.PermissionOverwrite(read_messages=True, send_messages=False)
+            cat = discord.utils.get(guild.categories, name="NexPlay Tournaments")
+            log_ch = await guild.create_text_channel(
+                "nexplay-support-log", overwrites=overwrites, category=cat,
+                topic="Auto-logged support tickets from NexPlay AI")
+            print(f"[SUPPORT] Created #nexplay-support-log in {guild.name}", flush=True)
+        except Exception as ex:
+            print(f"[SUPPORT] {ex}", flush=True)
+            return
+    gid = str(guild.id)
+    wh_url = _support_webhooks.get(gid)
+    if not wh_url:
+        try:
+            existing = await log_ch.webhooks()
+            wh = next((w for w in existing if w.name == "NexPlay Support"), None)
+            if not wh:
+                wh = await log_ch.create_webhook(name="NexPlay Support")
+            _support_webhooks[gid] = wh.url
+            wh_url = wh.url
+        except Exception as ex:
+            print(f"[SUPPORT] Webhook: {ex}", flush=True)
+            return
+    color  = 0xFF6B00 if needs_staff else 0x00CC66
+    status = "Needs Staff" if needs_staff else "AI Resolved"
+    e = discord.Embed(title="Support Ticket", color=color, timestamp=discord.utils.utcnow())
+    e.add_field(name="User",     value=f"{user.mention} ({user.display_name})", inline=True)
+    e.add_field(name="Channel",  value=src_channel.mention,                     inline=True)
+    e.add_field(name="Status",   value=status,                                  inline=True)
+    e.add_field(name="Question", value=(question or "—")[:300],                 inline=False)
+    if ai_reply:
+        e.add_field(name="AI Reply", value=ai_reply[:400],                      inline=False)
+    e.set_footer(text=f"Ticket: {ticket_id}")
+    try:
+        async with aiohttp.ClientSession() as s:
+            payload = {"username":"NexPlay Support","avatar_url":"https://i.imgur.com/4M34hi2.png","embeds":[e.to_dict()]}
+            await s.post(wh_url, json=payload)
+    except Exception as ex:
+        print(f"[SUPPORT] Post failed: {ex}", flush=True)
+        _support_webhooks.pop(gid, None)
+
+
+# ══════════════════════════════════════════════════════════
+#  WELCOME NEW MEMBERS
+# ══════════════════════════════════════════════════════════
+@bot.event
+async def on_member_join(member: discord.Member):
+    guild = member.guild
+    print(f"[JOIN] {member} joined {guild.name}", flush=True)
+    welcome_ch = None
+    for name in CHANNEL_NAMES["welcome"]:
+        welcome_ch = discord.utils.get(guild.text_channels, name=name)
+        if welcome_ch:
+            break
+    if not welcome_ch:
+        welcome_ch = resolve_channel(guild, "general")
+    if not welcome_ch:
+        return
+    active_t = None
+    try:
+        all_t    = await b44_list("Tournament", {"guild_id": str(guild.id)})
+        active_t = next((t for t in all_t if t.get("status") not in ("completed","cancelled","deleted")), None)
+    except Exception:
+        pass
+    prompt = (
+        f"Write a short 2-sentence welcome for '{member.display_name}' joining '{guild.name}', "
+        f"a gaming esports Discord. Make it warm and exciting. No hashtags. 1 emoji max."
+        f"{' Mention active tournament.' if active_t else ''}"
+    )
+    welcome_text = await ai_generate(prompt)
+    if not welcome_text or len(welcome_text) < 10:
+        welcome_text = f"Welcome to {guild.name}! Explore the channels and get ready to compete."
+    e = discord.Embed(title=f"Welcome, {member.display_name}!", description=welcome_text, color=0x5865F2)
+    e.set_thumbnail(url=str(member.display_avatar.url) if member.display_avatar else "")
+    e.add_field(name="Get Started", value=(
+        "- Read #rules for guidelines\n"
+        "- Introduce yourself in #general\n"
+        "- Check #announcements for events\n"
+        "- Use /register to join a tournament!"
+    ), inline=False)
+    if active_t:
+        e.add_field(
+            name=f"Active: {active_t.get('name','')}",
+            value=f"Status: {active_t.get('status','').replace('_',' ').title()} | Use /register",
+            inline=False)
+    e.set_footer(text=f"{guild.name} powered by NexPlay")
+    try:
+        await welcome_ch.send(content=member.mention, embed=e)
+    except Exception as ex:
+        print(f"[WELCOME] {ex}", flush=True)
+
+
+# ══════════════════════════════════════════════════════════
+#  REDDIT MEME/CLIP FETCHER
+# ══════════════════════════════════════════════════════════
+MEME_SUBREDDITS  = ["GlobalOffensive","FreeFireIndia","IndianGaming","gaming","GamingMemes","IndianDankMemes"]
+VIDEO_SUBREDDITS = ["gamingclips","IndianGaming","FreeFireIndia","GlobalOffensive"]
+
+async def fetch_reddit_post(subreddit: str, want_image: bool = True):
+    url     = f"https://www.reddit.com/r/{subreddit}/hot.json?limit=25&t=week"
+    headers = {"User-Agent": "NexPlayBot/1.0"}
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as r:
+                if r.status != 200:
+                    return None
+                data  = await r.json()
+                posts = data.get("data",{}).get("children",[])
+                out   = []
+                for p in posts:
+                    d = p["data"]
+                    if d.get("stickied"):
+                        continue
+                    if want_image:
+                        u = d.get("url","")
+                        if any(u.endswith(x) for x in (".jpg",".jpeg",".png",".gif",".gifv",".webp")) or "i.redd.it" in u or "imgur.com" in u:
+                            out.append(d)
+                    else:
+                        out.append(d)
+                if not out:
+                    return None
+                import random as _r
+                return _r.choice(out)
+    except Exception as ex:
+        print(f"[REDDIT] {subreddit}: {ex}", flush=True)
+        return None
+
+async def auto_meme_loop():
+    await bot.wait_until_ready()
+    import random as _r
+    while not bot.is_closed():
+        await asyncio.sleep(12 * 3600)
+        for guild in bot.guilds:
+            try:
+                meme_ch = resolve_channel(guild, "memes")
+                if not meme_ch:
+                    continue
+                sub  = _r.choice(MEME_SUBREDDITS)
+                post = await fetch_reddit_post(sub, want_image=True)
+                if not post:
+                    continue
+                title = post.get("title","")[:200]
+                img   = post.get("url","")
+                score = post.get("score",0)
+                e = discord.Embed(title=title, color=0xFF4500)
+                e.set_image(url=img)
+                e.set_footer(text=f"r/{sub} | {score:,} upvotes | Daily meme by NexPlay")
+                msg = await meme_ch.send(embed=e)
+                await msg.add_reaction("\U0001f602")
+                await msg.add_reaction("\U0001f480")
+                print(f"[AUTO-MEME] {guild.name}", flush=True)
+            except Exception as ex:
+                print(f"[AUTO-MEME] {guild.name}: {ex}", flush=True)
+
+
+# ══════════════════════════════════════════════════════════
+#  /post_meme
+# ══════════════════════════════════════════════════════════
+@tree.command(name="post_meme", description="Post a random gaming meme to the memes channel")
+@app_commands.describe(channel="Channel to post in (default: #memes)")
+async def cmd_post_meme(interaction: discord.Interaction, channel: discord.TextChannel = None):
+    if not is_staff(interaction.user):
+        return await interaction.response.send_message(embed=err_e("Staff only."), ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    import random as _r
+    target = channel or resolve_channel(interaction.guild, "memes") or resolve_channel(interaction.guild, "general")
+    if not target:
+        return await interaction.followup.send(embed=err_e("Create a #memes channel first!"), ephemeral=True)
+    sub  = _r.choice(MEME_SUBREDDITS)
+    post = await fetch_reddit_post(sub, want_image=True)
+    if not post:
+        post = await fetch_reddit_post("gaming", want_image=True)
+    if not post:
+        return await interaction.followup.send(embed=err_e("Couldn't fetch a meme. Try again!"), ephemeral=True)
+    e = discord.Embed(title=post.get("title","Gaming Meme")[:200], color=0xFF4500)
+    e.set_image(url=post.get("url",""))
+    e.set_footer(text=f"r/{sub} | {post.get('score',0):,} upvotes | u/{post.get('author','?')}")
+    try:
+        msg = await target.send(embed=e)
+        await msg.add_reaction("\U0001f602")
+        await msg.add_reaction("\U0001f480")
+        await msg.add_reaction("\U0001f525")
+        await interaction.followup.send(f"Meme posted to {target.mention}!", ephemeral=True)
+    except Exception as ex:
+        await interaction.followup.send(embed=err_e(str(ex)), ephemeral=True)
+
+
+# ══════════════════════════════════════════════════════════
+#  /post_clip
+# ══════════════════════════════════════════════════════════
+@tree.command(name="post_clip", description="Post a random gaming highlight clip")
+@app_commands.describe(channel="Channel to post in (default: #videos)")
+async def cmd_post_clip(interaction: discord.Interaction, channel: discord.TextChannel = None):
+    if not is_staff(interaction.user):
+        return await interaction.response.send_message(embed=err_e("Staff only."), ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    import random as _r
+    target = channel or resolve_channel(interaction.guild, "videos") or resolve_channel(interaction.guild, "memes") or resolve_channel(interaction.guild, "general")
+    if not target:
+        return await interaction.followup.send(embed=err_e("No videos channel found."), ephemeral=True)
+    sub  = _r.choice(VIDEO_SUBREDDITS)
+    post = await fetch_reddit_post(sub, want_image=False)
+    if not post:
+        post = await fetch_reddit_post("gaming", want_image=False)
+    if not post:
+        return await interaction.followup.send(embed=err_e("Couldn't fetch a clip. Try again!"), ephemeral=True)
+    permalink = "https://reddit.com" + post.get("permalink","")
+    e = discord.Embed(title=post.get("title","Gaming Clip")[:200], description=f"[Watch on Reddit]({permalink})", color=0x7289DA)
+    thumb = post.get("thumbnail","")
+    if thumb and thumb.startswith("http"):
+        e.set_image(url=thumb)
+    e.set_footer(text=f"r/{post.get('subreddit','gaming')} | {post.get('score',0):,} upvotes")
+    try:
+        msg = await target.send(embed=e)
+        await msg.add_reaction("\U0001f525")
+        await msg.add_reaction("\U0001f3ae")
+        await msg.add_reaction("\U0001f4af")
+        await interaction.followup.send(f"Clip posted to {target.mention}!", ephemeral=True)
+    except Exception as ex:
+        await interaction.followup.send(embed=err_e(str(ex)), ephemeral=True)
+
+
+# ══════════════════════════════════════════════════════════
+#  /suggest_improvement
+# ══════════════════════════════════════════════════════════
+@tree.command(name="suggest_improvement", description="AI-powered suggestions to grow and engage your server")
+async def cmd_suggest(interaction: discord.Interaction):
+    if not is_staff(interaction.user):
+        return await interaction.response.send_message(embed=err_e("Staff only."), ephemeral=True)
+    await interaction.response.defer()
+    guild    = interaction.guild
+    channels = ", ".join(f"#{c.name}" for c in guild.text_channels[:25])
+    roles    = ", ".join(r.name for r in guild.roles if not r.is_default())[:300]
+    prompt = (
+        f"Discord server growth expert for gaming communities.\n"
+        f"Server: {guild.name} | Members: {guild.member_count}\n"
+        f"Channels: {channels}\nRoles: {roles}\n\n"
+        f"Give 5 specific actionable suggestions to make this server more engaging.\n"
+        f"Format: NUMBER. TITLE | CHANNEL | ACTION"
+    )
+    reply = await ai_generate(prompt)
+    if not reply:
+        return await interaction.followup.send(embed=err_e("AI unavailable. Try again."), ephemeral=True)
+    lines = [l.strip() for l in reply.splitlines() if l.strip() and l.strip()[0].isdigit()]
+    icons = ["\U0001f4a1","\U0001f3ae","\U0001f389","\U0001f4e3","\U0001f3c6"]
+    e = discord.Embed(
+        title="Server Improvement Suggestions",
+        description=f"AI analysis for **{guild.name}** ({guild.member_count:,} members)",
+        color=0x5865F2)
+    for i, line in enumerate(lines[:5]):
+        parts = line.split("|") if "|" in line else [line,"",""]
+        tip   = parts[0].lstrip("12345. ").strip()
+        ch_   = parts[1].strip() if len(parts)>1 else ""
+        act   = parts[2].strip() if len(parts)>2 else ""
+        val   = (f"Channel: {ch_}\n" if ch_ else "") + (f"Action: {act}" if act else "")
+        if not val:
+            val = tip
+        e.add_field(name=f"{icons[i]} {tip}", value=val, inline=False)
+    e.set_footer(text="NexPlay AI Advisor | Use /host_game to run engagement activities")
+    await interaction.followup.send(embed=e)
+
+
+# ══════════════════════════════════════════════════════════
+#  /host_game
+# ══════════════════════════════════════════════════════════
+@tree.command(name="host_game", description="Host a quick mini-game to engage your community")
+@app_commands.describe(
+    game_type="Type of game",
+    prize="Optional prize (e.g. Custom role, 500 coins)",
+    channel="Channel to post in (default: #general)",
+)
+@app_commands.choices(game_type=[
+    app_commands.Choice(name="Trivia",          value="trivia"),
+    app_commands.Choice(name="Prediction Poll", value="prediction"),
+    app_commands.Choice(name="GG Hunt",         value="gghunt"),
+    app_commands.Choice(name="Community Poll",  value="poll"),
+    app_commands.Choice(name="Bracket Guess",   value="bracket"),
+])
+async def cmd_host_game(interaction: discord.Interaction, game_type: str, prize: str = "", channel: discord.TextChannel = None):
+    if not is_staff(interaction.user):
+        return await interaction.response.send_message(embed=err_e("Staff only."), ephemeral=True)
+    await interaction.response.defer()
+    import random as _r
+    gid    = str(interaction.guild.id)
+    target = channel or resolve_channel(interaction.guild, "general") or interaction.channel
+    prize_line = f"\nPrize: {prize}" if prize else ""
+    ping_txt   = "@here " if prize else ""
+
+    if game_type == "trivia":
+        prompt = (
+            "Generate ONE gaming trivia question with 4 options A-D.\n"
+            "Format (one per line):\n"
+            "QUESTION: <q>\nA: <opt>\nB: <opt>\nC: <opt>\nD: <opt>\nANSWER: <letter>\nFACT: <fact>"
+        )
+        raw  = await ai_generate(prompt)
+        data = {}
+        for line in (raw or "").splitlines():
+            if ":" in line:
+                k, _, v = line.partition(":")
+                data[k.strip()] = v.strip()
+        q    = data.get("QUESTION","What year did Free Fire release?")
+        opts = {k: data.get(k,"?") for k in ("A","B","C","D")}
+        ans  = data.get("ANSWER","A")
+        fact = data.get("FACT","Good game!")
+        emo  = {"A":"\U0001f1e6","B":"\U0001f1e7","C":"\U0001f1e8","D":"\U0001f1e9"}
+        body = f"**{q}**\n\n" + "\n".join(f"{emo[k]} {k}: {v}" for k,v in opts.items()) + prize_line
+        e = discord.Embed(title="Gaming Trivia!", description=body, color=0x5865F2)
+        e.set_footer(text="React with the correct letter! Answer in 60s")
+        msg = await target.send(content=f"{ping_txt}TRIVIA TIME!", embed=e)
+        for emoji in emo.values():
+            await msg.add_reaction(emoji)
+        await asyncio.sleep(60)
+        re = discord.Embed(title=f"Answer: {ans} — {opts.get(ans,'?')}", description=fact, color=0x00CC66)
+        await target.send(embed=re, reference=msg)
+
+    elif game_type == "prediction":
+        all_t  = await b44_list("Tournament", {"guild_id": gid})
+        active = next((t for t in all_t if t.get("status") not in ("completed","cancelled","deleted")), None)
+        ta, tb, tn = "Team Alpha","Team Omega","the next match"
+        if active:
+            tn   = active.get("name","the tournament")
+            regs = await b44_list("Registration", {"tournament_id": active.get("id",""), "status":"confirmed"})
+            ts   = [r.get("team_name","") for r in regs if r.get("team_name")]
+            if len(ts) >= 2:
+                picks = _r.sample(ts, 2)
+                ta, tb = picks[0], picks[1]
+        body = f"Who wins {tn}?\n\n\U0001f44d **{ta}**\n\nvs\n\n\U0001f44e **{tb}**{prize_line}"
+        e = discord.Embed(title="Prediction Poll", description=body, color=0xFFD700)
+        e.set_footer(text="\U0001f44d = Team A | \U0001f44e = Team B")
+        msg = await target.send(content=f"{ping_txt}PREDICTION TIME!", embed=e)
+        await msg.add_reaction("\U0001f44d")
+        await msg.add_reaction("\U0001f44e")
+
+    elif game_type == "gghunt":
+        code = "GG" + "".join(_r.choices("ABCDEFGHJKLMNPQRSTUVWXYZ23456789", k=4))
+        hl   = list(code)
+        for idx in _r.sample(range(len(hl)), len(hl)//2):
+            hl[idx] = "?"
+        hint = "".join(hl)
+        body = f"A secret code is hidden!\n\nHint: `{hint}`\n\nType the FULL code to win!{prize_line}\n\nFirst correct reply wins!"
+        e = discord.Embed(title="GG Hunt — Find the Code!", description=body, color=0xFF6B00)
+        e.set_footer(text="Code starts with GG")
+        msg = await target.send(content=f"{ping_txt}GG HUNT!", embed=e)
+        def chk(m):
+            return m.channel == target and not m.author.bot and m.content.upper().strip() == code
+        try:
+            wm = await bot.wait_for("message", check=chk, timeout=300)
+            we = discord.Embed(title="GG Hunt Winner!", description=f"{wm.author.mention} found `{code}` first!", color=0x00FF7F)
+            if prize:
+                we.add_field(name="Prize", value=prize)
+            await target.send(embed=we)
+        except asyncio.TimeoutError:
+            te = discord.Embed(title="GG Hunt Ended", description=f"Nobody found it! Code was `{code}`", color=0xFF4444)
+            await target.send(embed=te, reference=msg)
+
+    elif game_type == "poll":
+        prompt = f"Fun gaming poll for '{interaction.guild.name}'. Format: QUESTION|Option1|Option2|Option3|Option4"
+        raw    = await ai_generate(prompt)
+        parts  = (raw or "").split("|")
+        qp     = parts[0].strip() if parts else "Best game genre?"
+        op     = [p.strip() for p in parts[1:5]]
+        while len(op) < 4:
+            op.append(f"Option {len(op)+1}")
+        reacts = ["\u0031\ufe0f\u20e3","\u0032\ufe0f\u20e3","\u0033\ufe0f\u20e3","\u0034\ufe0f\u20e3"]
+        body   = f"**{qp}**\n\n" + "\n".join(f"{reacts[i]} {o}" for i,o in enumerate(op[:4])) + prize_line
+        e = discord.Embed(title="Community Poll", description=body, color=0x9B59B6)
+        e.set_footer(text="Vote with reactions!")
+        msg = await target.send(content=f"{ping_txt}COMMUNITY POLL!", embed=e)
+        for r in reacts:
+            await msg.add_reaction(r)
+
+    elif game_type == "bracket":
+        all_t  = await b44_list("Tournament", {"guild_id": gid})
+        active = next((t for t in all_t if t.get("status") not in ("completed","cancelled","deleted")), None)
+        if not active:
+            return await interaction.followup.send(embed=err_e("No active tournament!"), ephemeral=True)
+        regs  = await b44_list("Registration", {"tournament_id": active.get("id",""), "status":"confirmed"})
+        teams = [r.get("team_name", f"Team {i+1}") for i,r in enumerate(regs[:8])]
+        if len(teams) < 2:
+            return await interaction.followup.send(embed=err_e("Need at least 2 registered teams."), ephemeral=True)
+        body = f"Who wins **{active.get('name','')}**?\n\n" + "\n".join(f"- {t}" for t in teams) + f"\n\nType your prediction!{prize_line}"
+        e = discord.Embed(title="Bracket Guess!", description=body, color=0xFFD700)
+        await target.send(content=f"{ping_txt}BRACKET GUESS! Who takes the W?", embed=e)
+
+    await interaction.followup.send(f"Game posted to {target.mention}!", ephemeral=True)
+
+
+# ══════════════════════════════════════════════════════════
+#  /announce_game
+# ══════════════════════════════════════════════════════════
+@tree.command(name="announce_game", description="Post a hype announcement for an upcoming game event")
+@app_commands.describe(
+    title="Event title",
+    game="Game name",
+    starts_in="When it starts (e.g. Today 8PM, Tomorrow 6PM NPT)",
+    prize="Prize pool (optional)",
+    ping="Ping everyone (default: yes)",
+)
+async def cmd_announce_game(interaction: discord.Interaction, title: str, game: str, starts_in: str, prize: str = "", ping: bool = True):
+    if not is_staff(interaction.user):
+        return await interaction.response.send_message(embed=err_e("Staff only."), ephemeral=True)
+    await interaction.response.defer()
+    prompt = (
+        f"Hype announcement for a gaming event.\n"
+        f"Event: {title} | Game: {game} | Starts: {starts_in}\n"
+        f"Server: {interaction.guild.name} | Prize: {prize or 'Glory'}\n"
+        f"Write 2-3 exciting sentences. No hashtags. Max 2 emojis."
+    )
+    hype = await ai_generate(prompt)
+    if not hype or len(hype) < 10:
+        hype = f"Get ready! {title} is happening {starts_in}. Show up and prove your skills!"
+    e = discord.Embed(title=title, description=hype, color=0xFF6B00)
+    e.add_field(name="Game",   value=game,      inline=True)
+    e.add_field(name="Starts", value=starts_in, inline=True)
+    if prize:
+        e.add_field(name="Prize", value=prize,  inline=True)
+    e.add_field(name="How to Join", value="Use /register or DM a staff member!", inline=False)
+    e.set_footer(text=f"Hosted by {interaction.user.display_name} | {interaction.guild.name}")
+    img_p = urllib.parse.quote(f"gaming tournament {game} announcement poster epic")
+    e.set_image(url=f"https://image.pollinations.ai/prompt/{img_p}")
+    ann_ch  = resolve_channel(interaction.guild, "announcements") or interaction.channel
+    content = "@everyone" if ping else ""
+    msg = await ann_ch.send(content=content, embed=e)
+    await msg.add_reaction("\u2705")
+    await msg.add_reaction("\U0001f3ae")
+    await msg.add_reaction("\U0001f525")
+    try:
+        await b44_create("AnnouncementLog", {
+            "guild_id": str(interaction.guild.id), "tournament_id": "",
+            "milestone": f"game_event:{title}", "channel_id": str(ann_ch.id),
+            "message_id": str(msg.id), "announced_at": now_iso(),
+            "content_summary": f"{title} | {game} | {starts_in}",
+        })
+    except Exception:
+        pass
+    await interaction.followup.send(f"Announcement posted to {ann_ch.mention}!", ephemeral=True)
 
 
 # ══════════════════════════════════════════════════════════
