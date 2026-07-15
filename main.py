@@ -137,6 +137,27 @@ bot  = NexPlayBot()
 tree = bot.tree
 
 
+
+# ══════════════════════════════════════════════════════════
+#  ON READY — fresh start every deployment
+# ══════════════════════════════════════════════════════════
+@bot.event
+async def on_ready():
+    """Fires when bot connects. Clears all in-memory support locks so every
+    restart gives users a completely fresh support session."""
+    global _replied_users
+    _replied_users = {}   # ← wipe all per-guild locks on every startup
+
+    guilds = bot.guilds
+    print("=" * 60, flush=True)
+    print(f"[NexPlay] ✅ BOT ONLINE — {bot.user} (ID: {bot.user.id})", flush=True)
+    print(f"[NexPlay] Serving {len(guilds)} server(s)", flush=True)
+    for g in guilds:
+        print(f"[NexPlay]   • {g.name} ({g.id}) — {g.member_count} members", flush=True)
+    print(f"[NexPlay] Support locks cleared — fresh session started", flush=True)
+    print("=" * 60, flush=True)
+
+
 # ══════════════════════════════════════════════════════════
 #  BASE44 ENTITY HELPERS
 # ══════════════════════════════════════════════════════════
