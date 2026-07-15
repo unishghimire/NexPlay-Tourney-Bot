@@ -175,6 +175,8 @@ class NexPlayBot(commands.Bot):
         intents = discord.Intents.default()
         intents.message_content = True
         intents.members = True
+        intents.presences = True
+        intents.guilds = True
         super().__init__(command_prefix="!", intents=intents)
         self.http_session: aiohttp.ClientSession | None = None
 
@@ -222,72 +224,116 @@ tree = bot.tree
 #  MEME / FUNNY VIDEO AUTO-POSTER  (Elite plan only)
 # ══════════════════════════════════════════════════════════
 
-MEME_SUBREDDITS = ["dankmemes", "gaming", "freefire", "PUBGMobile", "mildlyinfuriating"]
-MEME_INTERVAL   = 4 * 3600   # post every 4 hours
+MEME_SUBREDDITS = ["dankmemes", "gaming", "freefire", "PUBGMobile", "mildlyinfuriating", "FreeFireBattlegrounds"]
+MEME_INTERVAL   = 30 * 60   # post every 30 minutes
 
-async def fetch_reddit_meme(subreddit: str = "dankmemes") -> dict | None:
-    """Fetch a random hot meme from Reddit JSON API (no auth needed)."""
-    url = f"https://www.reddit.com/r/{subreddit}/hot.json?limit=25"
+# Track last posted URL per guild so we never repeat the same meme
+_last_meme_url: dict[int, str] = {}
+
+async def fetch_reddit_meme(subreddit: str = "dankmemes", exclude_url: str = "") -> dict | None:
+    """Fetch a fresh trending meme from Reddit — skips NSFW, videos, and the last posted URL."""
+    import random
+    # Use a random sort (new/hot/top) to get variety each call
+    sort = random.choice(["hot", "new", "top"])
+    url = f"https://www.reddit.com/r/{subreddit}/{sort}.json?limit=50&t=day"
     try:
         async with bot.http_session.get(
             url,
-            headers={"User-Agent": "NexPlayBot/4.0"},
-            timeout=aiohttp.ClientTimeout(total=8)
+            headers={"User-Agent": "NexPlayBot/4.0 (nexplay-tourney-bot)"},
+            timeout=aiohttp.ClientTimeout(total=10)
         ) as r:
             if r.status != 200:
+                print(f"[NexPlay] Reddit {r.status} for r/{subreddit}", flush=True)
                 return None
-            data = await r.json()
+            data = await r.json(content_type=None)
             posts = data.get("data", {}).get("children", [])
-            import random
             random.shuffle(posts)
             for post in posts:
                 p = post.get("data", {})
-                if p.get("is_video") or p.get("over_18"):
+                if p.get("is_video") or p.get("over_18") or p.get("stickied"):
                     continue
-                url_hint = p.get("url", "")
-                if any(url_hint.endswith(ext) for ext in (".jpg", ".jpeg", ".png", ".gif", ".mp4", ".gifv")):
-                    return {"title": p.get("title",""), "url": url_hint, "permalink": "https://reddit.com" + p.get("permalink","")}
+                img_url = p.get("url", "")
+                # Skip if same as last posted
+                if img_url == exclude_url:
+                    continue
+                if any(img_url.lower().endswith(ext) for ext in (".jpg", ".jpeg", ".png", ".gif", ".gifv")):
+                    return {
+                        "title":     p.get("title", "")[:256],
+                        "url":       img_url,
+                        "permalink": "https://reddit.com" + p.get("permalink", ""),
+                        "score":     p.get("score", 0),
+                    }
     except Exception as e:
-        print(f"[NexPlay] meme fetch error: {e}", flush=True)
+        print(f"[NexPlay] meme fetch error r/{subreddit}: {e}", flush=True)
     return None
 
 async def auto_meme_loop():
-    """Every MEME_INTERVAL seconds, post a meme to Elite-plan servers."""
+    """Every MEME_INTERVAL seconds, post a DIFFERENT trending meme to each Elite-plan server."""
     await bot.wait_until_ready()
     import random
+    print("[NexPlay] auto_meme_loop started.", flush=True)
     while not bot.is_closed():
         try:
             for guild in bot.guilds:
-                # Check if server is Elite
-                ok, _ = await check_feature(str(guild.id), "meme_post")
-                if not ok:
-                    continue
-                # Find a channel named 'memes', 'funny', 'media' or 'general'
-                target = None
-                for name_hint in ("memes", "funny", "media", "general"):
-                    target = discord.utils.find(
-                        lambda c, h=name_hint: isinstance(c, discord.TextChannel) and h in c.name.lower(),
-                        guild.text_channels
+                try:
+                    # Gate: Elite plan only
+                    ok, _ = await check_feature(str(guild.id), "meme_post")
+                    if not ok:
+                        continue
+
+                    # Find target channel: memes > funny > media > general
+                    target = None
+                    for name_hint in ("meme", "funny", "media", "general", "chat"):
+                        target = discord.utils.find(
+                            lambda c, h=name_hint: (
+                                isinstance(c, discord.TextChannel)
+                                and h in c.name.lower()
+                                and c.permissions_for(guild.me).send_messages
+                            ),
+                            guild.text_channels
+                        )
+                        if target:
+                            break
+
+                    if not target:
+                        print(f"[NexPlay] No postable channel found in {guild.name}", flush=True)
+                        continue
+
+                    # Pick a different subreddit per guild using guild ID as seed offset
+                    sub = MEME_SUBREDDITS[(guild.id // 1000) % len(MEME_SUBREDDITS)]
+
+                    # Exclude last posted URL for this guild
+                    last_url = _last_meme_url.get(guild.id, "")
+                    meme = await fetch_reddit_meme(sub, exclude_url=last_url)
+
+                    # Fallback: try a different subreddit if first returned nothing
+                    if not meme:
+                        alt_sub = random.choice([s for s in MEME_SUBREDDITS if s != sub])
+                        meme = await fetch_reddit_meme(alt_sub, exclude_url=last_url)
+
+                    if not meme:
+                        print(f"[NexPlay] No meme found for {guild.name}", flush=True)
+                        continue
+
+                    # Save so we don't repeat next cycle
+                    _last_meme_url[guild.id] = meme["url"]
+
+                    embed = discord.Embed(
+                        title=meme["title"],
+                        url=meme["permalink"],
+                        color=0xFF6B35
                     )
-                    if target:
-                        break
-                if not target:
-                    continue
-                sub = random.choice(MEME_SUBREDDITS)
-                meme = await fetch_reddit_meme(sub)
-                if not meme:
-                    continue
-                embed = discord.Embed(
-                    title=meme["title"][:256],
-                    url=meme["permalink"],
-                    color=0xFF6B35
-                )
-                embed.set_image(url=meme["url"])
-                embed.set_footer(text=f"r/{sub} • NexPlay Daily Meme 😂")
-                await target.send(embed=embed)
-                print(f"[NexPlay] Meme posted to #{target.name} in {guild.name}", flush=True)
+                    embed.set_image(url=meme["url"])
+                    embed.set_footer(text=f"r/{sub} • 🔥 Trending on Reddit | NexPlay")
+                    await target.send(embed=embed)
+                    print(f"[NexPlay] Meme posted to #{target.name} in {guild.name} (score: {meme['score']})", flush=True)
+
+                except Exception as guild_err:
+                    print(f"[NexPlay] meme loop guild error ({guild.name}): {guild_err}", flush=True)
+
         except Exception as e:
-            print(f"[NexPlay] auto_meme_loop error: {e}", flush=True)
+            print(f"[NexPlay] auto_meme_loop outer error: {e}", flush=True)
+
         await asyncio.sleep(MEME_INTERVAL)
 
 
