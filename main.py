@@ -228,7 +228,7 @@ async def is_allowed(guild_id: str) -> tuple[bool, str]:
         return False, "This server has been banned from NexPlay. Contact support."
     if status in ("active", "trial"):
         return True, ""
-    return False, "This server's NexPlay subscription has expired. Renew at: https://nexplay-server-portal.vercel.app/subscription"
+    return False, "This server's NexPlay subscription has expired.\nRenew at: https://nexplay-server-portal.vercel.app/subscription\nPlans from NPR 99/mo (Starter) · NPR 299/mo (Pro AI) · NPR 399/mo (Elite)"
 
 
 # ══════════════════════════════════════════════════════════
