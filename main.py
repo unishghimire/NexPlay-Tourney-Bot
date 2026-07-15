@@ -228,7 +228,7 @@ async def is_allowed(guild_id: str) -> tuple[bool, str]:
         return False, "This server has been banned from NexPlay. Contact support."
     if status in ("active", "trial"):
         return True, ""
-    return False, "This server's NexPlay subscription has expired. Visit nexplay.gg to renew."
+    return False, "This server's NexPlay subscription has expired. Renew at: https://nexplay-server-portal.vercel.app/subscription"
 
 
 # ══════════════════════════════════════════════════════════
@@ -1216,7 +1216,9 @@ async def cmd_setup(interaction: discord.Interaction):
         "NexPlay Setup Complete!",
         status_msg + "\n\n**Channels ready:**\n" + ch_list + "\n\n"
         "Use `/create_tournament` to launch your first tournament!\n"
-        "Need more than 3 tournaments? Visit nexplay.gg to upgrade."
+        "\n**Links:**\n"
+        "Portal: https://nexplay-server-portal.vercel.app\n"
+        "Billing: https://nexplay-server-portal.vercel.app/subscription"
     ), ephemeral=True)
 
 
@@ -2700,6 +2702,32 @@ async def cmd_import_regs(interaction: discord.Interaction, tournament_name: str
     )
 
 
+@tree.command(name="portal", description="Get the NexPlay server portal and subscription links")
+async def cmd_portal(interaction: discord.Interaction):
+    e = discord.Embed(
+        title="NexPlay Server Portal",
+        description="Manage your tournaments, subscriptions, and analytics from the web dashboard.",
+        color=0x5865F2,
+    )
+    e.add_field(
+        name="Server Owner Dashboard",
+        value="https://nexplay-server-portal.vercel.app\nView tournaments, registrations, analytics",
+        inline=False,
+    )
+    e.add_field(
+        name="Subscription & Billing",
+        value="https://nexplay-server-portal.vercel.app/subscription\nUpgrade plan, submit payment, view history",
+        inline=False,
+    )
+    e.add_field(
+        name="Add Bot to Another Server",
+        value="https://discord.com/api/oauth2/authorize?client_id=1525463657843261591&permissions=8&scope=bot%20applications.commands\nAdd NexPlay to more of your servers",
+        inline=False,
+    )
+    e.set_footer(text="NexPlay Tournament System")
+    await interaction.response.send_message(embed=e)
+
+
 @tree.command(name="help", description="Show all NexPlay bot commands")
 async def cmd_help(interaction: discord.Interaction):
     e = discord.Embed(
@@ -2727,7 +2755,16 @@ async def cmd_help(interaction: discord.Interaction):
         "Each server gets 3 free trial tournaments.\n"
         "Upgrade at nexplay.gg for unlimited access."
     ), inline=False)
-    e.set_footer(text="NexPlay Tournament System | nexplay.gg")
+    e.add_field(
+        name="🔗 Links",
+        value=(
+            f"[Server Owner Portal](https://nexplay-server-portal.vercel.app) · "
+            f"[Manage Subscription](https://nexplay-server-portal.vercel.app/subscription) · "
+            f"[Add Bot to Server](https://discord.com/api/oauth2/authorize?client_id=1525463657843261591&permissions=8&scope=bot%20applications.commands)"
+        ),
+        inline=False,
+    )
+    e.set_footer(text="NexPlay Tournament System | nexplay-server-portal.vercel.app")
     await interaction.response.send_message(embed=e, ephemeral=True)
 
 
