@@ -862,6 +862,18 @@ async def on_ready():
     print(f"[NexPlay] Serving {len(guilds)} server(s)", flush=True)
     for g in guilds:
         print(f"[NexPlay]   • {g.name} ({g.id}) — {g.member_count} members", flush=True)
+
+    # ── Startup DB connectivity check ──────────────────────────────────────
+    if not SVC_TOKEN:
+        print("[NexPlay] ⚠️⚠️ BASE44_SERVICE_TOKEN is NOT SET! All DB operations will fail!", flush=True)
+    else:
+        print(f"[NexPlay] BASE44_SERVICE_TOKEN set (len={len(SVC_TOKEN)})", flush=True)
+        # Quick test: try to fetch servers
+        try:
+            srv_count = len(await b44_list("Server"))
+            print(f"[NexPlay] DB OK — {srv_count} server(s) found", flush=True)
+        except Exception as e:
+            print(f"[NexPlay] ⚠️ DB test failed: {e}", flush=True)
     print(f"[NexPlay] Support locks cleared — fresh session started", flush=True)
     # Re-sync slash commands on every ready (belt + suspenders)
     try:
@@ -881,18 +893,24 @@ def _b44_headers() -> dict:
 async def b44_list(entity: str, filters: dict | None = None) -> list:
     url = BASE44_API + "/" + entity
     try:
+        if not SVC_TOKEN:
+            print("[b44_list] ⚠️ SVC_TOKEN is empty! Base44 API calls will fail.", flush=True)
+            return []
         async with bot.http_session.get(url, headers=_b44_headers()) as r:
             if r.status != 200:
+                err_body = await r.text()
+                print(f"[b44_list] ⚠️ {entity} HTTP {r.status}: {err_body[:200]}", flush=True)
                 return []
             data = await r.json()
             if not isinstance(data, list):
+                print(f"[b44_list] ⚠️ {entity} returned non-list: {type(data).__name__}", flush=True)
                 return []
             if filters:
                 for k, v in filters.items():
                     data = [x for x in data if x.get(k) == v]
             return data
     except Exception as e:
-        print("[b44_list] " + str(e))
+        print(f"[b44_list] ❌ {entity} error: {e}", flush=True)
         return []
 
 
@@ -902,9 +920,11 @@ async def b44_create(entity: str, payload: dict) -> dict:
         async with bot.http_session.post(url, json=payload, headers=_b44_headers()) as r:
             if r.status in (200, 201):
                 return await r.json()
+            err_body = await r.text()
+            print(f"[b44_create] ⚠️ {entity} HTTP {r.status}: {err_body[:200]}", flush=True)
             return {}
     except Exception as e:
-        print("[b44_create] " + str(e))
+        print(f"[b44_create] ❌ {entity} error: {e}", flush=True)
         return {}
 
 
@@ -914,10 +934,26 @@ async def b44_update(entity: str, record_id: str, payload: dict) -> dict:
         async with bot.http_session.put(url, json=payload, headers=_b44_headers()) as r:
             if r.status in (200, 201):
                 return await r.json()
+            err_body = await r.text()
+            print(f"[b44_update] ⚠️ {entity}/{record_id} HTTP {r.status}: {err_body[:200]}", flush=True)
             return {}
     except Exception as e:
-        print("[b44_update] " + str(e))
+        print(f"[b44_update] ❌ {entity} error: {e}", flush=True)
         return {}
+
+
+async def b44_delete(entity: str, record_id: str) -> bool:
+    url = BASE44_API + "/" + entity + "/" + record_id
+    try:
+        async with bot.http_session.delete(url, headers=_b44_headers()) as r:
+            if r.status in (200, 204):
+                return True
+            err_body = await r.text()
+            print(f"[b44_delete] ⚠️ {entity}/{record_id} HTTP {r.status}: {err_body[:200]}", flush=True)
+            return False
+    except Exception as e:
+        print(f"[b44_delete] ❌ {entity} error: {e}", flush=True)
+        return False
 
 
 # ══════════════════════════════════════════════════════════
@@ -1513,17 +1549,27 @@ class StaffLogView(discord.ui.View):
 
 async def handle_support(message: discord.Message) -> None:
     # Elite-only AI support gate
-    ok, plan = await check_feature(str(message.guild.id), "ai_support")
+    ok, reason = await check_feature(str(message.guild.id), "ai_support")
     if not ok:
-        # Don't ghost the user — let them know support is handled by staff
-        embed = discord.Embed(
-            description=(
-                "👋 Hi! AI support is available on the **Elite** plan.\n"
-                "A staff member will assist you shortly.\n"
-                f"*(Current plan: {plan})*"
-            ),
-            color=0xFFA500
-        )
+        # Check if server is registered at all
+        srv = await get_server_record(str(message.guild.id))
+        if srv:
+            plan_name = (srv.get("plan_name") or "Unknown")
+            embed = discord.Embed(
+                description=(
+                    "👋 Hi! AI support is available on the **Elite** plan.\n"
+                    f"You're currently on **{plan_name}** — a staff member will assist you shortly."
+                ),
+                color=0xFFA500
+            )
+        else:
+            embed = discord.Embed(
+                description=(
+                    "👋 Hi! I'm NexPlay Bot.\n"
+                    "This server isn't registered yet — ask an admin to run `/setup` to activate tournament features."
+                ),
+                color=0xFFA500
+            )
         embed.set_footer(text="NexPlay Support")
         await message.reply(embed=embed, mention_author=False)
         return
