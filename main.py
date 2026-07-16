@@ -2517,6 +2517,248 @@ async def cmd_suggest_improvement(interaction: discord.Interaction):
 
 
 # ══════════════════════════════════════════════════════════
+#  CHANNEL / CATEGORY / TOURNAMENT DELETION COMMANDS
+# ══════════════════════════════════════════════════════════
+
+@tree.command(name="delete_channel", description="[Host] Delete a channel by name or ID")
+@app_commands.describe(channel="The channel to delete (name, ID, or #mention)")
+async def cmd_delete_channel(interaction: discord.Interaction, channel: str):
+    if not is_staff(interaction.user):
+        return await interaction.response.send_message(embed=err_e("You need the **Tournament Host** role to use this command."), ephemeral=True)
+
+    gid = str(interaction.guild.id)
+    allowed, reason = await is_allowed(gid, interaction.guild)
+    if not allowed:
+        return await interaction.response.send_message(embed=err_e(reason), ephemeral=True)
+
+    await interaction.response.defer(thinking=True, ephemeral=True)
+
+    # Parse channel input — could be #mention, raw ID, or channel name
+    ch = None
+    raw = channel.strip().lstrip("#")
+
+    # Try as mention <#123456>
+    if raw.startswith("<#") and raw.endswith(">"):
+        ch_id = raw[2:-1]
+        ch = interaction.guild.get_channel(int(ch_id)) if ch_id.isdigit() else None
+    elif raw.isdigit():
+        ch = interaction.guild.get_channel(int(raw))
+    else:
+        ch = discord.utils.get(interaction.guild.text_channels, name=raw)
+        if not ch:
+            ch = discord.utils.get(interaction.guild.voice_channels, name=raw)
+
+    if not ch:
+        return await interaction.followup.send(embed=err_e(f"Channel `{channel}` not found."), ephemeral=True)
+
+    ch_name = ch.name
+    try:
+        await ch.delete(reason=f"NexPlay: Deleted by {interaction.user.display_name}")
+        await interaction.followup.send(embed=ok_e("Channel Deleted", f"🗑️ Channel **#{ch_name}** has been deleted."), ephemeral=True)
+    except discord.Forbidden:
+        await interaction.followup.send(embed=err_e("I don't have permission to delete that channel."), ephemeral=True)
+    except Exception as e:
+        await interaction.followup.send(embed=err_e(f"Failed to delete channel: {e}"), ephemeral=True)
+
+
+@tree.command(name="delete_category", description="[Host] Delete a category AND all channels inside it")
+@app_commands.describe(category="The category to delete (name or ID)")
+async def cmd_delete_category(interaction: discord.Interaction, category: str):
+    if not is_staff(interaction.user):
+        return await interaction.response.send_message(embed=err_e("You need the **Tournament Host** role to use this command."), ephemeral=True)
+
+    gid = str(interaction.guild.id)
+    allowed, reason = await is_allowed(gid, interaction.guild)
+    if not allowed:
+        return await interaction.response.send_message(embed=err_e(reason), ephemeral=True)
+
+    await interaction.response.defer(thinking=True, ephemeral=True)
+
+    # Parse category input
+    cat = None
+    raw = category.strip()
+
+    if raw.isdigit():
+        cat = interaction.guild.get_channel(int(raw))
+        if cat and not isinstance(cat, discord.CategoryChannel):
+            cat = None
+    else:
+        cat = discord.utils.get(interaction.guild.categories, name=raw)
+
+    if not cat:
+        return await interaction.followup.send(embed=err_e(f"Category `{category}` not found."), ephemeral=True)
+
+    # Delete all channels inside the category first
+    deleted_channels = []
+    failed_channels = []
+    for ch in list(cat.channels):
+        try:
+            await ch.delete(reason=f"NexPlay: Category cleanup by {interaction.user.display_name}")
+            deleted_channels.append(ch.name)
+        except Exception:
+            failed_channels.append(ch.name)
+
+    # Delete the category itself
+    cat_name = cat.name
+    try:
+        await cat.delete(reason=f"NexPlay: Deleted by {interaction.user.display_name}")
+    except Exception as e:
+        return await interaction.followup.send(embed=err_e(f"Deleted {len(deleted_channels)} channels but failed to delete category: {e}"), ephemeral=True)
+
+    desc = f"🗑️ Category **{cat_name}** deleted along with **{len(deleted_channels)}** channels.\n"
+    if deleted_channels:
+        desc += "\n**Deleted channels:**\n" + "\n".join(f"• #{c}" for c in deleted_channels)
+    if failed_channels:
+        desc += "\n\n⚠️ **Failed to delete:**\n" + "\n".join(f"• #{c}" for c in failed_channels)
+
+    await interaction.followup.send(embed=ok_e("Category Deleted", desc), ephemeral=True)
+
+
+@tree.command(name="delete_tournament", description="[Host] Delete a tournament: DB record + all channels + category + registrations")
+@app_commands.describe(name="The tournament name to delete")
+async def cmd_delete_tournament(interaction: discord.Interaction, name: str):
+    if not is_staff(interaction.user):
+        return await interaction.response.send_message(embed=err_e("You need the **Tournament Host** role to use this command."), ephemeral=True)
+
+    gid = str(interaction.guild.id)
+    allowed, reason = await is_allowed(gid, interaction.guild)
+    if not allowed:
+        return await interaction.response.send_message(embed=err_e(reason), ephemeral=True)
+
+    await interaction.response.defer(thinking=True, ephemeral=True)
+
+    # Find tournament in DB
+    tournaments = await b44_list("Tournament", {"guild_id": gid})
+    tournament = None
+    for t in tournaments:
+        if t.get("name", "").lower() == name.lower() or t.get("short_name", "").lower() == name.lower():
+            tournament = t
+            break
+
+    if not tournament:
+        return await interaction.followup.send(embed=err_e(f"Tournament `{name}` not found in this server."), ephemeral=True)
+
+    t_name = tournament.get("name", name)
+    t_id = tournament.get("id", "")
+    short = tournament.get("short_name", "")
+    cat_name = tournament.get("category_name", f"🏆 {short.upper()}" if short else "")
+
+    deleted_channels = []
+    failed_channels = []
+    category_deleted = False
+
+    # 1. Delete tournament channels by short_name prefix
+    if short:
+        prefix = short.lower()
+        for ch in list(interaction.guild.text_channels):
+            if ch.name.lower().startswith(prefix):
+                try:
+                    await ch.delete(reason=f"NexPlay: Tournament '{t_name}' deleted by {interaction.user.display_name}")
+                    deleted_channels.append(ch.name)
+                except Exception:
+                    failed_channels.append(ch.name)
+
+    # 2. Delete the category
+    if cat_name:
+        cat = discord.utils.get(interaction.guild.categories, name=cat_name)
+        if cat:
+            # Delete any remaining channels in the category
+            for ch in list(cat.channels):
+                if ch.name not in deleted_channels:
+                    try:
+                        await ch.delete(reason=f"NexPlay: Tournament cleanup")
+                        deleted_channels.append(ch.name)
+                    except Exception:
+                        failed_channels.append(ch.name)
+            try:
+                await cat.delete(reason=f"NexPlay: Tournament '{t_name}' deleted")
+                category_deleted = True
+            except Exception:
+                pass
+
+    # 3. Delete registrations from DB
+    reg_count = 0
+    regs = await b44_list("Registration", {"tournament_id": t_id})
+    for reg in regs:
+        try:
+            # Delete via API
+            reg_id = reg.get("id")
+            if reg_id:
+                async with bot.http_session.delete(
+                    BASE44_API + "/Registration/" + reg_id,
+                    headers=_b44_headers()
+                ) as r:
+                    if r.status in (200, 204):
+                        reg_count += 1
+        except Exception:
+            pass
+
+    # 4. Delete tournament groups from DB
+    group_count = 0
+    groups = await b44_list("TournamentGroup", {"tournament_id": t_id})
+    for grp in groups:
+        try:
+            grp_id = grp.get("id")
+            if grp_id:
+                async with bot.http_session.delete(
+                    BASE44_API + "/TournamentGroup/" + grp_id,
+                    headers=_b44_headers()
+                ) as r:
+                    if r.status in (200, 204):
+                        group_count += 1
+        except Exception:
+            pass
+
+    # 5. Delete matches from DB
+    match_count = 0
+    matches = await b44_list("Match", {"tournament_id": t_id})
+    for m in matches:
+        try:
+            m_id = m.get("id")
+            if m_id:
+                async with bot.http_session.delete(
+                    BASE44_API + "/Match/" + m_id,
+                    headers=_b44_headers()
+                ) as r:
+                    if r.status in (200, 204):
+                        match_count += 1
+        except Exception:
+            pass
+
+    # 6. Delete the tournament record itself
+    t_deleted = False
+    if t_id:
+        try:
+            async with bot.http_session.delete(
+                BASE44_API + "/Tournament/" + t_id,
+                headers=_b44_headers()
+            ) as r:
+                if r.status in (200, 204):
+                    t_deleted = True
+        except Exception:
+            pass
+
+    # Build summary
+    desc = f"🗑️ **Tournament: {t_name}**\n\n"
+    desc += f"**Channels deleted:** {len(deleted_channels)}\n"
+    if deleted_channels:
+        desc += "\n".join(f"• #{c}" for c in deleted_channels) + "\n"
+    if category_deleted:
+        desc += f"**Category deleted:** {cat_name}\n"
+    if failed_channels:
+        desc += f"\n⚠️ **Failed to delete {len(failed_channels)} channel(s)**\n"
+    desc += f"\n**Registrations deleted:** {reg_count}\n"
+    desc += f"**Groups deleted:** {group_count}\n"
+    desc += f"**Matches deleted:** {match_count}\n"
+    desc += f"**Tournament record:** {'✅ Deleted' if t_deleted else '❌ Failed'}"
+
+    if t_deleted:
+        await interaction.followup.send(embed=ok_e("Tournament Deleted", desc), ephemeral=True)
+    else:
+        await interaction.followup.send(embed=err_e("Tournament channels cleaned but DB record could not be deleted. Check API connection."), ephemeral=True)
+
+
+# ══════════════════════════════════════════════════════════
 #  AUTO-REGISTER WHEN BOT JOINS A NEW SERVER
 # ══════════════════════════════════════════════════════════
 @bot.event
