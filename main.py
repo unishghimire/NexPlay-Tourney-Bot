@@ -2516,6 +2516,144 @@ async def cmd_suggest_improvement(interaction: discord.Interaction):
 
 
 
+async def build_tournament_export_excel(tournament: dict, registrations: list, groups: list, matches: list) -> io.BytesIO:
+    """Build an Excel sheet with ALL data for a single tournament — used before deletion."""
+    wb = openpyxl.Workbook()
+
+    # ── Sheet 1: TOURNAMENT DETAILS ────────────────────────────────
+    ws_t = wb.active
+    ws_t.title = "Tournament"
+    details = [
+        ("Field", "Value"),
+        ("ID", tournament.get("id", "")),
+        ("Name", tournament.get("name", "")),
+        ("Short Name", tournament.get("short_name", "")),
+        ("Game", tournament.get("game", "")),
+        ("Status", tournament.get("status", "")),
+        ("Format", tournament.get("format", "")),
+        ("Prize Pool", tournament.get("prize_pool", "")),
+        ("Description", tournament.get("description", "")),
+        ("Rules", tournament.get("rules", "")),
+        ("Max Players", tournament.get("max_players", "")),
+        ("Team Size", tournament.get("team_size", "")),
+        ("Group Size", tournament.get("group_size", "")),
+        ("Rounds", tournament.get("rounds", "")),
+        ("Registered Count", tournament.get("registered_count", 0)),
+        ("Tournament Date", tournament.get("tournament_date", "")),
+        ("Tournament Time", tournament.get("tournament_time", "")),
+        ("Reg Deadline", tournament.get("reg_deadline", "")),
+        ("Stream Channel", tournament.get("stream_channel", "")),
+        ("Eligible Nations", tournament.get("eligible_nations", "")),
+        ("Category Name", tournament.get("category_name", "")),
+        ("Announcement Channel ID", tournament.get("announcement_channel_id", "")),
+        ("Registration Channel ID", tournament.get("registration_channel_id", "")),
+        ("Created By", tournament.get("created_by_discord_id", "")),
+        ("Created At", str(tournament.get("created_date", ""))),
+        ("Started At", tournament.get("started_at", "")),
+    ]
+    for ri, (field, val) in enumerate(details, 1):
+        c1 = ws_t.cell(row=ri, column=1, value=field)
+        c2 = ws_t.cell(row=ri, column=2, value=str(val) if val is not None else "")
+        if ri == 1:
+            _xl_header_style(c1)
+            _xl_header_style(c2)
+        else:
+            c1.font = Font(bold=True)
+            _xl_border(c1)
+            _xl_border(c2)
+            c2.alignment = Alignment(vertical="top", wrap_text=True)
+    ws_t.column_dimensions["A"].width = 24
+    ws_t.column_dimensions["B"].width = 50
+
+    # ── Sheet 2: REGISTRATIONS ─────────────────────────────────────
+    ws_r = wb.create_sheet("Registrations")
+    r_headers = ["Team Name", "Discord User", "Team Members", "Status", "Seed #", "Group", "Logo URL", "Registered At"]
+    for ci, h in enumerate(r_headers, 1):
+        c = ws_r.cell(row=1, column=ci, value=h)
+        _xl_header_style(c, "375623")
+        _xl_border(c)
+    ws_r.row_dimensions[1].height = 20
+
+    for ri, reg in enumerate(registrations, 2):
+        row = [
+            reg.get("player_name", ""),
+            reg.get("player_discord_id", ""),
+            str(reg.get("team_members", "")),
+            reg.get("status", ""),
+            reg.get("seed_number", ""),
+            reg.get("group_label", "—"),
+            reg.get("logo_url", ""),
+            str(reg.get("registered_at", "")),
+        ]
+        for ci, val in enumerate(row, 1):
+            c = ws_r.cell(row=ri, column=ci, value=str(val) if val is not None else "")
+            _xl_border(c)
+            c.alignment = Alignment(vertical="center", wrap_text=(ci == 3))
+
+    for ci, w in enumerate([18, 18, 35, 14, 7, 8, 30, 20], 1):
+        ws_r.column_dimensions[get_column_letter(ci)].width = w
+
+    # ── Sheet 3: GROUPS ─────────────────────────────────────────────
+    ws_g = wb.create_sheet("Groups")
+    g_headers = ["Group Label", "Player Names", "Player IDs", "Generated At"]
+    for ci, h in enumerate(g_headers, 1):
+        c = ws_g.cell(row=1, column=ci, value=h)
+        _xl_header_style(c, "843C0C")
+        _xl_border(c)
+    ws_g.row_dimensions[1].height = 20
+
+    for ri, grp in enumerate(groups, 2):
+        row = [
+            grp.get("group_label", ""),
+            str(grp.get("player_names", "")),
+            str(grp.get("player_ids", "")),
+            str(grp.get("generated_at", "")),
+        ]
+        for ci, val in enumerate(row, 1):
+            c = ws_g.cell(row=ri, column=ci, value=str(val) if val is not None else "")
+            _xl_border(c)
+            c.alignment = Alignment(vertical="center", wrap_text=(ci in (2, 3)))
+
+    for ci, w in enumerate([12, 40, 40, 20], 1):
+        ws_g.column_dimensions[get_column_letter(ci)].width = w
+
+    # ── Sheet 4: MATCHES ────────────────────────────────────────────
+    ws_m = wb.create_sheet("Matches")
+    m_headers = ["Round", "Match #", "Group", "Player 1", "Player 2", "P1 Score", "P2 Score", "Winner", "Status", "Scheduled At", "Results Card"]
+    for ci, h in enumerate(m_headers, 1):
+        c = ws_m.cell(row=1, column=ci, value=h)
+        _xl_header_style(c, "1F4E79")
+        _xl_border(c)
+    ws_m.row_dimensions[1].height = 20
+
+    for ri, m in enumerate(matches, 2):
+        row = [
+            m.get("round_number", ""),
+            m.get("match_number", ""),
+            m.get("group_label", "—"),
+            m.get("player1_username", ""),
+            m.get("player2_username", ""),
+            m.get("player1_score", ""),
+            m.get("player2_score", ""),
+            m.get("winner_username", ""),
+            m.get("status", ""),
+            str(m.get("scheduled_at", "")),
+            m.get("results_card_image_url", ""),
+        ]
+        for ci, val in enumerate(row, 1):
+            c = ws_m.cell(row=ri, column=ci, value=str(val) if val is not None else "")
+            _xl_border(c)
+            c.alignment = Alignment(vertical="center")
+
+    for ci, w in enumerate([7, 8, 8, 18, 18, 8, 8, 18, 12, 20, 30], 1):
+        ws_m.column_dimensions[get_column_letter(ci)].width = w
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf
+
+
 # ══════════════════════════════════════════════════════════
 #  CHANNEL / CATEGORY / TOURNAMENT DELETION COMMANDS
 # ══════════════════════════════════════════════════════════
@@ -2646,6 +2784,50 @@ async def cmd_delete_tournament(interaction: discord.Interaction, name: str):
     deleted_channels = []
     failed_channels = []
     category_deleted = False
+
+    # 0. Export Excel backup BEFORE deleting anything
+    excel_sent = False
+    try:
+        regs_for_export = await b44_list("Registration", {"tournament_id": t_id})
+        groups_for_export = await b44_list("TournamentGroup", {"tournament_id": t_id})
+        matches_for_export = await b44_list("Match", {"tournament_id": t_id})
+
+        xl_buf = await build_tournament_export_excel(
+            tournament, regs_for_export, groups_for_export, matches_for_export
+        )
+        safe_name = "".join(c for c in t_name if c.isalnum() or c in " -_")[:30].strip() or "tournament"
+        filename = f"NexPlay_Backup_{safe_name}_{datetime.now(timezone.utc).strftime('%Y%m%d')}.xlsx"
+
+        # DM the server owner
+        owner = interaction.guild.owner
+        if owner:
+            try:
+                dm_ch = await owner.create_dm()
+                file = discord.File(xl_buf, filename=filename)
+                dm_embed = discord.Embed(
+                    title="📦 Tournament Data Backup",
+                    description=(
+                        f"An Excel backup of **{t_name}** has been exported before deletion.\n\n"
+                        f"**Server:** {interaction.guild.name}\n"
+                        f"**Tournament:** {t_name}\n"
+                        f"**Registrations:** {len(regs_for_export)}\n"
+                        f"**Groups:** {len(groups_for_export)}\n"
+                        f"**Matches:** {len(matches_for_export)}\n\n"
+                        f"Deleted by: {interaction.user.mention}\n"
+                        f"Date: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
+                    ),
+                    color=0xFFA500
+                )
+                await dm_ch.send(embed=dm_embed, file=file)
+                excel_sent = True
+                log(f"[Delete] Excel backup sent to {owner.display_name} for tournament '{t_name}'")
+            except discord.Forbidden:
+                log(f"[Delete] Cannot DM owner {owner.display_name} — sending to channel instead")
+                file = discord.File(xl_buf, filename=filename)
+                await interaction.channel.send(embed=dm_embed, file=file)
+                excel_sent = True
+    except Exception as e:
+        log(f"[Delete] Excel export failed: {e}")
 
     # 1. Delete tournament channels by short_name prefix
     if short:
