@@ -238,40 +238,64 @@ MEME_INTERVAL   = 30 * 60   # post every 30 minutes
 _last_meme_url: dict[int, str] = {}
 
 async def fetch_reddit_meme(subreddit: str = "dankmemes", exclude_url: str = "") -> dict | None:
-    """Fetch a fresh trending meme from Reddit — skips NSFW, videos, and the last posted URL."""
+    """Fetch a fresh trending meme via meme-api.com (Reddit JSON API now blocks non-OAuth).
+    Falls back across multiple subreddits if needed. Skips NSFW and the last posted URL."""
     import random
-    # Use a random sort (new/hot/top) to get variety each call
-    sort = random.choice(["hot", "new", "top"])
-    url = f"https://www.reddit.com/r/{subreddit}/{sort}.json?limit=50&t=day"
-    try:
-        async with bot.http_session.get(
-            url,
-            headers={"User-Agent": "NexPlayBot/4.0 (nexplay-tourney-bot)"},
-            timeout=aiohttp.ClientTimeout(total=10)
-        ) as r:
-            if r.status != 200:
-                print(f"[NexPlay] Reddit {r.status} for r/{subreddit}", flush=True)
-                return None
-            data = await r.json(content_type=None)
-            posts = data.get("data", {}).get("children", [])
-            random.shuffle(posts)
-            for post in posts:
-                p = post.get("data", {})
-                if p.get("is_video") or p.get("over_18") or p.get("stickied"):
+
+    # meme-api.com supports subreddit-specific fetch: /gimme/<subreddit>
+    # If no subreddit specified, fetch from a random gaming/meme subreddit
+    sub_list = MEME_SUBREDDITS if subreddit == "dankmemes" else [subreddit]
+
+    for attempt_sub in random.sample(sub_list, min(3, len(sub_list))):
+        try:
+            url = f"https://meme-api.com/gimme/{attempt_sub}"
+            async with bot.http_session.get(
+                url,
+                headers={"User-Agent": "NexPlayBot/4.0"},
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as r:
+                if r.status != 200:
                     continue
-                img_url = p.get("url", "")
+                data = await r.json(content_type=None)
+                if not isinstance(data, dict) or "url" not in data:
+                    continue
+                img_url = data.get("url", "")
                 # Skip if same as last posted
                 if img_url == exclude_url:
                     continue
-                if any(img_url.lower().endswith(ext) for ext in (".jpg", ".jpeg", ".png", ".gif", ".gifv")):
+                # Skip NSFW
+                if data.get("nsfw", False) or data.get("spoiler", False):
+                    continue
+                return {
+                    "title":     data.get("title", "")[:256],
+                    "url":       img_url,
+                    "permalink": data.get("postLink", ""),
+                    "score":     data.get("ups", 0),
+                }
+        except Exception as e:
+            print(f"[NexPlay] meme fetch error r/{attempt_sub}: {e}", flush=True)
+            continue
+
+    # Last resort: fetch a random meme (no subreddit filter)
+    try:
+        async with bot.http_session.get(
+            "https://meme-api.com/gimme",
+            headers={"User-Agent": "NexPlayBot/4.0"},
+            timeout=aiohttp.ClientTimeout(total=10)
+        ) as r:
+            if r.status == 200:
+                data = await r.json(content_type=None)
+                img_url = data.get("url", "")
+                if img_url and img_url != exclude_url:
                     return {
-                        "title":     p.get("title", "")[:256],
+                        "title":     data.get("title", "")[:256],
                         "url":       img_url,
-                        "permalink": "https://reddit.com" + p.get("permalink", ""),
-                        "score":     p.get("score", 0),
+                        "permalink": data.get("postLink", ""),
+                        "score":     data.get("ups", 0),
                     }
     except Exception as e:
-        print(f"[NexPlay] meme fetch error r/{subreddit}: {e}", flush=True)
+        print(f"[NexPlay] meme fetch fallback error: {e}", flush=True)
+
     return None
 
 async def auto_meme_loop():
