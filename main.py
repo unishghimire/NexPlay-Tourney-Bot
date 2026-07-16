@@ -62,7 +62,7 @@ HOME_GUILD  = int(os.environ.get("DISCORD_GUILD_ID", "0"))   # owner's server on
 SVC_TOKEN   = os.environ.get("BASE44_SERVICE_TOKEN", "")
 APP_ID      = os.environ.get("APP_ID", "6a5226b5047f5c59d961130e")
 
-BASE44_API  = "https://api.base44.com/api/apps/" + APP_ID + "/entities"
+BASE44_API  = "https://" + APP_ID + ".base44.app/api/apps/" + APP_ID + "/entities"
 DISCORD_API = "https://discord.com/api/v10"
 
 # ── Role names that count as "staff" in any server ────────
@@ -1035,15 +1035,10 @@ CHANNEL_NAMES = {
 
 
 def resolve_channel(guild: discord.Guild, key: str) -> discord.TextChannel | None:
-    """Find a channel by trying a list of common names."""
+    """Find a channel by trying a list of common names. No fallback — returns None if not found."""
     for name in CHANNEL_NAMES.get(key, []):
         ch = discord.utils.get(guild.text_channels, name=name)
         if ch:
-            return ch
-    # fallback: first text channel the bot can send in
-    for ch in guild.text_channels:
-        perms = ch.permissions_for(guild.me)
-        if perms.send_messages and perms.embed_links:
             return ch
     return None
 
@@ -1052,6 +1047,7 @@ async def get_or_create_channels(guild: discord.Guild) -> dict:
     """
     Ensure required channels exist. Returns a dict of channel IDs.
     Creates missing channels under a 'NexPlay Tournaments' category.
+    Only creates a channel if it doesn't already exist — no duplicates.
     """
     required = {
         "announcements": "tourney-announcements",
@@ -1072,10 +1068,15 @@ async def get_or_create_channels(guild: discord.Guild) -> dict:
     for key, ch_name in required.items():
         ch = resolve_channel(guild, key)
         if not ch:
-            try:
-                ch = await guild.create_text_channel(ch_name, category=category)
-            except Exception:
-                ch = guild.text_channels[0] if guild.text_channels else None
+            # Double-check by exact name to avoid duplicates
+            existing = discord.utils.get(guild.text_channels, name=ch_name)
+            if existing:
+                ch = existing
+            else:
+                try:
+                    ch = await guild.create_text_channel(ch_name, category=category)
+                except Exception:
+                    ch = None
         result[key] = ch.id if ch else None
     return result
 
@@ -2250,20 +2251,25 @@ async def cmd_setup(interaction: discord.Interaction):
     # Register or update server record
     existing = await get_server_record(gid)
     if not existing:
-        await b44_create("Server", {
+        created = await b44_create("Server", {
             "guild_id": gid, "guild_name": interaction.guild.name,
-            "owner_discord_id": str(interaction.guild.owner_id),
+            "owner_id": str(interaction.guild.owner_id),
+            "owner_name": interaction.user.display_name,
+            "plan_name": "Free Trial",
             "subscription_status": "trial", "tournaments_used": 0,
             "tournament_limit": 3, "member_count": interaction.guild.member_count or 0,
             "last_active": now_iso(),
         })
-        status_msg = "Server registered! You have a **free trial** with 3 tournaments."
+        if created and created.get("id"):
+            status_msg = "Server registered! You have a **free trial** with 3 tournaments."
+        else:
+            status_msg = "⚠️ Failed to register server in the database. Please try again or contact support."
     else:
         status_msg = "Server already registered. Status: **" + str(existing.get("subscription_status", "?")) + "**"
 
     # Provision channels
     channels = await get_or_create_channels(interaction.guild)
-    ch_list  = "\n".join("> <#" + str(v) + ">" for v in channels.values() if v)
+    ch_list  = "\n".join(f"> <#{v}>" for v in channels.values() if v) or "No channels created (check bot permissions)."
 
     await interaction.followup.send(embed=ok_e(
         "NexPlay Setup Complete!",
