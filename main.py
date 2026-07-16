@@ -231,21 +231,25 @@ tree = bot.tree
 #  MEME / FUNNY VIDEO AUTO-POSTER  (Elite plan only)
 # ══════════════════════════════════════════════════════════
 
-MEME_SUBREDDITS = ["dankmemes", "gaming", "freefire", "PUBGMobile", "mildlyinfuriating", "FreeFireBattlegrounds"]
+MEME_SUBREDDITS = [
+    "dankmemes", "gaming", "freefire", "PUBGMobile", "FreeFireBattlegrounds",
+    "memes", "Minecraft", "IndianGaming", "gamingmemes", "ProgrammerHumor",
+    "okbuddyretard", "wholesomememes", "PewdiepieSubmissions", "aww",
+]
+
+# Per-guild meme state tracking
+_last_meme_url: dict[int, str] = {}     # guild_id → last posted meme URL
+_meme_channel_cache: dict[int, int] = {} # guild_id → channel_id (cached)
 MEME_INTERVAL   = 30 * 60   # post every 30 minutes
 
-# Track last posted URL per guild so we never repeat the same meme
-_last_meme_url: dict[int, str] = {}
-
 async def fetch_reddit_meme(subreddit: str = "dankmemes", exclude_url: str = "") -> dict | None:
-    """Fetch a fresh trending meme via meme-api.com (Reddit JSON API now blocks non-OAuth).
-    Falls back across multiple subreddits if needed. Skips NSFW and the last posted URL."""
+    """Fetch a trending meme via meme-api.com.
+    Tries /gimme/<subreddit> (returns top/hot post), falls back across subreddits.
+    Skips NSFW, spoilers, and the last posted URL for this guild."""
     import random
 
-    # meme-api.com supports subreddit-specific fetch: /gimme/<subreddit>
-    # If no subreddit specified, fetch from a random gaming/meme subreddit
     sub_list = MEME_SUBREDDITS if subreddit == "dankmemes" else [subreddit]
-
+    # Try up to 3 different subreddits
     for attempt_sub in random.sample(sub_list, min(3, len(sub_list))):
         try:
             url = f"https://meme-api.com/gimme/{attempt_sub}"
@@ -260,10 +264,9 @@ async def fetch_reddit_meme(subreddit: str = "dankmemes", exclude_url: str = "")
                 if not isinstance(data, dict) or "url" not in data:
                     continue
                 img_url = data.get("url", "")
-                # Skip if same as last posted
-                if img_url == exclude_url:
+                if not img_url or img_url == exclude_url:
                     continue
-                # Skip NSFW
+                # Skip NSFW and spoilers
                 if data.get("nsfw", False) or data.get("spoiler", False):
                     continue
                 return {
@@ -271,12 +274,13 @@ async def fetch_reddit_meme(subreddit: str = "dankmemes", exclude_url: str = "")
                     "url":       img_url,
                     "permalink": data.get("postLink", ""),
                     "score":     data.get("ups", 0),
+                    "subreddit": data.get("subreddit", attempt_sub),
                 }
         except Exception as e:
             print(f"[NexPlay] meme fetch error r/{attempt_sub}: {e}", flush=True)
             continue
 
-    # Last resort: fetch a random meme (no subreddit filter)
+    # Fallback: fetch a random meme (no subreddit filter)
     try:
         async with bot.http_session.get(
             "https://meme-api.com/gimme",
@@ -286,12 +290,13 @@ async def fetch_reddit_meme(subreddit: str = "dankmemes", exclude_url: str = "")
             if r.status == 200:
                 data = await r.json(content_type=None)
                 img_url = data.get("url", "")
-                if img_url and img_url != exclude_url:
+                if img_url and img_url != exclude_url and not data.get("nsfw", False):
                     return {
                         "title":     data.get("title", "")[:256],
                         "url":       img_url,
                         "permalink": data.get("postLink", ""),
                         "score":     data.get("ups", 0),
+                        "subreddit": data.get("subreddit", "random"),
                     }
     except Exception as e:
         print(f"[NexPlay] meme fetch fallback error: {e}", flush=True)
@@ -299,68 +304,89 @@ async def fetch_reddit_meme(subreddit: str = "dankmemes", exclude_url: str = "")
     return None
 
 async def auto_meme_loop():
-    """Every MEME_INTERVAL seconds, post a DIFFERENT trending meme to each Elite-plan server."""
+    """Post trending memes to ALL servers every 30 minutes.
+    Elite servers: every 30 min. Non-Elite: every 2 hours (4 cycles)."""
     await bot.wait_until_ready()
     import random
-    print("[NexPlay] auto_meme_loop started.", flush=True)
+    _cycle = 0
+    print(f"[NexPlay] auto_meme_loop started — interval={MEME_INTERVAL}s (30 min)", flush=True)
     while not bot.is_closed():
+        _cycle += 1
         try:
             for guild in bot.guilds:
                 try:
-                    # Gate: Elite plan only
+                    # Check plan — Elite gets memes every cycle, others every 4th cycle (2 hours)
                     ok, _ = await check_feature(str(guild.id), "meme_post")
-                    if not ok:
-                        continue
+                    if not ok and _cycle % 4 != 0:
+                        continue  # Non-Elite: skip until 4th cycle
 
-                    # Find target channel: memes > funny > media > general
+                    # Find target channel — prefer #memes, #meme-server, #funny, then fallback
                     target = None
-                    for name_hint in ("meme", "funny", "media", "general", "chat"):
-                        target = discord.utils.find(
-                            lambda c, h=name_hint: (
-                                isinstance(c, discord.TextChannel)
-                                and h in c.name.lower()
-                                and c.permissions_for(guild.me).send_messages
-                            ),
-                            guild.text_channels
-                        )
-                        if target:
-                            break
+                    # Try cached channel first
+                    cached_ch_id = _meme_channel_cache.get(guild.id)
+                    if cached_ch_id:
+                        target = guild.get_channel(cached_ch_id)
+                        if target and not target.permissions_for(guild.me).send_messages:
+                            target = None  # Lost permissions, re-find
 
                     if not target:
-                        print(f"[NexPlay] No postable channel found in {guild.name}", flush=True)
-                        continue
+                        for name_hint in ("meme-server", "memes", "meme", "funny", "media", "general", "chat"):
+                            target = discord.utils.find(
+                                lambda c, h=name_hint: (
+                                    isinstance(c, discord.TextChannel)
+                                    and h in c.name.lower()
+                                    and c.permissions_for(guild.me).send_messages
+                                ),
+                                guild.text_channels
+                            )
+                            if target:
+                                _meme_channel_cache[guild.id] = target.id
+                                break
 
-                    # Pick a different subreddit per guild using guild ID as seed offset
-                    sub = MEME_SUBREDDITS[(guild.id // 1000) % len(MEME_SUBREDDITS)]
+                    if not target:
+                        continue  # No channel found, skip silently
 
-                    # Exclude last posted URL for this guild
+                    # Pick subreddit — rotate per guild per cycle for variety
+                    sub_idx = (guild.id // 1000 + _cycle) % len(MEME_SUBREDDITS)
+                    sub = MEME_SUBREDDITS[sub_idx]
+
+                    # Fetch trending meme — try multiple subreddits
                     last_url = _last_meme_url.get(guild.id, "")
                     meme = await fetch_reddit_meme(sub, exclude_url=last_url)
 
-                    # Fallback: try a different subreddit if first returned nothing
+                    # Fallback: random different subreddit
                     if not meme:
-                        alt_sub = random.choice([s for s in MEME_SUBREDDITS if s != sub])
-                        meme = await fetch_reddit_meme(alt_sub, exclude_url=last_url)
+                        alt_subs = [s for s in MEME_SUBREDDITS if s != sub]
+                        random.shuffle(alt_subs)
+                        for alt_sub in alt_subs[:3]:
+                            meme = await fetch_reddit_meme(alt_sub, exclude_url=last_url)
+                            if meme:
+                                sub = alt_sub
+                                break
 
                     if not meme:
-                        print(f"[NexPlay] No meme found for {guild.name}", flush=True)
                         continue
 
-                    # Save so we don't repeat next cycle
+                    # Save URL to prevent repeats
                     _last_meme_url[guild.id] = meme["url"]
 
+                    # Build trending embed
+                    score = meme.get("score", 0)
+                    is_hot = score > 1000
                     embed = discord.Embed(
-                        title=meme["title"],
+                        title=f"🔥 {meme['title']}",
                         url=meme["permalink"],
-                        color=0xFF6B35
+                        color=0xFF6B35 if is_hot else 0x5865F2
                     )
                     embed.set_image(url=meme["url"])
-                    embed.set_footer(text=f"r/{sub} • 🔥 Trending on Reddit | NexPlay")
+                    footer_text = f"r/{sub} • {'🔥 HOT' if is_hot else 'Trending'} • 👍 {score:,} | NexPlay Memes"
+                    embed.set_footer(text=footer_text)
+
                     await target.send(embed=embed)
-                    print(f"[NexPlay] Meme posted to #{target.name} in {guild.name} (score: {meme['score']})", flush=True)
+                    print(f"[NexPlay] Meme posted → #{target.name} in {guild.name} (r/{sub}, score={score})", flush=True)
 
                 except Exception as guild_err:
-                    print(f"[NexPlay] meme loop guild error ({guild.name}): {guild_err}", flush=True)
+                    print(f"[NexPlay] meme loop error ({guild.name}): {guild_err}", flush=True)
 
         except Exception as e:
             print(f"[NexPlay] auto_meme_loop outer error: {e}", flush=True)
@@ -2944,7 +2970,8 @@ async def cmd_delete_tournament(interaction: discord.Interaction, name: str):
 # ══════════════════════════════════════════════════════════
 @bot.event
 async def on_guild_join(guild: discord.Guild):
-    print(f"[NexPlay] Joined: {guild.name} ({guild.id})", flush=True)
+    """Auto-register new servers with Free Trial plan. Works for unlimited servers."""
+    print(f"[NexPlay] 🆕 Joined: {guild.name} ({guild.id}) — {guild.member_count} members", flush=True)
     existing = await b44_list("Server", {"guild_id": str(guild.id)})
     if not existing:
         owner = guild.owner
@@ -2952,7 +2979,7 @@ async def on_guild_join(guild: discord.Guild):
             "guild_id":            str(guild.id),
             "guild_name":          guild.name,
             "owner_id":            str(owner.id) if owner else "",
-            "owner_name":          owner.display_name if owner else "Unknown",
+            "owner_name":           owner.display_name if owner else "Unknown",
             "plan_name":           "Free Trial",
             "subscription_status": "trial",
             "tournaments_used":    0,
@@ -2960,22 +2987,94 @@ async def on_guild_join(guild: discord.Guild):
             "member_count":        guild.member_count or 0,
             "last_active":         now_iso(),
         })
-        print(f"[NexPlay] Registered {guild.name} as Free Trial", flush=True)
+        print(f"[NexPlay] ✅ Registered {guild.name} as Free Trial (3 tournaments)", flush=True)
+    else:
+        print(f"[NexPlay] {guild.name} already registered", flush=True)
+
+    # Auto-create needed roles if missing
+    try:
+        for role_name in ("Tournament Host", "NexPlay Admin"):
+            if not discord.utils.get(guild.roles, name=role_name):
+                await guild.create_role(
+                    name=role_name,
+                    colour=discord.Colour.gold() if "Admin" in role_name else discord.Colour.blue(),
+                    mentionable=True,
+                    reason="NexPlay: Auto-created role for tournament management"
+                )
+                print(f"[NexPlay] Created role '{role_name}' in {guild.name}", flush=True)
+    except Exception as e:
+        print(f"[NexPlay] Role creation failed in {guild.name}: {e}", flush=True)
+
+    # Welcome message
     for ch in guild.text_channels:
         if ch.permissions_for(guild.me).send_messages:
             e = discord.Embed(
                 title="👋 NexPlay Tournament System is here!",
                 description=(
-                    "**Get started:**\n"
-                    "1. Give yourself the `Tournament Host` role (or use server owner)\n"
+                    f"Welcome **{guild.name}** to NexPlay! 🎮\n\n"
+                    "**What I can do:**\n"
+                    "🏆 `/create_tournament` — Create tournaments with auto-channels\n"
+                    "✍️ `/register` — Players register via text in #register channels\n"
+                    "📊 `/generate_groups` — Auto group draws\n"
+                    "🎨 GFX generation, match results, CSV exports\n"
+                    "🤖 AI support in #support / #help channels\n"
+                    "🔥 Trending memes every 30 minutes\n\n"
+                    "**Getting started:**\n"
+                    "1. Make sure you have the `Tournament Host` role\n"
                     "2. Run `/create_tournament` to create your first tournament\n"
-                    "3. Portal: https://nexplay-server-portal.vercel.app\n\n"
-                    "Your server starts on **Free Trial** (3 tournaments). Upgrade anytime!"
+                    "3. Manage tournaments: https://nexplay-server-portal.vercel.app\n\n"
+                    "Your server is on **Free Trial** (3 tournaments). Upgrade anytime!"
                 ),
                 color=0x5865F2
             )
+            e.set_footer(text="NexPlay Tournament System • Multi-server ready")
             try: await ch.send(embed=e)
             except: pass
             break
+
+    # Update member count for existing servers on join
+    srv = await get_server_record(str(guild.id))
+    if srv:
+        await b44_update("Server", srv["id"], {
+            "member_count": guild.member_count or 0,
+            "last_active": now_iso(),
+        })
+
+@bot.event
+async def on_guild_remove(guild: discord.Guild):
+    """Bot removed from a server — mark inactive but DON'T delete data."""
+    print(f"[NexPlay] ❌ Removed from: {guild.name} ({guild.id})", flush=True)
+    srv = await get_server_record(str(guild.id))
+    if srv:
+        await b44_update("Server", srv["id"], {
+            "subscription_status": "inactive",
+            "last_active": now_iso(),
+        })
+        print(f"[NexPlay] Marked {guild.name} as inactive (data preserved)", flush=True)
+    # Clean up meme cache
+    _last_meme_url.pop(guild.id, None)
+    _meme_channel_cache.pop(guild.id, None)
+
+
+@bot.event
+async def on_member_join(member: discord.Member):
+    """Update member count when someone joins a server."""
+    srv = await get_server_record(str(member.guild.id))
+    if srv:
+        await b44_update("Server", srv["id"], {
+            "member_count": member.guild.member_count or 0,
+            "last_active": now_iso(),
+        })
+
+
+@bot.event
+async def on_member_remove(member: discord.Member):
+    """Update member count when someone leaves."""
+    srv = await get_server_record(str(member.guild.id))
+    if srv:
+        await b44_update("Server", srv["id"], {
+            "member_count": member.guild.member_count or 0,
+        })
+
 
 bot.run(BOT_TOKEN)
