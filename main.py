@@ -714,95 +714,6 @@ class TournamentStep3Modal(discord.ui.Modal, title="🏆 Create Tournament (3/3)
         await interaction.followup.send(embed=confirm, ephemeral=True)
 
 
-async def make_tournament_channels(guild: discord.Guild, tournament_name: str) -> dict:
-    """
-    Create a dedicated category + 8 channels for each tournament.
-    
-    Format: <short_name>-<channel>
-    Example: For "NexPlay Open 2026":
-      Category: 🏆 NPO26
-        #npo26-info
-        #npo26-announcements  
-        #npo26-roadmap
-        #npo26-results
-        #npo26-groups
-        #npo26-register
-        #npo26-confirm-teams
-        #npo26-help
-    
-    Returns dict with channel IDs.
-    """
-    import re
-    
-    # ── Generate short name from tournament name ──────────────────────────────
-    words = tournament_name.strip().split()
-    short = ""
-    if len(words) == 1:
-        # Single word: take first 4 chars
-        short = words[0][:4].lower()
-    else:
-        # Multiple words: take first letter of each word + last word digits if any
-        initials = "".join(w[0] for w in words if w).lower()
-        # Add any numbers found in the name
-        nums = re.sub(r"[^0-9]", "", tournament_name)[-2:]
-        short = (initials + nums)[:6]
-    
-    short = re.sub(r"[^a-z0-9]", "", short)[:6]
-    if not short:
-        short = "tourney"
-
-    cat_name = f"🏆 {short.upper()}"
-    
-    # Sub-channels: (key, channel_suffix, topic)
-    channels_def = [
-        ("info",          f"{short}-info",           "📋 Tournament information, rules and details"),
-        ("announcements", f"{short}-announcements",   "📢 Official tournament announcements"),
-        ("roadmap",       f"{short}-roadmap",         "🗺️ Tournament roadmap and schedule overview"),
-        ("results",       f"{short}-results",         "🏅 Match results and standings"),
-        ("groups",        f"{short}-groups",          "🎯 Group draws and bracket reveal"),
-        ("register",      f"{short}-register",        "✍️ Player registration — use /register here"),
-        ("confirm-teams", f"{short}-confirm-teams",   "✅ Team confirmation and roster lock"),
-        ("help",          f"{short}-help",            "❓ Support and help for this tournament"),
-    ]
-    
-    result = {"short_name": short, "category_name": cat_name}
-    
-    # ── Create or find category ───────────────────────────────────────────────
-    category = discord.utils.get(guild.categories, name=cat_name)
-    if not category:
-        try:
-            category = await guild.create_category(
-                cat_name,
-                reason=f"NexPlay: Tournament '{tournament_name}' channels"
-            )
-        except Exception as e:
-            log(f"[ERROR] Could not create category {cat_name}: {e}")
-            category = None
-    
-    result["category_id"] = str(category.id) if category else None
-
-    # ── Create each channel ───────────────────────────────────────────────────
-    for key, ch_name, topic in channels_def:
-        existing = discord.utils.get(guild.text_channels, name=ch_name)
-        if not existing:
-            try:
-                ch = await guild.create_text_channel(
-                    ch_name,
-                    category=category,
-                    topic=topic,
-                    reason=f"NexPlay: {tournament_name} tournament"
-                )
-                result[key] = str(ch.id)
-            except Exception as e:
-                log(f"[ERROR] Could not create #{ch_name}: {e}")
-                result[key] = None
-        else:
-            result[key] = str(existing.id)
-    
-    log(f"[Channels] Created tournament channels for '{tournament_name}' → category '{cat_name}'")
-    return result
-
-
 class TournamentEditModal(discord.ui.Modal, title="✏️ Edit Tournament"):
     t_prize     = discord.ui.TextInput(label="Prize Pool",         max_length=60)
     t_date      = discord.ui.TextInput(label="Tournament Date",    max_length=30)
@@ -952,6 +863,12 @@ async def on_ready():
     for g in guilds:
         print(f"[NexPlay]   • {g.name} ({g.id}) — {g.member_count} members", flush=True)
     print(f"[NexPlay] Support locks cleared — fresh session started", flush=True)
+    # Re-sync slash commands on every ready (belt + suspenders)
+    try:
+        synced = await bot.tree.sync()
+        print(f"[NexPlay] Synced {len(synced)} slash commands on ready.", flush=True)
+    except Exception as e:
+        print(f"[NexPlay] ⚠️ Command sync failed on ready: {e}", flush=True)
     print("=" * 60, flush=True)
 
 
@@ -1596,9 +1513,20 @@ class StaffLogView(discord.ui.View):
 
 async def handle_support(message: discord.Message) -> None:
     # Elite-only AI support gate
-    ok, _ = await check_feature(str(message.guild.id), "ai_support")
+    ok, plan = await check_feature(str(message.guild.id), "ai_support")
     if not ok:
-        return  # silently ignore — non-elite servers don't get AI support
+        # Don't ghost the user — let them know support is handled by staff
+        embed = discord.Embed(
+            description=(
+                "👋 Hi! AI support is available on the **Elite** plan.\n"
+                "A staff member will assist you shortly.\n"
+                f"*(Current plan: {plan})*"
+            ),
+            color=0xFFA500
+        )
+        embed.set_footer(text="NexPlay Support")
+        await message.reply(embed=embed, mention_author=False)
+        return
     gid = str(message.guild.id)
     uid = str(message.author.id)
     q   = message.content.strip()
@@ -1679,6 +1607,7 @@ INSTRUCTIONS:
     # ── Post to staff-log ─────────────────────────────────────────────────
     ch_staff = resolve_channel(message.guild, 'staff')
     if not ch_staff:
+        log(f"[Support] No staff-log channel found in {message.guild.name} — AI reply sent but staff not notified")
         return
 
     staff_color = 0xFF4444 if needs_staff else 0x00CC66
@@ -1869,7 +1798,7 @@ async def on_message(message: discord.Message):
 
     if is_support_ch and isinstance(message.channel, discord.TextChannel) and len(message.content.strip()) > 3:
         await handle_support(message)
-        return
+        # Don't return — let process_commands run too, so slash commands still work
 
     # ── Registration channel handler ──────────────────────────────────────────
     gid = str(message.guild.id)
