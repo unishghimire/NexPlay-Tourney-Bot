@@ -240,7 +240,7 @@ MEME_SUBREDDITS = [
 # Per-guild meme state tracking
 _last_meme_url: dict[int, str] = {}     # guild_id → last posted meme URL
 _meme_channel_cache: dict[int, int] = {} # guild_id → channel_id (cached)
-MEME_INTERVAL   = 30 * 60   # post every 30 minutes
+MEME_INTERVAL   = 15 * 60   # post every 15 minutes
 
 async def fetch_reddit_meme(subreddit: str = "dankmemes", exclude_url: str = "") -> dict | None:
     """Fetch a trending meme via meme-api.com.
@@ -309,7 +309,7 @@ async def auto_meme_loop():
     await bot.wait_until_ready()
     import random
     _cycle = 0
-    print(f"[NexPlay] auto_meme_loop started — interval={MEME_INTERVAL}s (30 min)", flush=True)
+    print(f"[NexPlay] auto_meme_loop started — interval={MEME_INTERVAL}s (15 min)", flush=True)
     while not bot.is_closed():
         _cycle += 1
         try:
