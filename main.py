@@ -2966,7 +2966,7 @@ async def cmd_delete_tournament(interaction: discord.Interaction, name: str):
 
 
 # ══════════════════════════════════════════════════════════
-#  MUSIC PLAYER — /play, /skip, /stop, /queue, /leave
+#  MUSIC PLAYER — /play, /skip, /stop, /queue, /loop, /leave, /volume
 # ══════════════════════════════════════════════════════════
 import yt_dlp
 import asyncio as _aio
@@ -2978,14 +2978,14 @@ _music_now: dict[int, dict] = {}          # guild_id → currently playing info
 _music_loops: dict[int, bool] = {}         # guild_id → loop mode
 _music_volumes: dict[int, float] = {}      # guild_id → volume (0.0-1.0)
 
-# yt-dlp options — extract audio only, best quality
+# yt-dlp options — extract audio only
 _YDL_OPTS = {
     "format": "bestaudio/best",
     "quiet": True,
     "no_warnings": True,
     "default_search": "ytsearch",
     "source_address": "0.0.0.0",
-    "extract_flat": False,
+    "noplaylist": True,
 }
 
 FFMPEG_OPTS = {
@@ -2993,44 +2993,40 @@ FFMPEG_OPTS = {
     "options": "-vn",
 }
 
-class YTDLSource(discord.PCMVolumeTransformer):
-    """Custom audio source using yt-dlp + ffmpeg."""
-    def __init__(self, source, *, data, volume=0.5):
-        super().__init__(source, volume)
-        self.data = data
-        self.title = data.get("title", "Unknown")
-        self.url = data.get("url", "")
-        self.duration = data.get("duration", 0)
-        self.uploader = data.get("uploader", "Unknown")
-        self.thumbnail = data.get("thumbnail", "")
 
-    @classmethod
-    async def from_url(cls, query: str, *, loop=None, volume=0.5) -> "YTDLSource":
-        """Extract audio from a YouTube URL or search query."""
-        loop = loop or _aio.get_event_loop()
+async def _extract_audio(query: str) -> dict:
+    """Extract audio info from YouTube URL or search query. Returns dict with title, url, duration, uploader, thumbnail, webpage_url."""
+    loop = _aio.get_event_loop()
 
-        def extract():
-            with yt_dlp.YoutubeDL(_YDL_OPTS) as ydl:
-                info = ydl.extract_info(query, download=False)
-                if "entries" in info:
-                    info = info["entries"][0]  # Take first search result
-                return info
+    def extract():
+        with yt_dlp.YoutubeDL(_YDL_OPTS) as ydl:
+            info = ydl.extract_info(query, download=False)
+            if "entries" in info:
+                info = info["entries"][0]
+            return info
 
-        info = await loop.run_in_executor(None, extract)
-        # Get the best audio-only stream URL
-        download_url = info.get("url", "")
-        if not download_url:
-            for fmt in info.get("formats", []):
-                if fmt.get("acodec", "none") != "none" and fmt.get("vcodec", "none") == "none":
-                    download_url = fmt["url"]
-                    break
-        if not download_url and info.get("formats"):
-            download_url = info["formats"][-1]["url"]
-        if not download_url:
-            raise RuntimeError("Could not extract audio URL from the video")
+    info = await loop.run_in_executor(None, extract)
 
-        source = discord.FFmpegPCMAudio(download_url, **FFMPEG_OPTS)
-        return cls(source, data=info, volume=volume)
+    # Get the best audio-only stream URL
+    audio_url = info.get("url", "")
+    if not audio_url:
+        for fmt in info.get("formats", []):
+            if fmt.get("acodec", "none") != "none" and fmt.get("vcodec", "none") == "none":
+                audio_url = fmt["url"]
+                break
+    if not audio_url and info.get("formats"):
+        audio_url = info["formats"][-1]["url"]
+    if not audio_url:
+        raise RuntimeError("Could not extract audio URL")
+
+    return {
+        "title":       info.get("title", "Unknown"),
+        "url":         audio_url,
+        "webpage_url": info.get("webpage_url", query),
+        "duration":    info.get("duration", 0),
+        "uploader":    info.get("uploader", "Unknown"),
+        "thumbnail":   info.get("thumbnail", ""),
+    }
 
 
 async def _play_next(guild_id: int, voice_client):
@@ -3044,28 +3040,40 @@ async def _play_next(guild_id: int, voice_client):
     _music_now[guild_id] = song
 
     try:
-        player = await YTDLSource.from_url(
-            song["url"],
-            volume=_music_volumes.get(guild_id, 0.5)
-        )
+        # Re-extract fresh audio URL (YouTube URLs expire after ~6 min)
+        fresh_info = await _extract_audio(song["webpage_url"])
+        audio_url = fresh_info["url"]
+
+        source = discord.FFmpegPCMAudio(audio_url, **FFMPEG_OPTS)
+        player = discord.PCMVolumeTransformer(source, volume=_music_volumes.get(guild_id, 0.5))
+
         def after_play(error):
             if error:
                 print(f"[Music] Playback error: {error}", flush=True)
             # Handle loop
             if _music_loops.get(guild_id):
-                queue.appendleft(song)
-            # Play next
-            _aio.run_coroutine_threadsafe(
-                _play_next(guild_id, voice_client),
-                bot.loop
-            )
+                _music_queues.setdefault(guild_id, deque()).appendleft(song)
+            # Play next song
+            try:
+                _aio.run_coroutine_threadsafe(
+                    _play_next(guild_id, voice_client),
+                    bot.loop
+                )
+            except Exception as e:
+                print(f"[Music] after_play error: {e}", flush=True)
+
         voice_client.play(player, after=after_play)
+        print(f"[Music] Now playing: {song['title']} in guild {guild_id}", flush=True)
+
     except Exception as e:
         print(f"[Music] Error playing next: {e}", flush=True)
         _music_now.pop(guild_id, None)
-        # Try next song
+        # Try next song if any
         if queue:
             await _play_next(guild_id, voice_client)
+        else:
+            # No more songs — don't disconnect, just idle
+            pass
 
 
 @tree.command(name="play", description="🎵 Play music from YouTube URL or search query")
@@ -3085,46 +3093,39 @@ async def cmd_play(interaction: discord.Interaction, query: str):
     voice_client = discord.utils.get(bot.voice_clients, guild=interaction.guild)
     if not voice_client:
         try:
-            voice_client = await voice_channel.connect(timeout=30)
+            voice_client = await voice_channel.connect(timeout=30, reconnect=True)
         except Exception as e:
             await interaction.followup.send(embed=err_e(f"Failed to join voice: {e}"))
             return
     elif voice_client.channel != voice_channel:
         await voice_client.move_to(voice_channel)
 
-    # Initialize queue
+    # Initialize queue if needed
     if guild_id not in _music_queues:
         _music_queues[guild_id] = deque()
         _music_volumes[guild_id] = 0.5
 
     # Extract video info
     try:
-        loop = _aio.get_event_loop()
-        def extract_info():
-            with yt_dlp.YoutubeDL(_YDL_OPTS) as ydl:
-                info = ydl.extract_info(query, download=False)
-                if "entries" in info:
-                    info = info["entries"][0]
-                return info
-        info = await loop.run_in_executor(None, extract_info)
+        info = await _extract_audio(query)
     except Exception as e:
         await interaction.followup.send(embed=err_e(f"Could not find song: {e}"))
         return
 
     song = {
-        "title":      info.get("title", "Unknown"),
-        "url":        info.get("url") or (info.get("formats", [{}])[-1].get("url", "")),
-        "webpage_url": info.get("webpage_url", query),
-        "duration":   info.get("duration", 0),
-        "uploader":   info.get("uploader", "Unknown"),
-        "thumbnail":  info.get("thumbnail", ""),
+        "title":       info["title"],
+        "url":         info["url"],
+        "webpage_url": info["webpage_url"],
+        "duration":    info["duration"],
+        "uploader":    info["uploader"],
+        "thumbnail":   info["thumbnail"],
         "requested_by": interaction.user.display_name,
     }
 
     duration_fmt = f"{song['duration']//60}:{song['duration']%60:02d}" if song["duration"] else "LIVE"
 
     # If nothing playing, start immediately
-    if not voice_client.is_playing() and len(_music_queues.get(guild_id, [])) == 0:
+    if not voice_client.is_playing() and not voice_client.is_paused() and len(_music_queues.get(guild_id, [])) == 0:
         _music_queues[guild_id].append(song)
         await interaction.followup.send(embed=ok_e(
             "▶️ Now Playing",
@@ -3153,9 +3154,9 @@ async def cmd_skip(interaction: discord.Interaction):
 
     current = _music_now.get(interaction.guild.id, {})
     title = current.get("title", "Unknown")
+    _music_loops[interaction.guild.id] = False  # reset loop on skip
     voice_client.stop()  # triggers after_play → plays next
     await interaction.response.send_message(embed=ok_e("⏭️ Skipped", f"**{title}** skipped."))
-    _music_loops[interaction.guild.id] = False  # reset loop on skip
 
 
 @tree.command(name="stop", description="⏹️ Stop music and clear the queue")
@@ -3239,6 +3240,26 @@ async def cmd_volume(interaction: discord.Interaction, level: int):
     if voice_client and hasattr(voice_client.source, "volume"):
         voice_client.source.volume = vol
     await interaction.response.send_message(embed=ok_e("🔊 Volume", f"Volume set to **{level}%**."))
+
+
+@tree.command(name="pause", description="⏸️ Pause the current song")
+async def cmd_pause(interaction: discord.Interaction):
+    voice_client = discord.utils.get(bot.voice_clients, guild=interaction.guild)
+    if not voice_client or not voice_client.is_playing():
+        await interaction.response.send_message(embed=err_e("Nothing is playing right now."), ephemeral=True)
+        return
+    voice_client.pause()
+    await interaction.response.send_message(embed=ok_e("⏸️ Paused", "Music paused. Use /play to resume."))
+
+
+@tree.command(name="resume", description="▶️ Resume the paused song")
+async def cmd_resume(interaction: discord.Interaction):
+    voice_client = discord.utils.get(bot.voice_clients, guild=interaction.guild)
+    if not voice_client or not voice_client.is_paused():
+        await interaction.response.send_message(embed=err_e("Nothing is paused right now."), ephemeral=True)
+        return
+    voice_client.resume()
+    await interaction.response.send_message(embed=ok_e("▶️ Resumed", "Music resumed."))
 
 
 # ══════════════════════════════════════════════════════════
