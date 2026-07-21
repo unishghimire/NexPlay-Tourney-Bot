@@ -133,14 +133,24 @@ async def check_feature(guild_id: str, feature: str, interaction: discord.Intera
             pass
     return False, full_msg
 
+async def _staff_feature_gate(interaction: discord.Interaction, feature: str) -> bool:
+    """Combined staff check + defer + feature gate. Returns True if allowed."""
+    if not is_staff(interaction.user):
+        await interaction.response.send_message(embed=err_e("❌ Staff only!"), ephemeral=True)
+        return False
+    await interaction.response.defer(thinking=True)
+    ok, msg = await check_feature(str(interaction.guild.id), feature)
+    if not ok:
+        await interaction.followup.send(embed=err_e(msg), ephemeral=True)
+        return False
+    return True
+
 # Shared HTTP timeout
 HTTP_TIMEOUT = aiohttp.ClientTimeout(total=10)
 
 def log(msg: str):
     """Simple print-based logger with flush for Railway."""
     print(msg, flush=True)
-
-
 
 
 class NexPlayBot(commands.Bot):
@@ -191,7 +201,6 @@ class NexPlayBot(commands.Bot):
 
 bot  = NexPlayBot()
 tree = bot.tree
-
 
 
 MEME_SUBREDDITS = [
@@ -329,18 +338,12 @@ async def auto_meme_loop():
         await asyncio.sleep(MEME_INTERVAL)
 
 
-
 @bot.event
 async def on_member_join(member: discord.Member):
     """Welcome new members (Elite) + update server member count."""
     guild = member.guild
     # Update member count for ALL servers
-    srv = await get_server_record(str(guild.id))
-    if srv:
-        await b44_update("Server", srv["id"], {
-            "member_count": guild.member_count or 0,
-            "last_active": now_iso(),
-        })
+    await _update_member_count(guild)
     # Welcome message (Elite only)
     ok, _ = await check_feature(str(guild.id), "welcome_message")
     if not ok:
@@ -352,23 +355,15 @@ async def on_member_join(member: discord.Member):
     )
     if not welcome_ch:
         return
-    embed = discord.Embed(
-        title=f"👋 Welcome to {guild.name}, {member.display_name}!",
-        description=(
-            f"Hey {member.mention}, we're glad you're here! 🎮\n\n"
-            f"**{guild.name}** is a competitive esports community hosting Free Fire & Battle Royale tournaments.\n\n"
-            f"📋 Check out our channels to get started\n"
-            f"🏆 Use **/register** in a tournament channel to join a competition\n"
-            f"❓ Use **/help** if you need assistance\n\n"
-            f"Good luck and have fun! 🔥"
-        ),
-        color=0x5865F2,
-        timestamp=datetime.now(timezone.utc)
-    )
-    embed.set_thumbnail(url=member.display_avatar.url)
-    embed.set_footer(text=f"Member #{guild.member_count} • NexPlay")
-    await welcome_ch.send(embed=embed)
-
+    e = discord.Embed(title=f"👋 Welcome to {guild.name}, {member.display_name}!",
+        description=(f"Hey {member.mention}, welcome! 🎮\n\n"
+            f"**{guild.name}** — competitive esports & Free Fire tournaments.\n\n"
+            f"📋 Check our channels\n🏆 Use `/register` to join a tournament\n"
+            f"❓ Need help? Use `/help`\n\nGood luck and have fun! 🔥"),
+        color=0x5865F2, timestamp=datetime.now(timezone.utc))
+    e.set_thumbnail(url=member.display_avatar.url)
+    e.set_footer(text=f"Member #{guild.member_count} • NexPlay")
+    await welcome_ch.send(embed=e)
 
 
 @tree.command(name="announce", description="[Host] Post a tournament announcement embed")
@@ -415,7 +410,6 @@ STAGE_NAMES = ["Group Stage","Quarter Final","Semi Final","Grand Final","Champio
 async def _post_tournament_info(ch_info, ch_ann, ch_reg, ch_road, ch_logo, name, game,
                                 fmt_label, prize, date, time_str, max_p, t_size, g_size,
                                 rounds, reg_end, nations, rules, stream, desc, poster, roadmap):
-    """Post tournament embeds to all channels after creation."""
     if ch_info:
         d = (f"**🎮 Game:** {game}\n**🏆 Format:** {fmt_label}\n**💰 Prize:** {prize}\n"
              f"**📅 Date:** {date} | **⏰ Time:** {time_str}\n"
@@ -781,37 +775,19 @@ class TournamentStatusModal(discord.ui.Modal, title="🔄 Change Tournament Stat
 
 @bot.event
 async def on_ready():
-    """Fires when bot connects. Clears all in-memory support locks so every
-    restart gives users a completely fresh support session."""
+    """Fires when bot connects. Clears support locks for fresh session."""
     global _replied_users
-    _replied_users = {}   # ← wipe all per-guild locks on every startup
-
-    guilds = bot.guilds
-    print("=" * 60, flush=True)
-    print(f"[NexPlay] ✅ BOT ONLINE — {bot.user} (ID: {bot.user.id})", flush=True)
-    print(f"[NexPlay] Serving {len(guilds)} server(s)", flush=True)
-    for g in guilds:
+    _replied_users = {}
+    print(f"[NexPlay] ✅ {bot.user} online — {len(bot.guilds)} server(s)", flush=True)
+    for g in bot.guilds:
         print(f"[NexPlay]   • {g.name} ({g.id}) — {g.member_count} members", flush=True)
-
-    # ── Startup DB connectivity check ──────────────────────────────────────
-    if not SVC_TOKEN:
-        print("[NexPlay] ⚠️⚠️ BASE44_SERVICE_TOKEN is NOT SET! All DB operations will fail!", flush=True)
+    if SVC_TOKEN:
+        try: print(f"[NexPlay] DB OK — {len(await b44_list('Server'))} server(s)", flush=True)
+        except Exception as e: print(f"[NexPlay] ⚠️ DB: {e}", flush=True)
     else:
-        print(f"[NexPlay] BASE44_SERVICE_TOKEN set (len={len(SVC_TOKEN)})", flush=True)
-        # Quick test: try to fetch servers
-        try:
-            srv_count = len(await b44_list("Server"))
-            print(f"[NexPlay] DB OK — {srv_count} server(s) found", flush=True)
-        except Exception as e:
-            print(f"[NexPlay] ⚠️ DB test failed: {e}", flush=True)
-    print(f"[NexPlay] Support locks cleared — fresh session started", flush=True)
-    # Re-sync slash commands on every ready (belt + suspenders)
-    try:
-        synced = await bot.tree.sync()
-        print(f"[NexPlay] Synced {len(synced)} slash commands on ready.", flush=True)
-    except Exception as e:
-        print(f"[NexPlay] ⚠️ Command sync failed on ready: {e}", flush=True)
-    print("=" * 60, flush=True)
+        print("[NexPlay] ⚠️ BASE44_SERVICE_TOKEN not set!", flush=True)
+    try: print(f"[NexPlay] Synced {len(await bot.tree.sync())} commands.", flush=True)
+    except Exception as e: print(f"[NexPlay] ⚠️ Sync: {e}", flush=True)
 
 
 def _b44_headers() -> dict:
@@ -897,6 +873,12 @@ async def _b44_delete_by_tournament(entity: str, tournament_id: str) -> int:
 async def get_server_record(guild_id: str) -> dict | None:
     servers = await b44_list("Server", {"guild_id": guild_id})
     return servers[0] if servers else None
+
+async def _update_member_count(guild: discord.Guild):
+    """Update server member count + last_active in DB."""
+    srv = await get_server_record(str(guild.id))
+    if srv:
+        await b44_update("Server", srv["id"], {"member_count": guild.member_count or 0, "last_active": now_iso()})
 
 async def register_server(guild: discord.Guild) -> dict:
     """Register a new server as Free Trial. Returns the created record."""
@@ -1278,7 +1260,6 @@ async def send_daily_logs(bot_instance: "NexPlayBot"):
 
 
 class StaffLogView(discord.ui.View):
-    """Persistent button panel on staff-log messages."""
 
     def __init__(self, uid: str, rec_id: str, guild_locks: dict,
                  user: discord.Member, user_channel: discord.TextChannel):
@@ -1296,85 +1277,64 @@ class StaffLogView(discord.ui.View):
     # ── ✅ RESOLVE ────────────────────────────────────────────────────────
     @discord.ui.button(label="✅ Resolve", style=discord.ButtonStyle.success, custom_id="staff_resolve")
     async def btn_resolve(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self._status = "resolved"
-        self.guild_locks.pop(self.uid, None)
-        if self.rec_id:
-            await b44_update("SupportMessage", self.rec_id, {"status": "resolved"})
-        await self._update_embed(interaction, "✅ RESOLVED", 0x00FF00,
-                                  f"Resolved by {interaction.user.display_name}")
-        # Notify user
+        self._set_status(interaction, "resolved", "✅ RESOLVED", 0x00FF00, True)
         try:
-            notify = discord.Embed(
-                description=f"Hey {self.user.mention}, a staff member resolved your query! Feel free to ask again. 😊",
-                color=0x00FF00
-            )
-            await self.user_channel.send(embed=notify)
-        except Exception:
-            pass
-        await interaction.response.send_message("✅ Resolved & user lock cleared.", ephemeral=True)
+            await self.user_channel.send(embed=discord.Embed(
+                description=f"Hey {self.user.mention}, your query was resolved! Feel free to ask again. 😊",
+                color=0x00FF00))
+        except: pass
+        await interaction.response.send_message("✅ Resolved & lock cleared.", ephemeral=True)
 
     # ── 💾 SAVE / UNSAVE TOGGLE ───────────────────────────────────────────
     @discord.ui.button(label="💾 Save", style=discord.ButtonStyle.secondary, custom_id="staff_save")
     async def btn_save(self, interaction: discord.Interaction, button: discord.ui.Button):
         if self._status == "saved":
-            # Unsave
             self._status = "pending"
-            if self.rec_id:
-                await b44_update("SupportMessage", self.rec_id, {"status": "pending"})
-            button.label = "💾 Save"
-            button.style = discord.ButtonStyle.secondary
+            if self.rec_id: await b44_update("SupportMessage", self.rec_id, {"status": "pending"})
+            button.label, button.style = "💾 Save", discord.ButtonStyle.secondary
             await interaction.response.edit_message(view=self)
             await interaction.followup.send("📌 Log unsaved.", ephemeral=True)
         else:
-            # Save
             self._status = "saved"
-            if self.rec_id:
-                await b44_update("SupportMessage", self.rec_id, {"status": "saved"})
-            button.label = "📌 Saved"
-            button.style = discord.ButtonStyle.primary
+            if self.rec_id: await b44_update("SupportMessage", self.rec_id, {"status": "saved"})
+            button.label, button.style = "📌 Saved", discord.ButtonStyle.primary
             await interaction.response.edit_message(view=self)
-            await interaction.followup.send("💾 Log saved for records.", ephemeral=True)
+            await interaction.followup.send("💾 Log saved.", ephemeral=True)
 
     # ── 🔔 ESCALATE ───────────────────────────────────────────────────────
     @discord.ui.button(label="🔔 Escalate", style=discord.ButtonStyle.danger, custom_id="staff_escalate")
     async def btn_escalate(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if self.rec_id:
-            await b44_update("SupportMessage", self.rec_id, {"status": "escalated"})
-        self._status = "escalated"
-        await self._update_embed(interaction, "🚨 ESCALATED", 0xFF6600,
-                                  f"Escalated by {interaction.user.display_name}")
-        await interaction.response.send_message(
-            f"🚨 Escalated! <@&{interaction.guild.id}> please review.", ephemeral=True
-        )
+        self._set_status(interaction, "escalated", "🚨 ESCALATED", 0xFF6600, False)
+        await interaction.response.send_message(f"🚨 Escalated! <@&{interaction.guild.id}> please review.", ephemeral=True)
 
     # ── 🗑️ DISMISS ────────────────────────────────────────────────────────
     @discord.ui.button(label="🗑️ Dismiss", style=discord.ButtonStyle.secondary, custom_id="staff_dismiss")
     async def btn_dismiss(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.guild_locks.pop(self.uid, None)
-        if self.rec_id:
-            await b44_update("SupportMessage", self.rec_id, {"status": "dismissed"})
-        await self._update_embed(interaction, "🗑️ DISMISSED", 0x555555,
-                                  f"Dismissed by {interaction.user.display_name}")
+        self._set_status(interaction, "dismissed", "🗑️ DISMISSED", 0x555555, True)
         self.stop()
         await interaction.response.send_message("🗑️ Dismissed & lock cleared.", ephemeral=True)
 
-    async def _update_embed(self, interaction, new_title, color, footer_note):
-        """Rebuild embed with new status, disable all buttons."""
+    def _set_status(self, interaction, status, title, color, clear_lock):
+        """Update DB status, rebuild embed with disabled buttons, optionally clear user lock."""
+        self._status = status
+        if clear_lock:
+            self.guild_locks.pop(self.uid, None)
+        if self.rec_id:
+            asyncio.ensure_future(b44_update("SupportMessage", self.rec_id, {"status": status}))
         if not self.message or not self.message.embeds:
             return
         old = self.message.embeds[0]
-        new_e = discord.Embed(title=new_title, description=old.description, color=color, timestamp=datetime.now(timezone.utc))
+        new_e = discord.Embed(title=title, description=old.description, color=color, timestamp=datetime.now(timezone.utc))
         for f in old.fields:
             new_e.add_field(name=f.name, value=f.value, inline=f.inline)
-        new_e.set_footer(text=footer_note)
+        new_e.set_footer(text=f"By {interaction.user.display_name}")
         for child in self.children:
             child.disabled = True
-        try: await self.message.edit(embed=new_e, view=self)
+        try: asyncio.ensure_future(self.message.edit(embed=new_e, view=self))
         except: pass
 
 
 async def _post_staff_log(message, uid, q, rec_id, guild_locks, needs_staff, ai_reply):
-    """Post support message to staff-log channel with action buttons."""
     ch = resolve_channel(message.guild, 'staff')
     if not ch:
         log(f"[Support] No staff-log channel in {message.guild.name}")
@@ -1494,6 +1454,13 @@ async def find_tournament_by_short(guild_id: str, short_name: str, statuses: tup
             return t
     return None
 
+async def _find_tournament(guild_id: str, name: str) -> dict | None:
+    """Find a tournament by name (case-insensitive) or short_name in a guild."""
+    for t in await b44_list("Tournament", {"guild_id": guild_id}):
+        if t.get("name", "").lower() == name.lower() or t.get("short_name", "").lower() == name.lower():
+            return t
+    return None
+
 
 def parse_registration(text: str, team_size: int) -> dict | None:
     """
@@ -1536,10 +1503,7 @@ def parse_registration(text: str, team_size: int) -> dict | None:
     return result
 
 
-
-
 async def lock_register_channel(guild: discord.Guild, channel: discord.TextChannel):
-    """Deny @everyone from sending messages in a channel."""
     try:
         everyone = guild.default_role
         overwrite = channel.overwrites_for(everyone)
@@ -1549,10 +1513,7 @@ async def lock_register_channel(guild: discord.Guild, channel: discord.TextChann
         log(f"[WARN] Could not lock channel #{channel.name}: {e}")
 
 
-
-
 async def update_reg_announcement(tournament: dict, guild: discord.Guild, registered: int):
-    """Edit the pinned registration announcement to update slot count."""
     msg_id = tournament.get("registration_msg_id")
     ch_id  = tournament.get("registration_channel_id")
     if not msg_id or not ch_id:
@@ -1594,7 +1555,6 @@ async def update_reg_announcement(tournament: dict, guild: discord.Guild, regist
         log(f"[WARN] Could not update reg announcement: {e}")
 
 async def handle_registration(message: discord.Message, gid: str, short: str, tournament: dict):
-    """Process a team registration message in a #<short>-register channel."""
     text = message.content.strip()
     team_size = int(tournament.get("team_size", 4))
     parsed = parse_registration(text, team_size)
@@ -1675,7 +1635,6 @@ async def handle_registration(message: discord.Message, gid: str, short: str, to
 
 
 async def handle_logo_submission(message: discord.Message, gid: str, short: str, tournament: dict):
-    """Process a team logo submission in a #<short>-team-logo channel."""
     images = [a for a in message.attachments if a.content_type and a.content_type.startswith("image/")]
     if not images:
         await _reject_msg(message, "❌ No Image Attached",
@@ -1777,7 +1736,6 @@ async def on_message(message: discord.Message):
         return
 
     await bot.process_commands(message)
-
 
 
 # ── /setup ────────────────────────────────────────────────
@@ -1920,8 +1878,7 @@ async def cmd_edit_tournament_new(interaction: discord.Interaction, tournament_n
         return await interaction.followup.send(embed=err_e(msg), ephemeral=True)
 
     gid = str(interaction.guild.id)
-    all_ts = await b44_list("Tournament", {"guild_id": gid})
-    tournament = next((t for t in all_ts if tournament_name.lower() in t.get("name","").lower()), None)
+    tournament = await _find_tournament(gid, tournament_name)
     if not tournament:
         return await interaction.followup.send(embed=err_e(f"Tournament **{tournament_name}** not found."), ephemeral=True)
 
@@ -1944,7 +1901,6 @@ async def cmd_edit_tournament_new(interaction: discord.Interaction, tournament_n
     await interaction.followup.send(embed=info_embed, view=view, ephemeral=True)
 
 
-
 # ────────────────────────────────────────────────────────────
 #  ELITE FEATURE COMMANDS
 # ────────────────────────────────────────────────────────────
@@ -1957,60 +1913,25 @@ async def cmd_edit_tournament_new(interaction: discord.Interaction, tournament_n
     app_commands.Choice(name="🔍 GG Hunt (hidden word)", value="gg_hunt"),
 ])
 async def cmd_host_game(interaction: discord.Interaction, game_type: str):
-    if not is_staff(interaction.user):
-        return await interaction.response.send_message(embed=err_e("❌ You need the **Tournament Host** role!"), ephemeral=True)
-    await interaction.response.defer(thinking=True)
-    ok, msg = await check_feature(str(interaction.guild.id), "host_game")
-    if not ok:
-        return await interaction.followup.send(embed=err_e(msg), ephemeral=True)
+    if not await _staff_feature_gate(interaction, "host_game"):
+        return
 
     games = {
-        "trivia": {
-            "title": "🧠 TRIVIA CHALLENGE",
-            "q": "What is the maximum number of players in a Free Fire match?",
-            "a": "50",
-            "hint": "It's between 40 and 60.",
-            "color": 0x3498DB
-        },
-        "prediction": {
-            "title": "🎯 PREDICTION GAME",
-            "q": "Who will win the next NexPlay tournament? Reply with your prediction!",
-            "a": None,
-            "hint": "No wrong answers here — just fun!",
-            "color": 0xE74C3C
-        },
-        "gg_hunt": {
-            "title": "🔍 GG HUNT",
-            "q": "Find the hidden word in this sentence: 'Great players always GRIND for the Glory!'",
-            "a": "GRIND",
-            "hint": "It's in ALL CAPS.",
-            "color": 0x2ECC71
-        },
+        "trivia":     ("🧠 TRIVIA CHALLENGE", "What is the max players in a Free Fire match?", "50", "It's between 40 and 60.", 0x3498DB),
+        "prediction":  ("🎯 PREDICTION GAME", "Who will win the next NexPlay tournament?", None, "No wrong answers — just fun!", 0xE74C3C),
+        "gg_hunt":    ("🔍 GG HUNT", "Find the hidden word: 'Great players always GRIND for the Glory!'", "GRIND", "It's in ALL CAPS.", 0x2ECC71),
     }
-    g = games.get(game_type, games["trivia"])
-
-    embed = discord.Embed(
-        title=g["title"],
-        description=(
-            f"**❓ {g['q']}**\n\n"
-            f"💡 Hint: *{g['hint']}*\n\n"
-            + (f"Type your answer below! First correct answer wins 🏆" if g['a'] else "Drop your prediction! 👇")
-        ),
-        color=g["color"],
-        timestamp=datetime.now(timezone.utc)
-    )
-    embed.set_footer(text="NexPlay Mini-Game | Hosted by " + interaction.user.display_name)
-    await interaction.followup.send("@everyone", embed=embed)
+    title, q, a, hint, color = games.get(game_type, games["trivia"])
+    desc = f"**❓ {q}**\n\n💡 Hint: *{hint}*\n\n" + ("Type your answer! First correct wins 🏆" if a else "Drop your prediction! 👇")
+    e = discord.Embed(title=title, description=desc, color=color, timestamp=datetime.now(timezone.utc))
+    e.set_footer(text=f"NexPlay Mini-Game | {interaction.user.display_name}")
+    await interaction.followup.send("@everyone", embed=e)
 
 
 @tree.command(name="suggest_improvement", description="[Elite] Get AI-powered server growth suggestions")
 async def cmd_suggest_improvement(interaction: discord.Interaction):
-    if not is_staff(interaction.user):
-        return await interaction.response.send_message(embed=err_e("❌ Staff only!"), ephemeral=True)
-    await interaction.response.defer(thinking=True)
-    ok, msg = await check_feature(str(interaction.guild.id), "suggest_improvement")
-    if not ok:
-        return await interaction.followup.send(embed=err_e(msg), ephemeral=True)
+    if not await _staff_feature_gate(interaction, "suggest_improvement"):
+        return
 
     gid = str(interaction.guild.id)
     guild = interaction.guild
@@ -2020,24 +1941,15 @@ async def cmd_suggest_improvement(interaction: discord.Interaction):
         active_t = next((t for t in all_ts if t.get("status") in ("registration_open","in_progress")), all_ts[0])
 
     ctx = build_server_context(guild, active_t)
-    prompt = (
-        f"You are a Discord server growth expert for NexPlay, a Free Fire & Battle Royale esports platform.\n"
-        f"Server context:\n{ctx}\n\n"
-        f"Give 5 specific, actionable improvement suggestions to grow this server, "
-        f"increase engagement, and attract more tournament participants. "
-        f"Be specific, practical, and enthusiastic. Format as numbered list."
-    )
+    prompt = (f"You are a Discord server growth expert for NexPlay esports.\n"
+              f"Server context:\n{ctx}\n\n"
+              f"Give 5 actionable suggestions to grow this server and increase tournament engagement. "
+              f"Be specific and enthusiastic. Numbered list.")
     suggestions = await ai_generate(prompt)
-
-    embed = discord.Embed(
-        title="💡 NexPlay Growth Advisor",
-        description=suggestions[:4000],
-        color=0xF39C12,
-        timestamp=datetime.now(timezone.utc)
-    )
-    embed.set_footer(text="NexPlay AI Growth Advisor | Elite Plan")
-    await interaction.followup.send(embed=embed)
-
+    e = discord.Embed(title="💡 NexPlay Growth Advisor", description=suggestions[:4000],
+        color=0xF39C12, timestamp=datetime.now(timezone.utc))
+    e.set_footer(text="NexPlay AI | Elite Plan")
+    await interaction.followup.send(embed=e)
 
 
 async def build_tournament_export_excel(tournament: dict, registrations: list, groups: list, matches: list) -> io.BytesIO:
@@ -2177,16 +2089,9 @@ async def cmd_delete_tournament(interaction: discord.Interaction, name: str):
 
     await interaction.response.defer(thinking=True, ephemeral=True)
 
-    # Find tournament in DB
-    tournaments = await b44_list("Tournament", {"guild_id": gid})
-    tournament = None
-    for t in tournaments:
-        if t.get("name", "").lower() == name.lower() or t.get("short_name", "").lower() == name.lower():
-            tournament = t
-            break
-
+    tournament = await _find_tournament(gid, name)
     if not tournament:
-        return await interaction.followup.send(embed=err_e(f"Tournament `{name}` not found in this server."), ephemeral=True)
+        return await interaction.followup.send(embed=err_e(f"Tournament `{name}` not found."), ephemeral=True)
 
     t_name = tournament.get("name", name)
     t_id = tournament.get("id", "")
@@ -2252,7 +2157,6 @@ async def cmd_delete_tournament(interaction: discord.Interaction, name: str):
         await interaction.followup.send(embed=ok_e("Tournament Deleted", desc), ephemeral=True)
     else:
         await interaction.followup.send(embed=err_e("DB record could not be deleted."), ephemeral=True)
-
 
 
 # Per-guild music state
@@ -2386,12 +2290,9 @@ async def cmd_play(interaction: discord.Interaction, query: str):
         try:
             voice_client = await voice_channel.connect(timeout=30, reconnect=True)
         except Exception as e:
-            await interaction.followup.send(embed=err_e(f"Failed to join voice: {e}"))
-            return
+            return await interaction.followup.send(embed=err_e(f"Failed to join voice: {e}"))
     elif voice_client.channel != voice_channel:
         await voice_client.move_to(voice_channel)
-
-    # Initialize queue if needed
     if guild_id not in _music_queues:
         _music_queues[guild_id] = deque()
         _music_volumes[guild_id] = 0.5
@@ -2588,13 +2489,7 @@ async def on_guild_join(guild: discord.Guild):
                 "Portal: https://nexplay-server-portal.vercel.app"))
             break
 
-    # Update member count for existing servers on join
-    srv = await get_server_record(str(guild.id))
-    if srv:
-        await b44_update("Server", srv["id"], {
-            "member_count": guild.member_count or 0,
-            "last_active": now_iso(),
-        })
+    await _update_member_count(guild)
 
 @bot.event
 async def on_guild_remove(guild: discord.Guild):
@@ -2615,11 +2510,7 @@ async def on_guild_remove(guild: discord.Guild):
 @bot.event
 async def on_member_remove(member: discord.Member):
     """Update member count when someone leaves."""
-    srv = await get_server_record(str(member.guild.id))
-    if srv:
-        await b44_update("Server", srv["id"], {
-            "member_count": member.guild.member_count or 0,
-        })
+    await _update_member_count(member.guild)
 
 
 bot.run(BOT_TOKEN)
