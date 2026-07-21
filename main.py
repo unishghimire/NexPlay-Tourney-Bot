@@ -17,6 +17,7 @@ import csv
 import re
 import openpyxl
 import yt_dlp
+import random
 from collections import deque
 from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
@@ -218,7 +219,6 @@ async def fetch_reddit_meme(subreddit: str = "dankmemes", exclude_url: str = "")
     """Fetch a trending meme via meme-api.com.
     Tries /gimme/<subreddit> (returns top/hot post), falls back across subreddits.
     Skips NSFW, spoilers, and the last posted URL for this guild."""
-    import random
 
     sub_list = MEME_SUBREDDITS if subreddit == "dankmemes" else [subreddit]
     # Try up to 3 different subreddits
@@ -279,7 +279,6 @@ async def auto_meme_loop():
     """Post trending memes to ALL servers every 30 minutes.
     Elite servers: every 30 min. Non-Elite: every 2 hours (4 cycles)."""
     await bot.wait_until_ready()
-    import random
     print(f"[NexPlay] auto_meme_loop started — interval={MEME_INTERVAL}s (15 min, ALL servers)", flush=True)
     while not bot.is_closed():
         try:
@@ -290,31 +289,18 @@ async def auto_meme_loop():
                     if not ok:
                         continue  # Skip servers without meme_post feature
 
-                    # Find target channel — prefer #memes, #meme-server, #funny, then fallback
-                    target = None
-                    # Try cached channel first
-                    cached_ch_id = _meme_channel_cache.get(guild.id)
-                    if cached_ch_id:
-                        target = guild.get_channel(cached_ch_id)
-                        if target and not target.permissions_for(guild.me).send_messages:
-                            target = None  # Lost permissions, re-find
-
+                    # Find meme channel (cached or by name hint)
+                    target = guild.get_channel(_meme_channel_cache.get(guild.id, 0))
+                    if target and not target.permissions_for(guild.me).send_messages: target = None
                     if not target:
-                        for name_hint in ("meme-server", "memes", "meme", "funny", "media", "general", "chat"):
+                        for hint in ("meme-server", "memes", "meme", "funny", "media", "general", "chat"):
                             target = discord.utils.find(
-                                lambda c, h=name_hint: (
-                                    isinstance(c, discord.TextChannel)
-                                    and h in c.name.lower()
-                                    and c.permissions_for(guild.me).send_messages
-                                ),
-                                guild.text_channels
-                            )
+                                lambda c, h=hint: isinstance(c, discord.TextChannel) and h in c.name.lower()
+                                and c.permissions_for(guild.me).send_messages, guild.text_channels)
                             if target:
                                 _meme_channel_cache[guild.id] = target.id
                                 break
-
-                    if not target:
-                        continue  # No channel found, skip silently
+                    if not target: continue
 
                     # Pick subreddit — rotate per guild per cycle for variety
                     sub_idx = (guild.id // 1000 + int(asyncio.get_event_loop().time()) // 900) % len(MEME_SUBREDDITS)
@@ -628,8 +614,6 @@ class TournamentStep3Modal(discord.ui.Modal, title="🏆 Create Tournament (3/3)
         ch_reg_id  = ch_id("register")
         ch_info_id = ch_id("info")
         ch_road_id = ch_id("roadmap")
-        ch_grp_id  = ch_id("groups")
-        ch_res_id  = ch_id("results")
         ch_logo_id = ch_id("team-logo")
 
         # AI GFX (Pro+)
@@ -727,23 +711,17 @@ class TournamentEditModal(discord.ui.Modal, title="✏️ Edit Tournament"):
             if info_ch: ch_info_id = info_ch.id
 
         if ch_info_id:
-            nations = t.get("eligible_nations", "🇳🇵")
-            updated_e = discord.Embed(
-                title=f"📋 {t['name']} — Tournament Info (Updated)",
-                description=(
-                    f"**🎮 Game:** {t.get('game','')}\n"
-                    f"**💰 Prize Pool:** {updates['prize_pool']}\n"
-                    f"**📅 Date:** {updates['tournament_date']}  |  ⏰ {updates['tournament_time']}\n"
-                    f"**👥 Max Teams:** {t.get('max_players','')}  |  Team Size: {t.get('team_size','')}v{t.get('team_size','')}\n"
-                    f"**🎯 Group Size:** {t.get('group_size','')} teams/group  |  Rounds: {t.get('rounds','')}\n"
-                    f"**🌏 Nations:** {nations}\n"
-                    + (f"\n**📜 Rules:**\n{updates['rules']}\n" if updates['rules'] else "")
-                    + (f"\n**📺 Stream:** {updates['stream_channel']}\n" if updates['stream_channel'] else "")
-                ),
-                color=0xFFA500, timestamp=datetime.now(timezone.utc)
-            )
-            updated_e.set_footer(text="NexPlay | Tournament details updated")
-            await dpost(ch_info_id, updated_e)
+            t.update(updates)
+            d = (f"**🎮 Game:** {t.get('game','')}\n**💰 Prize:** {updates['prize_pool']}\n"
+                 f"**📅 Date:** {updates['tournament_date']} | ⏰ {updates['tournament_time']}\n"
+                 f"**👥 Slots:** {t.get('max_players','')} | Teams: {t.get('team_size','')}v{t.get('team_size','')}\n"
+                 f"**🎯 Group:** {t.get('group_size','')}/group | Rounds: {t.get('rounds','')}\n"
+                 f"**🌏 Nations:** {t.get('eligible_nations','🇳🇵')}")
+            if updates['rules']: d += f"\n**📜 Rules:**\n{updates['rules']}"
+            if updates['stream_channel']: d += f"\n**📺 Stream:** {updates['stream_channel']}"
+            await dpost(ch_info_id, discord.Embed(
+                title=f"📋 {t['name']} — Updated", description=d, color=0xFFA500,
+                timestamp=datetime.now(timezone.utc)).set_footer(text="NexPlay | Updated"))
 
         await interaction.followup.send(embed=ok_e("Tournament Updated!", f"**{t['name']}** details have been updated and #info channel refreshed."), ephemeral=True)
 
@@ -1352,20 +1330,20 @@ class StaffLogView(discord.ui.View):
 
     def __init__(self, uid: str, rec_id: str, guild_locks: dict,
                  user: discord.Member, user_channel: discord.TextChannel):
-        super().__init__(timeout=None)  # No timeout — stays until resolved
-        self.uid          = uid
-        self.rec_id       = rec_id
-        self.guild_locks  = guild_locks
-        self.user         = user
-        self.user_channel = user_channel
-        self.message      = None
-        self._status      = "pending"   # pending | resolved | saved | unsaved
+        super().__init__(timeout=None)
+        self.uid, self.rec_id, self.guild_locks = uid, rec_id, guild_locks
+        self.user, self.user_channel = user, user_channel
+        self.message, self._status = None, "pending"
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if not is_staff(interaction.user):
+            await interaction.response.send_message("❌ Staff only.", ephemeral=True)
+            return False
+        return True
 
     # ── ✅ RESOLVE ────────────────────────────────────────────────────────
     @discord.ui.button(label="✅ Resolve", style=discord.ButtonStyle.success, custom_id="staff_resolve")
     async def btn_resolve(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not is_staff(interaction.user):
-            return await interaction.response.send_message("❌ Staff only.", ephemeral=True)
         self._status = "resolved"
         self.guild_locks.pop(self.uid, None)
         if self.rec_id:
@@ -1386,8 +1364,6 @@ class StaffLogView(discord.ui.View):
     # ── 💾 SAVE / UNSAVE TOGGLE ───────────────────────────────────────────
     @discord.ui.button(label="💾 Save", style=discord.ButtonStyle.secondary, custom_id="staff_save")
     async def btn_save(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not is_staff(interaction.user):
-            return await interaction.response.send_message("❌ Staff only.", ephemeral=True)
         if self._status == "saved":
             # Unsave
             self._status = "pending"
@@ -1410,8 +1386,6 @@ class StaffLogView(discord.ui.View):
     # ── 🔔 ESCALATE ───────────────────────────────────────────────────────
     @discord.ui.button(label="🔔 Escalate", style=discord.ButtonStyle.danger, custom_id="staff_escalate")
     async def btn_escalate(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not is_staff(interaction.user):
-            return await interaction.response.send_message("❌ Staff only.", ephemeral=True)
         if self.rec_id:
             await b44_update("SupportMessage", self.rec_id, {"status": "escalated"})
         self._status = "escalated"
@@ -1424,8 +1398,6 @@ class StaffLogView(discord.ui.View):
     # ── 🗑️ DISMISS ────────────────────────────────────────────────────────
     @discord.ui.button(label="🗑️ Dismiss", style=discord.ButtonStyle.secondary, custom_id="staff_dismiss")
     async def btn_dismiss(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not is_staff(interaction.user):
-            return await interaction.response.send_message("❌ Staff only.", ephemeral=True)
         self.guild_locks.pop(self.uid, None)
         if self.rec_id:
             await b44_update("SupportMessage", self.rec_id, {"status": "dismissed"})
@@ -1449,31 +1421,50 @@ class StaffLogView(discord.ui.View):
         except: pass
 
 
+async def _post_staff_log(message, uid, q, rec_id, guild_locks, needs_staff, ai_reply):
+    """Post support message to staff-log channel with action buttons."""
+    ch = resolve_channel(message.guild, 'staff')
+    if not ch:
+        log(f"[Support] No staff-log channel in {message.guild.name}")
+        return
+
+    e = discord.Embed(
+        title='🔴 NEEDS STAFF REVIEW' if needs_staff else '🟢 AI HANDLED — Monitor',
+        color=0xFF4444 if needs_staff else 0x00CC66)
+    e.add_field(name='👤 User', value=message.author.mention, inline=True)
+    e.add_field(name='📢 Channel', value=message.channel.mention, inline=True)
+    e.add_field(name='❓ Message', value=f'```{q[:500]}```', inline=False)
+    if needs_staff:
+        reason = ai_reply.replace("NEEDS_STAFF:", "").strip() if ai_reply else "No AI response"
+        e.add_field(name='⚠️ Reason', value=reason or "Complex query", inline=False)
+        e.add_field(name='📋 Action', value='1. Reply to user\n2. React ✅ to clear lock\n3. User can ask again', inline=False)
+    else:
+        e.add_field(name='🤖 AI Response', value=f'```{ai_reply[:300]}```', inline=False)
+        e.add_field(name='📋 Note', value='AI handled. React ✅ to clear lock.', inline=False)
+    e.set_footer(text=f"User ID: {uid} | DB Record: {rec_id}")
+
+    try:
+        view = StaffLogView(uid=uid, rec_id=rec_id, guild_locks=guild_locks,
+                           user=message.author, user_channel=message.channel)
+        log_msg = await ch.send(embed=e, view=view)
+        view.message = log_msg
+    except Exception as ex:
+        print(f"[Support] staff-log error: {ex}", flush=True)
+
+    if needs_staff:
+        try: await ch.send(f"@here 🔴 **{message.author.display_name}** needs help in {message.channel.mention}")
+        except: pass
+
+
 async def handle_support(message: discord.Message) -> None:
-    # Elite-only AI support gate
     ok, reason = await check_feature(str(message.guild.id), "ai_support")
     if not ok:
-        # Check if server is registered at all
         srv = await get_server_record(str(message.guild.id))
         if srv:
-            plan_name = (srv.get("plan_name") or "Unknown")
-            embed = discord.Embed(
-                description=(
-                    "👋 Hi! AI support is available on the **Elite** plan.\n"
-                    f"You're currently on **{plan_name}** — a staff member will assist you shortly."
-                ),
-                color=0xFFA500
-            )
+            desc = f"👋 AI support is **Elite** only. You're on **{srv.get('plan_name','?')}** — a staff member will help shortly."
         else:
-            embed = discord.Embed(
-                description=(
-                    "👋 Hi! I'm NexPlay Bot.\n"
-                    "This server isn't registered yet — ask an admin to run `/setup` to activate tournament features."
-                ),
-                color=0xFFA500
-            )
-        embed.set_footer(text="NexPlay Support")
-        await message.reply(embed=embed, mention_author=False)
+            desc = "👋 I'm NexPlay Bot. This server isn't registered — ask an admin to run `/setup`."
+        await message.reply(embed=discord.Embed(description=desc, color=0xFFA500).set_footer(text="NexPlay Support"), mention_author=False)
         return
     gid = str(message.guild.id)
     uid = str(message.author.id)
@@ -1543,66 +1534,7 @@ INSTRUCTIONS:
     # ── Lock this user from getting another reply ─────────────────────────
     guild_locks[uid] = rec_id
 
-    # ── Post to staff-log ─────────────────────────────────────────────────
-    ch_staff = resolve_channel(message.guild, 'staff')
-    if not ch_staff:
-        log(f"[Support] No staff-log channel found in {message.guild.name} — AI reply sent but staff not notified")
-        return
-
-    staff_color = 0xFF4444 if needs_staff else 0x00CC66
-
-    staff_embed = discord.Embed(
-        title=('🔴 NEEDS STAFF REVIEW' if needs_staff else '🟢 AI HANDLED — Monitor'),
-        color=staff_color
-    )
-    staff_embed.add_field(name='👤 User', value=message.author.mention, inline=True)
-    staff_embed.add_field(name='📢 Channel', value=message.channel.mention, inline=True)
-    staff_embed.add_field(name='❓ Message', value=f'```{q[:500]}```', inline=False)
-
-    if needs_staff:
-        reason = ai_reply.replace("NEEDS_STAFF:", "").strip() if ai_reply else "AI couldn't generate a response"
-        staff_embed.add_field(name='⚠️ Reason', value=reason or "Complex/unknown query", inline=False)
-        staff_embed.add_field(
-            name='📋 Action Required',
-            value=(
-                '1. Reply to the user in their channel\n'
-                '2. React ✅ on THIS message to clear the user lock\n'
-                '3. Bot will allow them to ask again after lock is cleared'
-            ),
-            inline=False
-        )
-    else:
-        staff_embed.add_field(name='🤖 AI Response', value=f'```{ai_reply[:300]}```', inline=False)
-        staff_embed.add_field(
-            name='📋 Note',
-            value='AI handled this. React ✅ to clear user lock if satisfied.',
-            inline=False
-        )
-
-    staff_embed.set_footer(text=f"User ID: {uid} | DB Record: {rec_id}")
-
-    try:
-        view = StaffLogView(
-            uid=uid,
-            rec_id=rec_id,
-            guild_locks=guild_locks,
-            user=message.author,
-            user_channel=message.channel,
-        )
-        log_msg = await ch_staff.send(embed=staff_embed, view=view)
-        view.message = log_msg
-
-    except Exception as e:
-        print(f"[Support] staff-log error: {e}", flush=True)
-
-    # ── Escalate with ping if needs_staff ─────────────────────────────────
-    if needs_staff:
-        try:
-            await ch_staff.send(
-                f"@here 🔴 **{message.author.display_name}** needs help in {message.channel.mention} — please review above."
-            )
-        except Exception:
-            pass
+    await _post_staff_log(message, uid, q, rec_id, guild_locks, needs_staff, ai_reply)
 async def find_tournament_by_short(guild_id: str, short_name: str, statuses: tuple = ("registration_open",)) -> dict | None:
     """Find a tournament by short_name in a guild."""
     for t in await b44_list("Tournament", {"guild_id": guild_id}):
@@ -1693,29 +1625,152 @@ async def update_reg_announcement(tournament: dict, guild: discord.Guild, regist
         filled = registered >= max_p
 
         lines = "\n".join([f"Player {i+1}: @mention" for i in range(tsize)])
-        embed = discord.Embed(
-            title=("🔒 REGISTRATION CLOSED" if filled else "✍️ REGISTRATION OPEN") + " — " + name,
-            description=(
-                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"🎮 **Game:** {game}\n"
-                f"🎖️ **Prize:** {prize}\n"
-                f"📅 **Date:** {date}\n"
-                f"👥 **Slots:** {registered}/{max_p}  `{bar}`\n"
-                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            ) + (
-                "\n🚫 **Registration is CLOSED. All slots filled!**" if filled else
-                "\n@everyone **Registration is OPEN!**\n\n"
-                f"Send a message in this channel with EXACTLY this format:\n"
-                f"```\nTeam Name: <your team name>\n" + "\n".join([f"Player {i+1}: @mention" for i in range(tsize)]) + "\n```"
-                "\n⚠️ All players must be mentioned. No duplicate registrations."
-            ),
-            color=0x555555 if filled else 0x00FF7F,
-            timestamp=datetime.now(timezone.utc)
-        )
-        embed.set_footer(text="NexPlay Tournament System")
-        await msg.edit(embed=embed)
+        if filled:
+            desc = (f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n🎮 **Game:** {game}\n🎖️ **Prize:** {prize}\n"
+                    f"📅 **Date:** {date}\n👥 **Slots:** {registered}/{max_p}  `{bar}`\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n🚫 **Registration CLOSED. All slots filled!**")
+        else:
+            desc = (f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n🎮 **Game:** {game}\n🎖️ **Prize:** {prize}\n"
+                    f"📅 **Date:** {date}\n👥 **Slots:** {registered}/{max_p}  `{bar}`\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n@everyone **Registration OPEN!**\n"
+                    f"```\nTeam Name: <name>\n{lines}\n```\n⚠️ All players must be @mentioned.")
+        e = discord.Embed(title=f"{'🔒 CLOSED' if filled else '✍️ OPEN'} — {name}", description=desc,
+            color=0x555555 if filled else 0x00FF7F, timestamp=datetime.now(timezone.utc))
+        e.set_footer(text="NexPlay")
+        await msg.edit(embed=e)
     except Exception as e:
         log(f"[WARN] Could not update reg announcement: {e}")
+
+async def handle_registration(message: discord.Message, gid: str, short: str, tournament: dict):
+    """Process a team registration message in a #<short>-register channel."""
+    text = message.content.strip()
+    team_size = int(tournament.get("team_size", 4))
+    parsed = parse_registration(text, team_size)
+
+    if not parsed:
+        lines_needed = "\n".join([f"Player {i+1}: @mention" for i in range(team_size)])
+        await _reject_msg(message, "❌ Invalid Format",
+            f"Use EXACTLY this format:\n```\nTeam Name: <name>\n{lines_needed}\n```"
+            f"\n• All {team_size} players must be @mentioned")
+        return
+
+    team_name = parsed["team_name"]
+    players = parsed["players"]
+
+    existing_regs = await b44_list("Registration", {"tournament_id": tournament["id"]})
+
+    # Duplicate team name?
+    if any(r.get("player_name", "").lower() == team_name.lower() for r in existing_regs):
+        await _reject_msg(message, "❌ Team Name Taken", f"**{team_name}** is already registered.")
+        return
+
+    # Duplicate player?
+    all_players = []
+    for r in existing_regs:
+        members = r.get("team_members", [])
+        if isinstance(members, list): all_players.extend(members)
+        elif isinstance(members, str) and members: all_players.extend(members.split(","))
+    already = [f"<@{p}>" for p in players if p in all_players]
+    if already:
+        await _reject_msg(message, "❌ Player Already Registered", f"{', '.join(already)} is already on another team!")
+        return
+
+    # Slots full?
+    max_p = int(tournament.get("max_players", 16))
+    slot = len(existing_regs) + 1
+    if slot > max_p:
+        await message.add_reaction("❌")
+        await message.reply(embed=discord.Embed(title="🔒 Registration Full",
+            description=f"All {max_p} slots are taken.", color=0xFF4444))
+        return
+
+    # Save registration
+    await b44_create("Registration", {
+        "tournament_id": tournament["id"], "guild_id": gid,
+        "player_name": team_name, "player_discord_id": str(message.author.id),
+        "team_members": players, "status": "registered", "logo_url": "",
+    })
+    await b44_update("Tournament", tournament["id"], {"registered_count": slot})
+    await message.add_reaction("✅")
+
+    # Post confirmation to #<short>-confirm-teams
+    cfm_ch = discord.utils.get(message.guild.text_channels, name=short + "-confirm-teams")
+    if cfm_ch:
+        player_mentions = " ".join(f"<@{p}>" for p in players)
+        logo_ch = discord.utils.get(message.guild.text_channels, name=short + "-team-logo")
+        logo_mention = f"<#{logo_ch.id}>" if logo_ch else f"#{short}-team-logo"
+        e = discord.Embed(title="✅ TEAM REGISTERED!",
+            description=(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"🏷️ **Team:** {team_name}\n👑 **Captain:** {message.author.mention}\n"
+                f"👥 **Players:** {player_mentions}\n🎫 **Slot:** #{slot} of {max_p}\n"
+                f"🏆 **Tournament:** {tournament.get('name', '')}\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n**CONFIRMED ✅**\n\n"
+                f"🎨 Submit logo in {logo_mention} — `Team Name: <name>` + image"),
+            color=0x00FF7F, timestamp=datetime.now(timezone.utc))
+        e.set_footer(text=f"NexPlay | {tournament.get('game','')}", icon_url="https://i.imgur.com/wSTFkRM.png")
+        await cfm_ch.send(embed=e)
+
+    # Update announcement + auto-close
+    updated_t = dict(tournament); updated_t["registered_count"] = slot
+    await update_reg_announcement(updated_t, message.guild, slot)
+    if slot >= max_p:
+        await b44_update("Tournament", tournament["id"], {"status": "registration_closed"})
+        await lock_register_channel(message.guild, message.channel)
+        await message.channel.send(embed=discord.Embed(
+            title=f"🔒 REGISTRATION CLOSED — {tournament.get('name', '')}",
+            description=f"All **{max_p}** slots filled! Groups next. Stay tuned.",
+            color=0xFF6B35, timestamp=datetime.now(timezone.utc)).set_footer(text="NexPlay"))
+
+
+async def handle_logo_submission(message: discord.Message, gid: str, short: str, tournament: dict):
+    """Process a team logo submission in a #<short>-team-logo channel."""
+    images = [a for a in message.attachments if a.content_type and a.content_type.startswith("image/")]
+    if not images:
+        await _reject_msg(message, "❌ No Image Attached",
+            "Attach your team logo (PNG/JPG) + include your team name.\n"
+            "```\nTeam Name: <exact team name>\n[attach image]\n```")
+        return
+
+    match = re.search(r'team\s*name\s*:\s*(.+)', message.content, re.IGNORECASE)
+    if not match:
+        await _reject_msg(message, "❌ Missing Team Name", "Include `Team Name: <name>` in your message.")
+        return
+
+    submitted_name = match.group(1).strip()
+    existing_regs = await b44_list("Registration", {"tournament_id": tournament["id"]})
+    matched = next((r for r in existing_regs if r.get("player_name", "").lower() == submitted_name.lower()), None)
+    if not matched:
+        matched = next((r for r in existing_regs if r.get("player_discord_id") == str(message.author.id)), None)
+        if matched: submitted_name = matched.get("player_name", submitted_name)
+    if not matched:
+        await _reject_msg(message, "❌ Team Not Found",
+            f"**{submitted_name}** is not registered in this tournament.", delay=20)
+        return
+
+    logo_url = images[0].url
+    await b44_update("Registration", matched["id"], {
+        "logo_url": logo_url, "logo_submitted_at": datetime.now(timezone.utc).isoformat(),
+        "logo_submitted_by": str(message.author.id),
+    })
+    await message.add_reaction("✅")
+
+    e = discord.Embed(title="✅ Logo Accepted!",
+        description=f"**Team:** {submitted_name}\n**By:** {message.author.mention}\n"
+            f"Saved — will appear in group draws and match cards.",
+        color=0x00FF7F, timestamp=datetime.now(timezone.utc))
+    e.set_thumbnail(url=logo_url)
+    e.set_footer(text="NexPlay")
+    await message.channel.send(embed=e)
+
+    cfm_ch = discord.utils.get(message.guild.text_channels, name=short + "-confirm-teams")
+    if cfm_ch:
+        e2 = discord.Embed(title="🎨 Logo Submitted",
+            description=f"**{submitted_name}** submitted their logo ✅\nBy: {message.author.mention}",
+            color=0xFF6B9D, timestamp=datetime.now(timezone.utc))
+        e2.set_thumbnail(url=logo_url)
+        e2.set_footer(text="NexPlay | Logo will appear in all GFX")
+        await cfm_ch.send(embed=e2)
+
 
 @bot.event
 async def on_message(message: discord.Message):
@@ -1754,228 +1809,19 @@ async def on_message(message: discord.Message):
     if ch_name.endswith("-register"):
         short_candidate = ch_name[:-9]
         tournament = await find_tournament_by_short(gid, short_candidate, ("registration_open",))
-        if not tournament:
-            await bot.process_commands(message)
+        if tournament:
+            await handle_registration(message, gid, short_candidate, tournament)
             return
-
-        # Delete non-registration messages (keep it clean)
-        text = message.content.strip()
-        team_size = int(tournament.get("team_size", 4))
-
-        parsed = parse_registration(text, team_size)
-
-        # ── VALIDATION ────────────────────────────────────────────────────────
-        if not parsed:
-            lines_needed = "\n".join([f"Player {i+1}: @mention" for i in range(team_size)])
-            await _reject_msg(message, "❌ Invalid Format",
-                f"Please use EXACTLY this format:\n```\nTeam Name: <your team name>\n{lines_needed}\n```"
-                f"\n• All {team_size} players must be @mentioned\n• Team Name line is required")
-            return
-
-        team_name = parsed["team_name"]
-        players   = parsed["players"]  # list of user ID strings
-
-        # Check team name duplicate
-        existing_regs = await b44_list("Registration", {"tournament_id": tournament["id"]})
-        if any(r.get("player_name", "").lower() == team_name.lower() for r in existing_regs):
-            await _reject_msg(message, "❌ Team Name Taken",
-                f"**{team_name}** is already registered. Use a different team name.")
-            return
-
-        # Check player duplicate
-        all_registered_players = []
-        for r in existing_regs:
-            members = r.get("team_members", [])
-            if isinstance(members, list):
-                all_registered_players.extend(members)
-            elif isinstance(members, str) and members:
-                all_registered_players.extend(members.split(","))
-
-        already = [f"<@{p}>" for p in players if p in all_registered_players]
-        if already:
-            await _reject_msg(message, "❌ Player Already Registered",
-                f"{', '.join(already)} is already registered in another team!")
-            return
-
-        # Check slots
-        max_p = int(tournament.get("max_players", 16))
-        slot  = len(existing_regs) + 1
-        if slot > max_p:
-            await message.add_reaction("❌")
-            await message.reply(
-                embed=discord.Embed(
-                    title="🔒 Registration Full",
-                    description=f"All {max_p} slots are taken. Registration is closed.",
-                    color=0xFF4444
-                )
-            )
-            return
-
-        # ── SUCCESS — Save to DB ──────────────────────────────────────────────
-        await b44_create("Registration", {
-            "tournament_id":    tournament["id"],
-            "guild_id":         gid,
-            "player_name":      team_name,
-            "player_discord_id": str(message.author.id),
-            "team_members":     players,
-            "status":           "registered",
-            "logo_url":         "",
-        })
-
-        # Update tournament registered count
-        await b44_update("Tournament", tournament["id"], {"registered_count": slot})
-
-        # React success
-        await message.add_reaction("✅")
-
-        # Post confirmation to #<short>-confirm-teams
-        cfm_ch_name = short_candidate + "-confirm-teams"
-        cfm_ch = discord.utils.get(message.guild.text_channels, name=cfm_ch_name)
-        if cfm_ch:
-            player_mentions = " ".join([f"<@{p}>" for p in players])
-            logo_ch = discord.utils.get(message.guild.text_channels, name=short_candidate + "-team-logo")
-            logo_ch_mention = f"<#{logo_ch.id}>" if logo_ch else f"#{short_candidate}-team-logo"
-            cfm_embed = discord.Embed(
-                title="✅ TEAM REGISTERED!",
-                description=(
-                    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                    f"🏷️ **Team:** {team_name}\n"
-                    f"👑 **Captain:** {message.author.mention}\n"
-                    f"👥 **Players:** {player_mentions}\n"
-                    f"🎫 **Slot:** #{slot} of {max_p}\n"
-                    f"🏆 **Tournament:** {tournament.get('name', '')}\n"
-                    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                    "**Status: CONFIRMED ✅**\n\n"
-                    f"📋 Check tournament info in <#{tournament.get('announcement_channel_id','')}>\n"
-                    f"🎨 **NEXT STEP:** Submit your team logo in {logo_ch_mention}\n"
-                    "`Team Name: <name>` + attach logo image (PNG/JPG)\n\n"
-                    "Groups will be revealed after registration closes. Good luck! 🎮"
-                ),
-                color=0x00FF7F,
-                timestamp=datetime.now(timezone.utc)
-            )
-            cfm_embed.set_footer(text=f"NexPlay Tournament System | {tournament.get('game','')}",
-                                 icon_url="https://i.imgur.com/wSTFkRM.png")
-            await cfm_ch.send(embed=cfm_embed)
-
-        # Update slot counter on announcement embed
-        updated_t = dict(tournament)
-        updated_t["registered_count"] = slot
-        await update_reg_announcement(updated_t, message.guild, slot)
-
-        # ── AUTO-CLOSE when full ──────────────────────────────────────────────
-        if slot >= max_p:
-            await b44_update("Tournament", tournament["id"], {"status": "registration_closed"})
-            await lock_register_channel(message.guild, message.channel)
-
-            close_embed = discord.Embed(
-                title="🔒 REGISTRATION CLOSED — " + tournament.get("name", ""),
-                description=(
-                    f"All **{max_p}** slots have been filled!\n\n"
-                    "**What happens next:**\n"
-                    "① Groups will be drawn by the host\n"
-                    "② Match schedule will be posted\n"
-                    "③ Match Day begins!\n\n"
-                    "Stay tuned in the announcements channel."
-                ),
-                color=0xFF6B35,
-                timestamp=datetime.now(timezone.utc)
-            )
-            close_embed.set_footer(text="NexPlay Tournament System")
-            await message.channel.send(embed=close_embed)
-
+        await bot.process_commands(message)
         return
 
-    # ── Logo submission channel handler ──────────────────────────────────────
     if ch_name.endswith("-team-logo"):
         short_candidate = ch_name[:-10]
         tournament = await find_tournament_by_short(gid, short_candidate, ("registration_open", "registration_closed"))
-        if not tournament:
-            await bot.process_commands(message)
+        if tournament:
+            await handle_logo_submission(message, gid, short_candidate, tournament)
             return
-
-        # Must have an image attachment
-        image_attachments = [a for a in message.attachments if a.content_type and a.content_type.startswith("image/")]
-
-        if not image_attachments:
-            await _reject_msg(message, "❌ No Image Attached",
-                "Please attach your team logo image (PNG/JPG) AND include your team name.\n\n"
-                "**Format:**\n```\nTeam Name: <your exact team name>\nTeam Logo: [attach image]\n```")
-            return
-
-        # Extract team name from message text
-        text_content = message.content.strip()
-        team_name_match = re.search(r'team\s*name\s*:\s*(.+)', text_content, re.IGNORECASE)
-
-        if not team_name_match:
-            await _reject_msg(message, "❌ Missing Team Name",
-                "Include your team name in the message.\n\n"
-                "**Format:**\n```\nTeam Name: <your exact team name>\nTeam Logo: [attach image]\n```")
-            return
-
-        submitted_team_name = team_name_match.group(1).strip()
-
-        # Verify team is registered — match by name first, then by submitter Discord ID
-        existing_regs = await b44_list("Registration", {"tournament_id": tournament["id"]})
-        matched_reg = next(
-            (r for r in existing_regs if r.get("player_name", "").lower() == submitted_team_name.lower()),
-            None
-        )
-        if not matched_reg:
-            matched_reg = next(
-                (r for r in existing_regs if r.get("player_discord_id") == str(message.author.id)),
-                None
-            )
-            if matched_reg:
-                submitted_team_name = matched_reg.get("player_name", submitted_team_name)
-
-        if not matched_reg:
-            await _reject_msg(message, "❌ Team Not Found",
-                f"**{submitted_team_name}** is not registered in this tournament.\n\n"
-                "Make sure your team name matches exactly as you registered.", delay=20)
-            return
-
-        # Save logo URL to DB
-        logo_url = image_attachments[0].url
-        await b44_update("Registration", matched_reg["id"], {
-            "logo_url": logo_url,
-            "logo_submitted_at": datetime.now(timezone.utc).isoformat(),
-            "logo_submitted_by": str(message.author.id),
-        })
-
-        await message.add_reaction("✅")
-
-        confirm_embed = discord.Embed(
-            title="✅ Logo Accepted!",
-            description=(
-                f"**Team:** {submitted_team_name}\n"
-                f"**Submitted by:** {message.author.mention}\n"
-                f"**Tournament:** {tournament.get('name', '')}\n\n"
-                "Your logo is saved and will appear in group draws, match cards, and result graphics."
-            ),
-            color=0x00FF7F,
-            timestamp=datetime.now(timezone.utc)
-        )
-        confirm_embed.set_thumbnail(url=logo_url)
-        confirm_embed.set_footer(text="NexPlay Tournament System")
-        await message.channel.send(embed=confirm_embed)
-
-        # Notify in confirm-teams
-        cfm_ch = discord.utils.get(message.guild.text_channels, name=short_candidate + "-confirm-teams")
-        if cfm_ch:
-            logo_update = discord.Embed(
-                title="🎨 Logo Submitted",
-                description=(
-                    f"**{submitted_team_name}** has submitted their team logo ✅\n"
-                    f"Submitted by: {message.author.mention}"
-                ),
-                color=0xFF6B9D,
-                timestamp=datetime.now(timezone.utc)
-            )
-            logo_update.set_thumbnail(url=logo_url)
-            logo_update.set_footer(text="NexPlay | Logo will appear in all GFX")
-            await cfm_ch.send(embed=logo_update)
-
+        await bot.process_commands(message)
         return
 
     await bot.process_commands(message)
@@ -2346,20 +2192,12 @@ async def cmd_delete_channel(interaction: discord.Interaction, channel: str):
 
     await interaction.response.defer(thinking=True, ephemeral=True)
 
-    # Parse channel input — could be #mention, raw ID, or channel name
-    ch = None
+    # Parse channel input — #mention, raw ID, or name
     raw = channel.strip().lstrip("#")
-
-    # Try as mention <#123456>
-    if raw.startswith("<#") and raw.endswith(">"):
-        ch_id = raw[2:-1]
-        ch = interaction.guild.get_channel(int(ch_id)) if ch_id.isdigit() else None
-    elif raw.isdigit():
-        ch = interaction.guild.get_channel(int(raw))
-    else:
-        ch = discord.utils.get(interaction.guild.text_channels, name=raw)
-        if not ch:
-            ch = discord.utils.get(interaction.guild.voice_channels, name=raw)
+    if raw.startswith("<#") and raw.endswith(">"): raw = raw[2:-1]
+    ch = interaction.guild.get_channel(int(raw)) if raw.isdigit() else (
+        discord.utils.get(interaction.guild.text_channels, name=raw) or
+        discord.utils.get(interaction.guild.voice_channels, name=raw))
 
     if not ch:
         return await interaction.followup.send(embed=err_e(f"Channel `{channel}` not found."), ephemeral=True)
