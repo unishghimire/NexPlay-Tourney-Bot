@@ -308,17 +308,15 @@ async def auto_meme_loop():
     Elite servers: every 30 min. Non-Elite: every 2 hours (4 cycles)."""
     await bot.wait_until_ready()
     import random
-    _cycle = 0
-    print(f"[NexPlay] auto_meme_loop started — interval={MEME_INTERVAL}s (15 min)", flush=True)
+    print(f"[NexPlay] auto_meme_loop started — interval={MEME_INTERVAL}s (15 min, ALL servers)", flush=True)
     while not bot.is_closed():
-        _cycle += 1
         try:
             for guild in bot.guilds:
                 try:
-                    # Check plan — Elite gets memes every cycle, others every 4th cycle (2 hours)
+                    # ALL servers get memes every 15 minutes
                     ok, _ = await check_feature(str(guild.id), "meme_post")
-                    if not ok and _cycle % 4 != 0:
-                        continue  # Non-Elite: skip until 4th cycle
+                    if not ok:
+                        continue  # Skip servers without meme_post feature
 
                     # Find target channel — prefer #memes, #meme-server, #funny, then fallback
                     target = None
@@ -347,7 +345,7 @@ async def auto_meme_loop():
                         continue  # No channel found, skip silently
 
                     # Pick subreddit — rotate per guild per cycle for variety
-                    sub_idx = (guild.id // 1000 + _cycle) % len(MEME_SUBREDDITS)
+                    sub_idx = (guild.id // 1000 + int(asyncio.get_event_loop().time()) // 900) % len(MEME_SUBREDDITS)
                     sub = MEME_SUBREDDITS[sub_idx]
 
                     # Fetch trending meme — try multiple subreddits
@@ -2963,6 +2961,283 @@ async def cmd_delete_tournament(interaction: discord.Interaction, name: str):
         await interaction.followup.send(embed=ok_e("Tournament Deleted", desc), ephemeral=True)
     else:
         await interaction.followup.send(embed=err_e("Tournament channels cleaned but DB record could not be deleted. Check API connection."), ephemeral=True)
+
+
+
+# ══════════════════════════════════════════════════════════
+#  MUSIC PLAYER — /play, /skip, /stop, /queue, /leave
+# ══════════════════════════════════════════════════════════
+import yt_dlp
+import asyncio as _aio
+from collections import deque
+
+# Per-guild music state
+_music_queues: dict[int, deque] = {}      # guild_id → song queue
+_music_now: dict[int, dict] = {}          # guild_id → currently playing info
+_music_loops: dict[int, bool] = {}         # guild_id → loop mode
+_music_volumes: dict[int, float] = {}      # guild_id → volume (0.0-1.0)
+
+# yt-dlp options — extract audio only, best quality
+_YDL_OPTS = {
+    "format": "bestaudio/best",
+    "quiet": True,
+    "no_warnings": True,
+    "default_search": "ytsearch",
+    "source_address": "0.0.0.0",
+    "extract_flat": False,
+}
+
+FFMPEG_OPTS = {
+    "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -vn",
+    "options": "-vn",
+}
+
+class YTDLSource(discord.PCMVolumeTransformer):
+    """Custom audio source using yt-dlp + ffmpeg."""
+    def __init__(self, source, *, data, volume=0.5):
+        super().__init__(source, volume)
+        self.data = data
+        self.title = data.get("title", "Unknown")
+        self.url = data.get("url", "")
+        self.duration = data.get("duration", 0)
+        self.uploader = data.get("uploader", "Unknown")
+        self.thumbnail = data.get("thumbnail", "")
+
+    @classmethod
+    async def from_url(cls, query: str, *, loop=None, volume=0.5) -> "YTDLSource":
+        """Extract audio from a YouTube URL or search query."""
+        loop = loop or _aio.get_event_loop()
+
+        def extract():
+            with yt_dlp.YoutubeDL(_YDL_OPTS) as ydl:
+                info = ydl.extract_info(query, download=False)
+                if "entries" in info:
+                    info = info["entries"][0]  # Take first search result
+                return info
+
+        info = await loop.run_in_executor(None, extract)
+        # Get the best audio-only stream URL
+        download_url = info.get("url", "")
+        if not download_url:
+            for fmt in info.get("formats", []):
+                if fmt.get("acodec", "none") != "none" and fmt.get("vcodec", "none") == "none":
+                    download_url = fmt["url"]
+                    break
+        if not download_url and info.get("formats"):
+            download_url = info["formats"][-1]["url"]
+        if not download_url:
+            raise RuntimeError("Could not extract audio URL from the video")
+
+        source = discord.FFmpegPCMAudio(download_url, **FFMPEG_OPTS)
+        return cls(source, data=info, volume=volume)
+
+
+async def _play_next(guild_id: int, voice_client):
+    """Play the next song in the queue."""
+    queue = _music_queues.get(guild_id)
+    if not queue or len(queue) == 0:
+        _music_now.pop(guild_id, None)
+        return
+
+    song = queue.popleft()
+    _music_now[guild_id] = song
+
+    try:
+        player = await YTDLSource.from_url(
+            song["url"],
+            volume=_music_volumes.get(guild_id, 0.5)
+        )
+        def after_play(error):
+            if error:
+                print(f"[Music] Playback error: {error}", flush=True)
+            # Handle loop
+            if _music_loops.get(guild_id):
+                queue.appendleft(song)
+            # Play next
+            _aio.run_coroutine_threadsafe(
+                _play_next(guild_id, voice_client),
+                bot.loop
+            )
+        voice_client.play(player, after=after_play)
+    except Exception as e:
+        print(f"[Music] Error playing next: {e}", flush=True)
+        _music_now.pop(guild_id, None)
+        # Try next song
+        if queue:
+            await _play_next(guild_id, voice_client)
+
+
+@tree.command(name="play", description="🎵 Play music from YouTube URL or search query")
+async def cmd_play(interaction: discord.Interaction, query: str):
+    """Play a song from YouTube URL or search by name."""
+    await interaction.response.defer()
+
+    # Check if user is in a voice channel
+    if not interaction.user.voice or not interaction.user.voice.channel:
+        await interaction.followup.send(embed=err_e("You need to be in a voice channel first!"))
+        return
+
+    voice_channel = interaction.user.voice.channel
+    guild_id = interaction.guild.id
+
+    # Connect to voice channel
+    voice_client = discord.utils.get(bot.voice_clients, guild=interaction.guild)
+    if not voice_client:
+        try:
+            voice_client = await voice_channel.connect(timeout=30)
+        except Exception as e:
+            await interaction.followup.send(embed=err_e(f"Failed to join voice: {e}"))
+            return
+    elif voice_client.channel != voice_channel:
+        await voice_client.move_to(voice_channel)
+
+    # Initialize queue
+    if guild_id not in _music_queues:
+        _music_queues[guild_id] = deque()
+        _music_volumes[guild_id] = 0.5
+
+    # Extract video info
+    try:
+        loop = _aio.get_event_loop()
+        def extract_info():
+            with yt_dlp.YoutubeDL(_YDL_OPTS) as ydl:
+                info = ydl.extract_info(query, download=False)
+                if "entries" in info:
+                    info = info["entries"][0]
+                return info
+        info = await loop.run_in_executor(None, extract_info)
+    except Exception as e:
+        await interaction.followup.send(embed=err_e(f"Could not find song: {e}"))
+        return
+
+    song = {
+        "title":      info.get("title", "Unknown"),
+        "url":        info.get("url") or (info.get("formats", [{}])[-1].get("url", "")),
+        "webpage_url": info.get("webpage_url", query),
+        "duration":   info.get("duration", 0),
+        "uploader":   info.get("uploader", "Unknown"),
+        "thumbnail":  info.get("thumbnail", ""),
+        "requested_by": interaction.user.display_name,
+    }
+
+    duration_fmt = f"{song['duration']//60}:{song['duration']%60:02d}" if song["duration"] else "LIVE"
+
+    # If nothing playing, start immediately
+    if not voice_client.is_playing() and len(_music_queues.get(guild_id, [])) == 0:
+        _music_queues[guild_id].append(song)
+        await interaction.followup.send(embed=ok_e(
+            "▶️ Now Playing",
+            f"**[{song['title']}]({song['webpage_url']})**\n"
+            f"⏱️ {duration_fmt} | 👤 {song['uploader']}\n"
+            f"🎵 Requested by {song['requested_by']}"
+        ))
+        await _play_next(guild_id, voice_client)
+    else:
+        _music_queues[guild_id].append(song)
+        queue_len = len(_music_queues[guild_id])
+        await interaction.followup.send(embed=ok_e(
+            "➕ Added to Queue",
+            f"**[{song['title']}]({song['webpage_url']})**\n"
+            f"⏱️ {duration_fmt} | 👤 {song['uploader']}\n"
+            f"📋 Position #{queue_len} in queue | Requested by {song['requested_by']}"
+        ))
+
+
+@tree.command(name="skip", description="⏭️ Skip the current song")
+async def cmd_skip(interaction: discord.Interaction):
+    voice_client = discord.utils.get(bot.voice_clients, guild=interaction.guild)
+    if not voice_client or not voice_client.is_playing():
+        await interaction.response.send_message(embed=err_e("Nothing is playing right now."), ephemeral=True)
+        return
+
+    current = _music_now.get(interaction.guild.id, {})
+    title = current.get("title", "Unknown")
+    voice_client.stop()  # triggers after_play → plays next
+    await interaction.response.send_message(embed=ok_e("⏭️ Skipped", f"**{title}** skipped."))
+    _music_loops[interaction.guild.id] = False  # reset loop on skip
+
+
+@tree.command(name="stop", description="⏹️ Stop music and clear the queue")
+async def cmd_stop(interaction: discord.Interaction):
+    voice_client = discord.utils.get(bot.voice_clients, guild=interaction.guild)
+    guild_id = interaction.guild.id
+
+    _music_queues[guild_id] = deque()
+    _music_now.pop(guild_id, None)
+    _music_loops[guild_id] = False
+
+    if voice_client:
+        if voice_client.is_playing():
+            voice_client.stop()
+        await voice_client.disconnect()
+    await interaction.response.send_message(embed=ok_e("⏹️ Stopped", "Music stopped and queue cleared."))
+
+
+@tree.command(name="queue", description="📋 Show the current music queue")
+async def cmd_queue(interaction: discord.Interaction):
+    guild_id = interaction.guild.id
+    queue = _music_queues.get(guild_id, deque())
+    now = _music_now.get(guild_id)
+
+    if not now and len(queue) == 0:
+        await interaction.response.send_message(embed=err_e("The queue is empty."))
+        return
+
+    desc = ""
+    if now:
+        dur = now.get("duration", 0)
+        dur_fmt = f"{dur//60}:{dur%60:02d}" if dur else "LIVE"
+        desc += f"▶️ **NOW PLAYING:** [{now['title']}]({now.get('webpage_url', '')})\n⏱️ {dur_fmt} | 👤 {now.get('uploader', '')}\n\n"
+    if queue:
+        desc += "**UP NEXT:**\n"
+        for i, song in enumerate(list(queue)[:10], 1):
+            dur = song.get("duration", 0)
+            dur_fmt = f"{dur//60}:{dur%60:02d}" if dur else "LIVE"
+            desc += f"`{i}.` [{song['title']}]({song.get('webpage_url', '')}) — {dur_fmt}\n"
+        if len(queue) > 10:
+            desc += f"\n*...and {len(queue) - 10} more*\n"
+    else:
+        desc += "*No songs in queue.*"
+
+    if _music_loops.get(guild_id):
+        desc += "\n🔁 **Loop mode: ON**"
+
+    embed = discord.Embed(title="🎵 Music Queue", description=desc, color=0x1DB954)
+    await interaction.response.send_message(embed=embed)
+
+
+@tree.command(name="loop", description="🔁 Toggle loop for the current song")
+async def cmd_loop(interaction: discord.Interaction):
+    guild_id = interaction.guild.id
+    current = _music_loops.get(guild_id, False)
+    _music_loops[guild_id] = not current
+    status = "ON 🔁" if not current else "OFF"
+    await interaction.response.send_message(embed=ok_e("🔁 Loop", f"Loop mode is now **{status}**."))
+
+
+@tree.command(name="leave", description="👋 Disconnect the bot from voice channel")
+async def cmd_leave(interaction: discord.Interaction):
+    voice_client = discord.utils.get(bot.voice_clients, guild=interaction.guild)
+    if not voice_client:
+        await interaction.response.send_message(embed=err_e("I'm not in a voice channel."))
+        return
+    _music_queues[interaction.guild.id] = deque()
+    _music_now.pop(interaction.guild.id, None)
+    await voice_client.disconnect()
+    await interaction.response.send_message(embed=ok_e("👋 Left", "Disconnected from voice channel."))
+
+
+@tree.command(name="volume", description="🔊 Set music volume (0-100)")
+async def cmd_volume(interaction: discord.Interaction, level: int):
+    if level < 0 or level > 100:
+        await interaction.response.send_message(embed=err_e("Volume must be between 0 and 100."))
+        return
+    vol = level / 100
+    _music_volumes[interaction.guild.id] = vol
+    voice_client = discord.utils.get(bot.voice_clients, guild=interaction.guild)
+    if voice_client and hasattr(voice_client.source, "volume"):
+        voice_client.source.volume = vol
+    await interaction.response.send_message(embed=ok_e("🔊 Volume", f"Volume set to **{level}%**."))
 
 
 # ══════════════════════════════════════════════════════════
