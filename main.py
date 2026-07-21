@@ -165,12 +165,11 @@ class NexPlayBot(commands.Bot):
 
     async def setup_hook(self):
         self.http_session = aiohttp.ClientSession(timeout=HTTP_TIMEOUT)
-        # GLOBAL sync — commands appear in every server
         await self.tree.sync()
         print("[NexPlay] Global slash commands synced.")
-        # Start daily log scheduler
         asyncio.create_task(self._daily_log_scheduler())
         asyncio.create_task(auto_meme_loop())
+        asyncio.create_task(_247_health_check())
 
     async def _daily_log_scheduler(self):
         """Send daily Excel log at midnight (00:00 NPT = 18:15 UTC prev day).
@@ -2165,6 +2164,75 @@ _music_now: dict[int, dict] = {}
 _music_loops: dict[int, bool] = {}
 _music_volumes: dict[int, float] = {}
 
+# 24/7 auto-play state: guild_id → True/False (bot stays in VC and plays forever)
+_music_247: dict[int, bool] = {}
+# guild_id → channel_id where 24/7 was activated
+_247_channel: dict[int, int] = {}
+# guild_id → list of AI-curated songs already played (to avoid repeats)
+_247_history: dict[int, list] = {}
+
+# AI-curated Gen Z favorite Hindi & Nepali songs (YouTube search queries)
+# These are popular tracks that Gen Z in Nepal/India actually listens to
+GENZ_PLAYLIST = [
+    # Hindi hits
+    "Apna Bana Le Bhediya Arijit Singh",
+    "Tum Hi Ho Aashiqui 2 Arijit Singh",
+    "Channa Mereya Ae Dil Hai Mushkil",
+    "Raabta Agent Vinod Arijit Singh",
+    "Kabira Yeh Jawaani Hai Deewani",
+    "Phir Bhi Tumko Chaahunga Half Girlfriend",
+    "Ik Vaari Aa Raabta Arijit Singh",
+    "Hawayein Jab Harry Met Sejal",
+    "Tujhe Kitna Chahne Lage Hum Kabir Singh",
+    "Pachtaoge Jaani Ve Arijit Singh",
+    "Dilbar Dilbar Satyameva Jayate",
+    "Kesariya Brahmastra Arijit Singh",
+    "Shershaah Raataan Lambiyan",
+    "KGF Theme Song Rocky Bhai",
+    "Pasoori Ali Sethi Shae Gill",
+    "Baarishein Anuv Jain",
+    "Alag Aasmaan Anuv Jain",
+    "Baatein Ye Kabhi Na Kehna Khamoshiyan",
+    "Hamdard Arijit Singh",
+    "Duniyaa Luka Chuppi",
+    # Nepali hits
+    "Saili Ghimire Hemant Sharma",
+    "Yeta Timro Kathmandu Maharani",
+    "Chyangba Ohoi Pramod Kharel",
+    "Laija Re Swaroop Raj Acharya",
+    "Pani Pani Rojina Bhandari",
+    "Timi Bina Sushant KC",
+    "Sarangi Sushant KC",
+    "Kabita Khadka Maruni Song",
+    "Pritma Lok Dohori Song",
+    "Nepali Lok Dohori Latest Hit",
+    # Indian pop / Gen Z favorites
+    "Brown Munde AP Dhillon",
+    "Excuses AP Dhillon",
+    "Insane AP Dhillon",
+    "Maan Meri Jaan King",
+    "Na Ja Pav Dharia",
+    "Kina Dekha Indeep Pari",
+    "Sufiyana Pyaar Mera Kailash Kher",
+    "Bekhayali Kabir Singh",
+    "Aabaad Barbaad Arijit Singh",
+    "O Bedardeya Tu Jhoothi Main Makkar",
+    "Tere Vaal Love Shagun",
+    "Heeriye Jasleen Royal Arijit Singh",
+    "Tere Pyaar Mein Tu Jhoothi Main Makkar",
+    "Pyaar Hota Kayabar Hua Tu Jhoothi Main Makkar",
+    "Mast Magan Two States",
+    "Gerua Dilwale",
+    "Zaalima Raees",
+    "Sochta Hoon Kitne Din Bahar Jaani",
+    "Lut Gaye Jubin Nautiyal",
+    "Barsaat Ki Dhun Jubin Nautiyal",
+    "O Aasai Wale Sapne Bula Le",
+    "Tera Fitoor Genius Utkarsh",
+    "Mere Mehboob Qayamat Ki Raat",
+    "Dil Galti Kar Baitha Hai Jubin Nautiyal",
+]
+
 def _fmt_dur(sec: int) -> str:
     """Format seconds as m:ss, or LIVE if 0."""
     return f"{sec//60}:{sec%60:02d}" if sec else "LIVE"
@@ -2224,9 +2292,48 @@ async def _extract_audio(query: str) -> dict:
     }
 
 
+async def _pick_autoplay_song(guild_id: int) -> dict:
+    """Pick a random song from the Gen Z playlist that hasn't been played recently."""
+    import random
+    history = _247_history.get(guild_id, [])
+    # If we've played most of the playlist, reset history
+    if len(history) > len(GENZ_PLAYLIST) * 0.7:
+        history = []
+        _247_history[guild_id] = []
+    # Pick a song not in recent history
+    available = [s for s in GENZ_PLAYLIST if s not in history]
+    if not available:
+        available = GENZ_PLAYLIST
+        _247_history[guild_id] = []
+    chosen = random.choice(available)
+    _247_history.setdefault(guild_id, []).append(chosen)
+    # Extract audio info
+    info = await _extract_audio(chosen)
+    return {
+        "title": info["title"], "url": info["url"], "webpage_url": info["webpage_url"],
+        "duration": info["duration"], "uploader": info["uploader"],
+        "thumbnail": info["thumbnail"], "requested_by": "🎵 24/7 AutoPlay",
+    }
+
 async def _play_next(guild_id: int, voice_client):
-    """Play the next song in the queue."""
+    """Play next song from queue, or auto-play from playlist if 24/7 mode is on."""
     queue = _music_queues.get(guild_id)
+    is_247 = _music_247.get(guild_id, False)
+
+    # Queue empty + 24/7 on → pick a random song from the curated playlist
+    if (not queue or len(queue) == 0) and is_247 and voice_client and voice_client.is_connected():
+        try:
+            auto_song = await _pick_autoplay_song(guild_id)
+            _music_queues.setdefault(guild_id, deque()).append(auto_song)
+            queue = _music_queues.get(guild_id)
+        except Exception as e:
+            print(f"[Music/247] Auto-play pick failed: {e}", flush=True)
+            # Retry after a short delay
+            await asyncio.sleep(5)
+            if is_247 and voice_client.is_connected():
+                asyncio.ensure_future(_play_next(guild_id, voice_client))
+            return
+
     if not queue or len(queue) == 0:
         _music_now.pop(guild_id, None)
         return
@@ -2235,7 +2342,6 @@ async def _play_next(guild_id: int, voice_client):
     _music_now[guild_id] = song
 
     try:
-        # Re-extract fresh audio URL (YouTube URLs expire after ~6 min)
         fresh_info = await _extract_audio(song["webpage_url"])
         audio_url = fresh_info["url"]
 
@@ -2245,30 +2351,26 @@ async def _play_next(guild_id: int, voice_client):
         def after_play(error):
             if error:
                 print(f"[Music] Playback error: {error}", flush=True)
-            # Handle loop
             if _music_loops.get(guild_id):
                 _music_queues.setdefault(guild_id, deque()).appendleft(song)
-            # Play next song
             try:
                 asyncio.run_coroutine_threadsafe(
-                    _play_next(guild_id, voice_client),
-                    bot.loop
-                )
+                    _play_next(guild_id, voice_client), bot.loop)
             except Exception as e:
                 print(f"[Music] after_play error: {e}", flush=True)
 
         voice_client.play(player, after=after_play)
-        print(f"[Music] Now playing: {song['title']} in guild {guild_id}", flush=True)
+        print(f"[Music] Now playing: {song['title']} in guild {guild_id}{' [24/7]' if is_247 else ''}", flush=True)
 
     except Exception as e:
         print(f"[Music] Error playing next: {e}", flush=True)
         _music_now.pop(guild_id, None)
-        # Try next song if any
-        if queue:
+        # If 24/7 is on, retry with next song after short delay
+        if is_247 and voice_client and voice_client.is_connected():
+            await asyncio.sleep(3)
+            asyncio.ensure_future(_play_next(guild_id, voice_client))
+        elif queue:
             await _play_next(guild_id, voice_client)
-        else:
-            # No more songs — don't disconnect, just idle
-            pass
 
 
 @tree.command(name="play", description="🎵 Play music from YouTube URL or search query")
@@ -2351,20 +2453,24 @@ async def cmd_skip(interaction: discord.Interaction):
     await interaction.response.send_message(embed=ok_e("⏭️ Skipped", f"**{title}** skipped."))
 
 
-@tree.command(name="stop", description="⏹️ Stop music and clear the queue")
+@tree.command(name="stop", description="⏹️ Stop music, clear queue, disable 24/7 mode")
 async def cmd_stop(interaction: discord.Interaction):
     voice_client = _get_vc(interaction)
     guild_id = interaction.guild.id
+    was_247 = _music_247.get(guild_id, False)
 
     _music_queues[guild_id] = deque()
     _music_now.pop(guild_id, None)
     _music_loops[guild_id] = False
+    _music_247[guild_id] = False  # Disable 24/7
+    _247_channel.pop(guild_id, None)
 
     if voice_client:
         if voice_client.is_playing():
             voice_client.stop()
         await voice_client.disconnect()
-    await interaction.response.send_message(embed=ok_e("⏹️ Stopped", "Music stopped and queue cleared."))
+    msg = "Music stopped, queue cleared, 24/7 disabled." if was_247 else "Music stopped and queue cleared."
+    await interaction.response.send_message(embed=ok_e("⏹️ Stopped", msg))
 
 
 @tree.command(name="queue", description="📋 Show the current music queue")
@@ -2395,6 +2501,8 @@ async def cmd_queue(interaction: discord.Interaction):
 
     if _music_loops.get(guild_id):
         desc += "\n🔁 **Loop mode: ON**"
+    if _music_247.get(guild_id):
+        desc += "\n♾️ **24/7 AutoPlay: ON**"
 
     embed = discord.Embed(title="🎵 Music Queue", description=desc, color=0x1DB954)
     await interaction.response.send_message(embed=embed)
@@ -2409,16 +2517,18 @@ async def cmd_loop(interaction: discord.Interaction):
     await interaction.response.send_message(embed=ok_e("🔁 Loop", f"Loop mode is now **{status}**."))
 
 
-@tree.command(name="leave", description="👋 Disconnect the bot from voice channel")
+@tree.command(name="leave", description="👋 Disconnect bot, disable 24/7 mode")
 async def cmd_leave(interaction: discord.Interaction):
     voice_client = _get_vc(interaction)
     if not voice_client:
-        await interaction.response.send_message(embed=err_e("I'm not in a voice channel."))
-        return
-    _music_queues[interaction.guild.id] = deque()
-    _music_now.pop(interaction.guild.id, None)
+        return await interaction.response.send_message(embed=err_e("I'm not in a voice channel."))
+    gid = interaction.guild.id
+    _music_queues[gid] = deque()
+    _music_now.pop(gid, None)
+    _music_247[gid] = False
+    _247_channel.pop(gid, None)
     await voice_client.disconnect()
-    await interaction.response.send_message(embed=ok_e("👋 Left", "Disconnected from voice channel."))
+    await interaction.response.send_message(embed=ok_e("👋 Left", "Disconnected. 24/7 disabled."))
 
 
 @tree.command(name="volume", description="🔊 Set music volume (0-100)")
@@ -2452,6 +2562,168 @@ async def cmd_resume(interaction: discord.Interaction):
         return
     voice_client.resume()
     await interaction.response.send_message(embed=ok_e("▶️ Resumed", "Music resumed."))
+
+
+# ──────────────────────────────────────────────────────────
+#  24/7 AUTO-PLAY SYSTEM
+# ──────────────────────────────────────────────────────────
+
+@tree.command(name="247", description="🎵 Enable 24/7 music — bot stays in VC and plays forever")
+async def cmd_247(interaction: discord.Interaction):
+    """Enable 24/7 auto-play mode. Bot joins the user's voice channel and
+    continuously plays random Gen Z Hindi/Nepali songs from the curated playlist."""
+    if not is_staff(interaction.user):
+        return await interaction.response.send_message(embed=err_e("Staff only to enable 24/7 mode."), ephemeral=True)
+
+    gid = interaction.guild.id
+
+    # If already in 24/7 mode, disable it
+    if _music_247.get(gid, False):
+        _music_247[gid] = False
+        _247_channel.pop(gid, None)
+        voice_client = _get_vc(interaction)
+        if voice_client and voice_client.is_playing():
+            voice_client.stop()
+        # Don't disconnect — let the current queue finish or user can /leave
+        return await interaction.response.send_message(embed=ok_e("🎵 24/7 Disabled",
+            "Auto-play stopped. Bot will disconnect when queue ends.\nUse `/leave` to disconnect now."))
+
+    # User must be in a voice channel
+    if not interaction.user.voice or not interaction.user.voice.channel:
+        return await interaction.response.send_message(embed=err_e("Join a voice channel first, then run `/247`."))
+
+    voice_channel = interaction.user.voice.channel
+    voice_client = _get_vc(interaction)
+
+    if not voice_client:
+        try:
+            voice_client = await voice_channel.connect(timeout=30, reconnect=True)
+        except Exception as e:
+            return await interaction.response.send_message(embed=err_e(f"Failed to join voice: {e}"))
+    elif voice_client.channel != voice_channel:
+        await voice_client.move_to(voice_channel)
+
+    # Enable 24/7
+    _music_247[gid] = True
+    _247_channel[gid] = voice_channel.id
+    if gid not in _music_queues:
+        _music_queues[gid] = deque()
+        _music_volumes[gid] = 0.5
+
+    await interaction.response.send_message(embed=ok_e("🎵 24/7 AutoPlay Enabled!",
+        f"Bot is now in **{voice_channel.name}** and will play music 24/7!\n\n"
+        f"🎶 Playlist: **Gen Z Hindi & Nepali Hits** ({len(GENZ_PLAYLIST)} songs)\n"
+        f"🤖 AI-curated: Arijit Singh, AP Dhillon, Sushant KC, Jubin Nautiyal & more\n"
+        f"♾️ Random shuffle — no repeats for 70% of playlist\n\n"
+        f"**Controls:**\n"
+        f"• `/skip` — skip current song\n"
+        f"• `/play <song>` — add a song (plays after current)\n"
+        f"• `/queue` — see what's playing\n"
+        f"• `/stop` — stop everything & disconnect\n"
+        f"• `/247` again — toggle off\n"
+        f"• `/playlist` — view full playlist"))
+
+    # If nothing is playing, start auto-play
+    if not voice_client.is_playing() and not voice_client.is_paused():
+        await _play_next(gid, voice_client)
+
+
+@tree.command(name="autoplay", description="🎵 Toggle auto-play (same as /247)")
+async def cmd_autoplay(interaction: discord.Interaction):
+    """Alias for /247."""
+    await cmd_247(interaction)
+
+
+@tree.command(name="playlist", description="📜 View the 24/7 auto-play playlist")
+async def cmd_playlist(interaction: discord.Interaction):
+    """Show the curated Gen Z Hindi/Nepali playlist."""
+    desc = "**🎶 Gen Z Hindi & Nepali Hits**\n\n"
+    desc += "**🇮🇳 Hindi Hits:**\n"
+    hindi_songs = [s for s in GENZ_PLAYLIST if "Arijit" in s or "Jubin" in s or "KGF" in s
+                   or "Brahmastra" in s or "Shershaah" in s or "Dhillon" in s or "King" in s
+                   or "Anuv" in s or "Kher" in s or "Nautiyal" in s or "Jaani" in s
+                   or "Raabta" in s or "Dilwale" in s or "Raees" in s or "Genius" in s]
+    nepali_songs = [s for s in GENZ_PLAYLIST if s not in hindi_songs]
+
+    for i, s in enumerate(hindi_songs[:20], 1):
+        desc += f"`{i:2}.` {s}\n"
+    if len(hindi_songs) > 20:
+        desc += f"*...and {len(hindi_songs)-20} more Hindi tracks*\n"
+
+    desc += f"\n**🇳🇵 Nepali Hits:**\n"
+    for i, s in enumerate(nepali_songs, 1):
+        desc += f"`{i:2}.` {s}\n"
+
+    desc += f"\n**Total: {len(GENZ_PLAYLIST)} songs** — random shuffle in 24/7 mode\n"
+    desc += "Use `/247` to start auto-play! 🎵"
+
+    # Split into multiple embeds if too long
+    if len(desc) > 4000:
+        desc = desc[:3990] + "..."
+
+    e = discord.Embed(title="📜 NexPlay 24/7 Playlist", description=desc, color=0x1DB954,
+        timestamp=datetime.now(timezone.utc))
+    e.set_footer(text="AI-curated Gen Z Hindi & Nepali playlist")
+    await interaction.response.send_message(embed=e)
+
+
+@tree.command(name="nowplaying", description="🎵 Show what's currently playing")
+async def cmd_nowplaying(interaction: discord.Interaction):
+    """Show the currently playing song with details."""
+    gid = interaction.guild.id
+    now = _music_now.get(gid)
+    if not now:
+        return await interaction.response.send_message(embed=err_e("Nothing is playing right now."))
+
+    dur = _fmt_dur(now.get("duration", 0))
+    is_247 = _music_247.get(gid, False)
+    requester = now.get("requested_by", "Unknown")
+
+    e = discord.Embed(title="🎵 Now Playing", color=0x1DB954, timestamp=datetime.now(timezone.utc))
+    e.description = f"**[{now['title']}]({now.get('webpage_url', '')})**\n⏱️ {dur} | 👤 {now.get('uploader', '')}\n🎵 Requested by {requester}"
+    if is_247:
+        e.description += "\n♾️ **24/7 AutoPlay is ON**"
+    if now.get("thumbnail"):
+        e.set_thumbnail(url=now["thumbnail"])
+    e.set_footer(text="NexPlay Music")
+    await interaction.response.send_message(embed=e)
+
+
+async def _247_health_check():
+    """Background task: every 60s, check all guilds with 24/7 enabled.
+    If bot disconnected from VC, reconnect and resume auto-play."""
+    await bot.wait_until_ready()
+    print("[NexPlay] 24/7 health check started.", flush=True)
+    while not bot.is_closed():
+        try:
+            for guild in bot.guilds:
+                gid = guild.id
+                if not _music_247.get(gid, False):
+                    continue
+                vc = discord.utils.get(bot.voice_clients, guild=guild)
+                ch_id = _247_channel.get(gid)
+                # Bot not connected but 24/7 is on → reconnect
+                if not vc or not vc.is_connected():
+                    ch = guild.get_channel(ch_id) if ch_id else None
+                    if not ch:
+                        # Find any voice channel the bot can join
+                        ch = discord.utils.find(lambda c: c.permissions_for(guild.me).connect, guild.voice_channels)
+                    if ch:
+                        try:
+                            vc = await ch.connect(timeout=15, reconnect=True)
+                            _247_channel[gid] = ch.id
+                            print(f"[NexPlay/247] Reconnected to {ch.name} in {guild.name}", flush=True)
+                            if not vc.is_playing():
+                                await _play_next(gid, vc)
+                        except Exception as e:
+                            print(f"[NexPlay/247] Reconnect failed in {guild.name}: {e}", flush=True)
+                # Connected but nothing playing → resume auto-play
+                elif vc.is_connected() and not vc.is_playing() and not vc.is_paused():
+                    if len(_music_queues.get(gid, deque())) == 0:
+                        await _play_next(gid, vc)
+        except Exception as e:
+            print(f"[NexPlay/247] Health check error: {e}", flush=True)
+        await asyncio.sleep(60)
 
 
 @bot.event
@@ -2502,9 +2774,12 @@ async def on_guild_remove(guild: discord.Guild):
             "last_active": now_iso(),
         })
         print(f"[NexPlay] Marked {guild.name} as inactive (data preserved)", flush=True)
-    # Clean up meme cache
+    # Clean up meme cache + 24/7 state
     _last_meme_url.pop(guild.id, None)
     _meme_channel_cache.pop(guild.id, None)
+    _music_247.pop(guild.id, None)
+    _247_channel.pop(guild.id, None)
+    _247_history.pop(guild.id, None)
 
 
 @bot.event
