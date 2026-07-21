@@ -318,20 +318,9 @@ async def auto_meme_loop():
                     sub_idx = (guild.id // 1000 + int(asyncio.get_event_loop().time()) // 900) % len(MEME_SUBREDDITS)
                     sub = MEME_SUBREDDITS[sub_idx]
 
-                    # Fetch trending meme — try multiple subreddits
+                    # Fetch trending meme (fetch_reddit_meme already tries 3 subreddits)
                     last_url = _last_meme_url.get(guild.id, "")
                     meme = await fetch_reddit_meme(sub, exclude_url=last_url)
-
-                    # Fallback: random different subreddit
-                    if not meme:
-                        alt_subs = [s for s in MEME_SUBREDDITS if s != sub]
-                        random.shuffle(alt_subs)
-                        for alt_sub in alt_subs[:3]:
-                            meme = await fetch_reddit_meme(alt_sub, exclude_url=last_url)
-                            if meme:
-                                sub = alt_sub
-                                break
-
                     if not meme:
                         continue
 
@@ -368,8 +357,16 @@ async def auto_meme_loop():
 
 @bot.event
 async def on_member_join(member: discord.Member):
-    """Send a warm welcome to new members in #welcome channel (Elite plan)."""
+    """Welcome new members (Elite) + update server member count."""
     guild = member.guild
+    # Update member count for ALL servers
+    srv = await get_server_record(str(guild.id))
+    if srv:
+        await b44_update("Server", srv["id"], {
+            "member_count": guild.member_count or 0,
+            "last_active": now_iso(),
+        })
+    # Welcome message (Elite only)
     ok, _ = await check_feature(str(guild.id), "welcome_message")
     if not ok:
         return
@@ -953,6 +950,22 @@ async def get_server_record(guild_id: str) -> dict | None:
     servers = await b44_list("Server", {"guild_id": guild_id})
     return servers[0] if servers else None
 
+async def register_server(guild: discord.Guild) -> dict:
+    """Register a new server as Free Trial. Returns the created record."""
+    owner = guild.owner
+    return await b44_create("Server", {
+        "guild_id":            str(guild.id),
+        "guild_name":          guild.name,
+        "owner_id":            str(owner.id) if owner else "",
+        "owner_name":          owner.display_name if owner else "Unknown",
+        "plan_name":           "Free Trial",
+        "subscription_status": "trial",
+        "tournaments_used":    0,
+        "tournament_limit":    3,
+        "member_count":        guild.member_count or 0,
+        "last_active":         now_iso(),
+    })
+
 
 async def is_allowed(guild_id: str, guild: discord.Guild = None) -> tuple[bool, str]:
     """Returns (allowed, reason). Auto-registers new servers as Free Trial."""
@@ -1083,10 +1096,8 @@ def is_staff(member: discord.Member) -> bool:
     if member.guild.owner_id == member.id:
         return True
     for role in member.roles:
-        clean = role.name.strip()
-        for prefix in ("👑 ", "⚔️ ", "🛡️ ", "🔧 ", "🎮 ", "🎯 ", "⚙️ ", "🏆 ", "🔥 ", "⛏️ ", "📋 ", "🌱 ", "🤖 ",
-                        "👑", "⚔️", "🛡️", "🔧", "🎮", "🎯", "⚙️", "🏆", "🔥", "⛏️", "📋", "🌱", "🤖"):
-            clean = clean.replace(prefix, "").strip()
+        # Strip emoji prefixes (any non-alphanumeric leading chars)
+        clean = re.sub(r"^[^A-Za-z]+", "", role.name).strip()
         if clean in STAFF_ROLE_NAMES:
             return True
     return False
@@ -1101,6 +1112,20 @@ def ok_e(title: str, desc: str, color: int = 0x00FF7F) -> discord.Embed:
     e.set_footer(text="NexPlay Tournament System")
     e.timestamp = datetime.now(timezone.utc)
     return e
+
+async def _reject_msg(message: discord.Message, title: str, desc: str, delay: int = 15):
+    """Reply with an error embed, react ❌, then delete both after delay."""
+    await message.add_reaction("❌")
+    err = await message.reply(
+        embed=discord.Embed(title=title, description=desc, color=0xFF4444),
+        mention_author=True
+    )
+    await asyncio.sleep(delay)
+    try:
+        await err.delete()
+        await message.delete()
+    except:
+        pass
 
 def img_url(t_name: str, game: str, kind: str, extra: str = "") -> str:
     """Generate a fixed-size tournament image URL via Pollinations.
@@ -1189,35 +1214,23 @@ async def ai_generate(prompt: str) -> str:
     return ""
 
 def build_server_context(guild: discord.Guild, active_tournament: dict | None) -> str:
-    """Build a rich context string about the server for the AI prompt."""
-    channels = [f"#{ch.name}" for ch in guild.text_channels]
-    roles    = [r.name for r in guild.roles if not r.is_default()]
-
-    ctx  = f"Server: {guild.name}\n"
-    ctx += f"Channels: {', '.join(channels[:30])}\n"
-    ctx += f"Roles: {', '.join(roles[:20])}\n"
-
+    """Build context string about the server for the AI prompt."""
+    channels = ", ".join(f"#{ch.name}" for ch in guild.text_channels[:30])
+    roles    = ", ".join(r.name for r in guild.roles if not r.is_default()[:20])
+    ctx = f"Server: {guild.name}\nChannels: {channels}\nRoles: {roles}\n"
     if active_tournament:
-        tn    = active_tournament.get('name', 'Unknown')
-        tg    = active_tournament.get('game', 'Unknown')
-        ts    = active_tournament.get('status', 'unknown')
-        td    = active_tournament.get('tournament_date', 'TBA')
-        ttime = active_tournament.get('tournament_time', 'TBD')
-        tmx   = active_tournament.get('max_players', '?')
-        tcnt  = active_tournament.get('registered_count', 0)
-        tsize = active_tournament.get('team_size', 4)
-        tp    = active_tournament.get('prize_pool', 'TBA')
-        short = active_tournament.get('short_name', '')
-
-        ctx += f"\nActive Tournament: {tn}\n"
-        ctx += f"Game: {tg} | Status: {ts} | Date: {td} | Time: {ttime}\n"
-        ctx += f"Max Slots: {tmx} | Registered: {tcnt} | Team Size: {tsize}\n"
-        ctx += f"Prize Pool: {tp}\n"
-        if short:
-            ctx += f"Registration channel: #{short}-register\n"
+        t = active_tournament
+        ctx += (
+            f"\nActive Tournament: {t.get('name','?')}\n"
+            f"Game: {t.get('game','?')} | Status: {t.get('status','?')} | "
+            f"Date: {t.get('tournament_date','?')} | Time: {t.get('tournament_time','?')}\n"
+            f"Slots: {t.get('max_players','?')} | Registered: {t.get('registered_count',0)} | "
+            f"Team Size: {t.get('team_size',4)} | Prize: {t.get('prize_pool','?')}\n"
+        )
+        if t.get('short_name'):
+            ctx += f"Registration channel: #{t['short_name']}-register\n"
     else:
-        ctx += "\nNo active tournament right now.\n"
-
+        ctx += "\nNo active tournament.\n"
     return ctx
 
 # ══════════════════════════════════════════════════════════
@@ -1518,28 +1531,19 @@ class StaffLogView(discord.ui.View):
         self.stop()
         await interaction.response.send_message("🗑️ Dismissed & lock cleared.", ephemeral=True)
 
-    async def _update_embed(self, interaction: discord.Interaction,
-                             new_title: str, color: int, footer_note: str):
-        """Rebuild embed with new status and disable all buttons."""
-        if self.message:
-            try:
-                old = self.message.embeds[0] if self.message.embeds else None
-                if old:
-                    new_e = discord.Embed(
-                        title=new_title,
-                        description=old.description,
-                        color=color,
-                        timestamp=datetime.now(timezone.utc)
-                    )
-                    for field in old.fields:
-                        new_e.add_field(name=field.name, value=field.value, inline=field.inline)
-                    new_e.set_footer(text=footer_note)
-                    # Disable all buttons
-                    for child in self.children:
-                        child.disabled = True
-                    await self.message.edit(embed=new_e, view=self)
-            except Exception as e:
-                print(f"[StaffLogView] embed update error: {e}")
+    async def _update_embed(self, interaction, new_title, color, footer_note):
+        """Rebuild embed with new status, disable all buttons."""
+        if not self.message or not self.message.embeds:
+            return
+        old = self.message.embeds[0]
+        new_e = discord.Embed(title=new_title, description=old.description, color=color, timestamp=datetime.now(timezone.utc))
+        for f in old.fields:
+            new_e.add_field(name=f.name, value=f.value, inline=f.inline)
+        new_e.set_footer(text=footer_note)
+        for child in self.children:
+            child.disabled = True
+        try: await self.message.edit(embed=new_e, view=self)
+        except: pass
 
 
 async def handle_support(message: discord.Message) -> None:
@@ -1870,27 +1874,10 @@ async def on_message(message: discord.Message):
 
         # ── VALIDATION ────────────────────────────────────────────────────────
         if not parsed:
-            await message.add_reaction("❌")
             lines_needed = "\n".join([f"Player {i+1}: @mention" for i in range(team_size)])
-            err_msg = await message.reply(
-                embed=discord.Embed(
-                    title="❌ Invalid Format",
-                    description=(
-                        f"Please use EXACTLY this format:\n"
-                        f"```\nTeam Name: <your team name>\n{lines_needed}\n```"
-                        f"\n• All {team_size} players must be @mentioned\n"
-                        "• Team Name line is required"
-                    ),
-                    color=0xFF4444
-                ),
-                mention_author=True
-            )
-            await asyncio.sleep(15)
-            try:
-                await err_msg.delete()
-                await message.delete()
-            except:
-                pass
+            await _reject_msg(message, "❌ Invalid Format",
+                f"Please use EXACTLY this format:\n```\nTeam Name: <your team name>\n{lines_needed}\n```"
+                f"\n• All {team_size} players must be @mentioned\n• Team Name line is required")
             return
 
         team_name = parsed["team_name"]
@@ -1899,20 +1886,8 @@ async def on_message(message: discord.Message):
         # Check team name duplicate
         existing_regs = await b44_list("Registration", {"tournament_id": tournament["id"]})
         if any(r.get("player_name", "").lower() == team_name.lower() for r in existing_regs):
-            await message.add_reaction("❌")
-            err_msg = await message.reply(
-                embed=discord.Embed(
-                    title="❌ Team Name Taken",
-                    description=f"**{team_name}** is already registered. Use a different team name.",
-                    color=0xFF4444
-                )
-            )
-            await asyncio.sleep(15)
-            try:
-                await err_msg.delete()
-                await message.delete()
-            except:
-                pass
+            await _reject_msg(message, "❌ Team Name Taken",
+                f"**{team_name}** is already registered. Use a different team name.")
             return
 
         # Check player duplicate
@@ -1926,20 +1901,8 @@ async def on_message(message: discord.Message):
 
         already = [f"<@{p}>" for p in players if p in all_registered_players]
         if already:
-            await message.add_reaction("❌")
-            err_msg = await message.reply(
-                embed=discord.Embed(
-                    title="❌ Player Already Registered",
-                    description=f"{', '.join(already)} is already registered in another team!",
-                    color=0xFF4444
-                )
-            )
-            await asyncio.sleep(15)
-            try:
-                await err_msg.delete()
-                await message.delete()
-            except:
-                pass
+            await _reject_msg(message, "❌ Player Already Registered",
+                f"{', '.join(already)} is already registered in another team!")
             return
 
         # Check slots
@@ -2051,52 +2014,19 @@ async def on_message(message: discord.Message):
         image_attachments = [a for a in message.attachments if a.content_type and a.content_type.startswith("image/")]
 
         if not image_attachments:
-            await message.add_reaction("❌")
-            err = await message.reply(
-                embed=discord.Embed(
-                    title="❌ No Image Attached",
-                    description=(
-                        "Please attach your team logo image (PNG/JPG) AND include your team name.\n\n"
-                        "**Format:**\n"
-                        "```\nTeam Name: <your exact team name>\nTeam Logo: [attach image]\n```"
-                    ),
-                    color=0xFF4444
-                ),
-                mention_author=True
-            )
-            await asyncio.sleep(15)
-            try:
-                await err.delete()
-                await message.delete()
-            except:
-                pass
+            await _reject_msg(message, "❌ No Image Attached",
+                "Please attach your team logo image (PNG/JPG) AND include your team name.\n\n"
+                "**Format:**\n```\nTeam Name: <your exact team name>\nTeam Logo: [attach image]\n```")
             return
 
         # Extract team name from message text
-        import re
         text_content = message.content.strip()
         team_name_match = re.search(r'team\s*name\s*:\s*(.+)', text_content, re.IGNORECASE)
 
         if not team_name_match:
-            await message.add_reaction("❌")
-            err = await message.reply(
-                embed=discord.Embed(
-                    title="❌ Missing Team Name",
-                    description=(
-                        "Include your team name in the message.\n\n"
-                        "**Format:**\n"
-                        "```\nTeam Name: <your exact team name>\nTeam Logo: [attach image]\n```"
-                    ),
-                    color=0xFF4444
-                ),
-                mention_author=True
-            )
-            await asyncio.sleep(15)
-            try:
-                await err.delete()
-                await message.delete()
-            except:
-                pass
+            await _reject_msg(message, "❌ Missing Team Name",
+                "Include your team name in the message.\n\n"
+                "**Format:**\n```\nTeam Name: <your exact team name>\nTeam Logo: [attach image]\n```")
             return
 
         submitted_team_name = team_name_match.group(1).strip()
@@ -2116,24 +2046,9 @@ async def on_message(message: discord.Message):
                 submitted_team_name = matched_reg.get("player_name", submitted_team_name)
 
         if not matched_reg:
-            await message.add_reaction("❌")
-            err = await message.reply(
-                embed=discord.Embed(
-                    title="❌ Team Not Found",
-                    description=(
-                        f"**{submitted_team_name}** is not registered in this tournament.\n\n"
-                        "Make sure your team name matches exactly as you registered."
-                    ),
-                    color=0xFF4444
-                ),
-                mention_author=True
-            )
-            await asyncio.sleep(20)
-            try:
-                await err.delete()
-                await message.delete()
-            except:
-                pass
+            await _reject_msg(message, "❌ Team Not Found",
+                f"**{submitted_team_name}** is not registered in this tournament.\n\n"
+                "Make sure your team name matches exactly as you registered.", delay=20)
             return
 
         # Save logo URL to DB
@@ -2245,15 +2160,7 @@ async def cmd_setup(interaction: discord.Interaction):
     # Register or update server record
     existing = await get_server_record(gid)
     if not existing:
-        created = await b44_create("Server", {
-            "guild_id": gid, "guild_name": interaction.guild.name,
-            "owner_id": str(interaction.guild.owner_id),
-            "owner_name": interaction.user.display_name,
-            "plan_name": "Free Trial",
-            "subscription_status": "trial", "tournaments_used": 0,
-            "tournament_limit": 3, "member_count": interaction.guild.member_count or 0,
-            "last_active": now_iso(),
-        })
+        created = await register_server(interaction.guild)
         if created and created.get("id"):
             status_msg = "Server registered! You have a **free trial** with 3 tournaments."
         else:
@@ -2278,24 +2185,7 @@ async def cmd_setup(interaction: discord.Interaction):
 # ── /create_tournament ────────────────────────────────────
 
 async def make_tournament_channels(guild: discord.Guild, tournament_name: str) -> dict:
-    """
-    Create a dedicated category + 8 channels for each tournament.
-    
-    Format: <short_name>-<channel>
-    Example: For "NexPlay Open 2026":
-      Category: 🏆 NPO26
-        #npo26-info
-        #npo26-announcements  
-        #npo26-roadmap
-        #npo26-results
-        #npo26-groups
-        #npo26-register
-        #npo26-confirm-teams
-        #npo26-help
-    
-    Returns dict with channel IDs.
-    """
-    import re
+    """Create a tournament category + 8 channels. Returns dict with channel IDs."""
     
     # ── Generate short name from tournament name ──────────────────────────────
     words = tournament_name.strip().split()
@@ -3200,19 +3090,7 @@ async def on_guild_join(guild: discord.Guild):
     print(f"[NexPlay] 🆕 Joined: {guild.name} ({guild.id}) — {guild.member_count} members", flush=True)
     existing = await b44_list("Server", {"guild_id": str(guild.id)})
     if not existing:
-        owner = guild.owner
-        await b44_create("Server", {
-            "guild_id":            str(guild.id),
-            "guild_name":          guild.name,
-            "owner_id":            str(owner.id) if owner else "",
-            "owner_name":           owner.display_name if owner else "Unknown",
-            "plan_name":           "Free Trial",
-            "subscription_status": "trial",
-            "tournaments_used":    0,
-            "tournament_limit":    3,
-            "member_count":        guild.member_count or 0,
-            "last_active":         now_iso(),
-        })
+        await register_server(guild)
         print(f"[NexPlay] ✅ Registered {guild.name} as Free Trial (3 tournaments)", flush=True)
     else:
         print(f"[NexPlay] {guild.name} already registered", flush=True)
@@ -3234,28 +3112,11 @@ async def on_guild_join(guild: discord.Guild):
     # Welcome message
     for ch in guild.text_channels:
         if ch.permissions_for(guild.me).send_messages:
-            e = discord.Embed(
-                title="👋 NexPlay Tournament System is here!",
-                description=(
-                    f"Welcome **{guild.name}** to NexPlay! 🎮\n\n"
-                    "**What I can do:**\n"
-                    "🏆 `/create_tournament` — Create tournaments with auto-channels\n"
-                    "✍️ `/register` — Players register via text in #register channels\n"
-                    "📊 `/generate_groups` — Auto group draws\n"
-                    "🎨 GFX generation, match results, CSV exports\n"
-                    "🤖 AI support in #support / #help channels\n"
-                    "🔥 Trending memes every 30 minutes\n\n"
-                    "**Getting started:**\n"
-                    "1. Make sure you have the `Tournament Host` role\n"
-                    "2. Run `/create_tournament` to create your first tournament\n"
-                    "3. Manage tournaments: https://nexplay-server-portal.vercel.app\n\n"
-                    "Your server is on **Free Trial** (3 tournaments). Upgrade anytime!"
-                ),
-                color=0x5865F2
-            )
-            e.set_footer(text="NexPlay Tournament System • Multi-server ready")
-            try: await ch.send(embed=e)
-            except: pass
+            await ch.send(embed=ok_e("👋 NexPlay is here!",
+                f"Welcome **{guild.name}**! 🎮\n"
+                "🏆 `/create_tournament` · ✍️ `/register` · 🎨 GFX · 🤖 AI support\n"
+                "Run `/setup` to get started. Free Trial = 3 tournaments.\n"
+                "Portal: https://nexplay-server-portal.vercel.app"))
             break
 
     # Update member count for existing servers on join
@@ -3280,17 +3141,6 @@ async def on_guild_remove(guild: discord.Guild):
     # Clean up meme cache
     _last_meme_url.pop(guild.id, None)
     _meme_channel_cache.pop(guild.id, None)
-
-
-@bot.event
-async def on_member_join(member: discord.Member):
-    """Update member count when someone joins a server."""
-    srv = await get_server_record(str(member.guild.id))
-    if srv:
-        await b44_update("Server", srv["id"], {
-            "member_count": member.guild.member_count or 0,
-            "last_active": now_iso(),
-        })
 
 
 @bot.event
