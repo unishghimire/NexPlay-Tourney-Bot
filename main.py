@@ -16,6 +16,8 @@ import io
 import csv
 import re
 import openpyxl
+import yt_dlp
+from collections import deque
 from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
 from datetime import datetime, timezone
@@ -24,9 +26,9 @@ from dotenv import load_dotenv
 # Load .env file if present (local dev). Render injects vars directly.
 load_dotenv()
 
-# ══════════════════════════════════════════════════════════
+# ──────────────────────────────────────────────────────────
 #  CONFIG  — all values come from environment variables
-# ══════════════════════════════════════════════════════════
+# ──────────────────────────────────────────────────────────
 BOT_TOKEN   = os.environ.get("DISCORD_BOT_TOKEN", "")
 HOME_GUILD  = int(os.environ.get("DISCORD_GUILD_ID", "0"))   # owner's server only
 SVC_TOKEN   = os.environ.get("BASE44_SERVICE_TOKEN", "")
@@ -54,11 +56,11 @@ STATUS_EMOJI = {
 }
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ────────────────────────────────────────────────────────────══════════════════
 #  PLAN FEATURE GATES
 #  Keys match features checked throughout the bot.
 #  Plans: trial / starter / pro / elite
-# ══════════════════════════════════════════════════════════════════════════════
+# ────────────────────────────────────────────────────────────══════════════════
 PLAN_FEATURES = {
     # (plan_name_lower) → set of unlocked feature keys
     # meme_post is available on ALL plans — every server gets trending memes
@@ -144,9 +146,9 @@ def log(msg: str):
 
 
 
-# ══════════════════════════════════════════════════════════
+# ──────────────────────────────────────────────────────────
 #  BOT CLASS
-# ══════════════════════════════════════════════════════════
+# ──────────────────────────────────────────────────────────
 class NexPlayBot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
@@ -197,9 +199,9 @@ bot  = NexPlayBot()
 tree = bot.tree
 
 
-# ══════════════════════════════════════════════════════════
+# ──────────────────────────────────────────────────────────
 #  MEME / FUNNY VIDEO AUTO-POSTER  (Elite plan only)
-# ══════════════════════════════════════════════════════════
+# ──────────────────────────────────────────────────────────
 
 MEME_SUBREDDITS = [
     "dankmemes", "gaming", "freefire", "PUBGMobile", "FreeFireBattlegrounds",
@@ -351,9 +353,9 @@ async def auto_meme_loop():
         await asyncio.sleep(MEME_INTERVAL)
 
 
-# ══════════════════════════════════════════════════════════
+# ──────────────────────────────────────────────────────────
 #  WELCOME MESSAGE  (Elite plan only)
-# ══════════════════════════════════════════════════════════
+# ──────────────────────────────────────────────────────────
 
 @bot.event
 async def on_member_join(member: discord.Member):
@@ -395,9 +397,9 @@ async def on_member_join(member: discord.Member):
     await welcome_ch.send(embed=embed)
 
 
-# ══════════════════════════════════════════════════════════
+# ──────────────────────────────────────────────────────────
 #  ANNOUNCEMENT COMMAND  (all plans)
-# ══════════════════════════════════════════════════════════
+# ──────────────────────────────────────────────────────────
 
 @tree.command(name="announce", description="[Host] Post a tournament announcement embed")
 @app_commands.describe(
@@ -425,19 +427,67 @@ async def cmd_announce(
     await target.send(embed=embed)
     await interaction.followup.send(embed=ok_e("Announced!", f"Posted to {target.mention}"), ephemeral=True)
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ────────────────────────────────────────────────────────────══════════════════
 #  MULTI-STEP TOURNAMENT CREATION MODALS
-# ══════════════════════════════════════════════════════════════════════════════
+# ────────────────────────────────────────────────────────────══════════════════
 
-# ══════════════════════════════════════════════════════════
+# ──────────────────────────────────────────────────────────
 #  TOURNAMENT CREATION — MODAL → BUTTON → MODAL FLOW
 #  Discord does NOT allow opening a modal from inside another
 #  modal's on_submit. Pattern: Modal → ephemeral View with
 #  Next button → button opens next Modal → repeat.
 #  Step data stored in _tourney_sessions[user_id].
-# ══════════════════════════════════════════════════════════
+# ──────────────────────────────────────────────────────────
 
-_tourney_sessions: dict[int, dict] = {}   # user_id → accumulated data
+_tourney_sessions: dict[int, dict] = {}
+
+FMT_LABELS = {"single_elim":"Single Elimination","double_elim":"Double Elimination","round_robin":"Round Robin","battle_royale":"Battle Royale"}
+STAGE_NAMES = ["Group Stage","Quarter Final","Semi Final","Grand Final","Championship"]
+
+async def _post_tournament_info(ch_info, ch_ann, ch_reg, ch_road, ch_logo, name, game,
+                                fmt_label, prize, date, time_str, max_p, t_size, g_size,
+                                rounds, reg_end, nations, rules, stream, desc, poster, roadmap):
+    """Post tournament embeds to all channels after creation."""
+    if ch_info:
+        d = (f"**🎮 Game:** {game}\n**🏆 Format:** {fmt_label}\n**💰 Prize:** {prize}\n"
+             f"**📅 Date:** {date} | **⏰ Time:** {time_str}\n"
+             f"**👥 Max Teams:** {max_p} | **Size:** {t_size}v{t_size}\n"
+             f"**🎯 Groups:** {g_size}/group | **Rounds:** {rounds}\n"
+             f"**🗓️ Reg Deadline:** {reg_end} | **🌏 Nations:** {nations}")
+        if rules: d += f"\n**📜 Rules:**\n{rules}"
+        if stream: d += f"\n**📺 Stream:** {stream}"
+        if desc: d += f"\n{desc}"
+        e = discord.Embed(title=f"📋 {name} — Tournament Info", description=d, color=0x5865F2, timestamp=datetime.now(timezone.utc))
+        e.set_footer(text="NexPlay Tournament System")
+        if poster: e.set_image(url=poster)
+        await dpost(ch_info, e)
+
+    if ch_ann:
+        d = (f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n🎮 **Game:** {game}\n💰 **Prize:** {prize}\n"
+             f"📅 **Date:** {date} | ⏰ {time_str}\n👥 **Slots:** {max_p} teams ({t_size}v{t_size})\n"
+             f"🌏 **Nations:** {nations}\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        if ch_reg: d += f"\n✍️ Register → <#{ch_reg}>"
+        if ch_info: d += f"\n📋 Info → <#{ch_info}>"
+        if ch_road: d += f"\n🗺️ Roadmap → <#{ch_road}>"
+        if stream: d += f"\n📺 Stream: **{stream}**"
+        e = discord.Embed(title=f"🚨 {name.upper()} — REGISTRATION OPEN!", description=d, color=0x00FF7F, timestamp=datetime.now(timezone.utc))
+        e.set_footer(text="NexPlay | Registration Open")
+        if poster: e.set_image(url=poster)
+        await dpost(ch_ann, e)
+
+    if ch_reg:
+        d = f"Use `/register` to sign up!\n\n**Deadline:** {reg_end} | **Team Size:** {t_size}\n**Open Slots:** {max_p}"
+        if ch_logo: d += f"\nAfter registering, submit logo in <#{ch_logo}> 🖼️"
+        e = discord.Embed(title=f"✍️ Register for {name}", description=d, color=0xFFD700)
+        e.set_footer(text="NexPlay Registration")
+        await dpost(ch_reg, e)
+
+    if ch_road:
+        lines = [f"**Stage {i+1}:** {STAGE_NAMES[i] if i < 5 else f'Round {i+1}'}" for i in range(min(rounds, 5))]
+        e = discord.Embed(title=f"🗺️ {name} — Roadmap", description="\n".join(lines), color=0xFF6B35)
+        e.set_footer(text="NexPlay Roadmap")
+        if roadmap: e.set_image(url=roadmap)
+        await dpost(ch_road, e)
 
 # ── Step 1 Modal ──────────────────────────────────────────
 class TournamentStep1Modal(discord.ui.Modal, title="🏆 Create Tournament (1/3) — Basics"):
@@ -605,77 +655,12 @@ class TournamentStep3Modal(discord.ui.Modal, title="🏆 Create Tournament (3/3)
         })
         tid = rec.get("id", "")
 
-        fmt_label = {
-            "single_elim": "Single Elimination", "double_elim": "Double Elimination",
-            "round_robin": "Round Robin", "battle_royale": "Battle Royale",
-        }.get(fmt.lower().replace(" ", "_"), fmt)
+        fmt_label = FMT_LABELS.get(fmt.lower().replace(" ", "_"), fmt)
 
-        # Post to #info
-        if ch_info_id:
-            e = discord.Embed(
-                title=f"📋 {name} — Tournament Info",
-                description=(
-                    f"**🎮 Game:** {game}\n**🏆 Format:** {fmt_label}\n"
-                    f"**💰 Prize Pool:** {prize_pool}\n"
-                    f"**📅 Date:** {date}  |  **⏰ Time:** {time_str}\n"
-                    f"**👥 Max Teams:** {max_players}  |  **Size:** {team_size}v{team_size}\n"
-                    f"**🎯 Groups:** {group_size} teams/group  |  **Rounds:** {rounds}\n"
-                    f"**🗓️ Reg Deadline:** {reg_end}  |  **🌏 Nations:** {nations}\n"
-                    + (f"\n**📜 Rules:**\n{rules}\n" if rules else "")
-                    + (f"\n**📺 Stream:** {stream}" if stream else "")
-                    + (f"\n\n{description}" if description else "")
-                ),
-                color=0x5865F2, timestamp=datetime.now(timezone.utc)
-            )
-            e.set_footer(text="NexPlay Tournament System")
-            if poster_url: e.set_image(url=poster_url)
-            await dpost(ch_info_id, e)
-
-        # Post to #announcements
-        if ch_ann_id:
-            e = discord.Embed(
-                title=f"🚨 {name.upper()} — REGISTRATION OPEN!",
-                description=(
-                    f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                    f"🎮 **Game:** {game}\n💰 **Prize:** {prize_pool}\n"
-                    f"📅 **Date:** {date}  |  ⏰ {time_str}\n"
-                    f"👥 **Slots:** {max_players} teams ({team_size}v{team_size})\n"
-                    f"🌏 **Nations:** {nations}\n"
-                    f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                    + (f"✍️ Register → <#{ch_reg_id}>\n" if ch_reg_id else "")
-                    + (f"📋 Info → <#{ch_info_id}>\n" if ch_info_id else "")
-                    + (f"🗺️ Roadmap → <#{ch_road_id}>\n" if ch_road_id else "")
-                    + (f"📺 Stream: **{stream}**" if stream else "")
-                ),
-                color=0x00FF7F, timestamp=datetime.now(timezone.utc)
-            )
-            e.set_footer(text="NexPlay | Registration Open")
-            if poster_url: e.set_image(url=poster_url)
-            await dpost(ch_ann_id, e)
-
-        # Post to #register
-        if ch_reg_id:
-            e = discord.Embed(
-                title=f"✍️ Register for {name}",
-                description=(
-                    f"Use `/register` to sign up!\n\n"
-                    f"**Deadline:** {reg_end}  |  **Team Size:** {team_size}\n"
-                    f"**Open Slots:** {max_players}\n"
-                    + (f"\nAfter registering, submit logo in <#{ch_logo_id}> 🖼️" if ch_logo_id else "")
-                ),
-                color=0xFFD700
-            )
-            e.set_footer(text="NexPlay Registration")
-            await dpost(ch_reg_id, e)
-
-        # Post roadmap
-        if ch_road_id:
-            stage_names = ["Group Stage", "Quarter Final", "Semi Final", "Grand Final", "Championship"]
-            lines_r = [f"**Stage {i+1}:** {stage_names[i] if i < 5 else 'Round '+str(i+1)}" for i in range(min(rounds, 5))]
-            e = discord.Embed(title=f"🗺️ {name} — Roadmap", description="\n".join(lines_r), color=0xFF6B35)
-            e.set_footer(text="NexPlay Roadmap")
-            if roadmap_url: e.set_image(url=roadmap_url)
-            await dpost(ch_road_id, e)
+        await _post_tournament_info(ch_info_id, ch_ann_id, ch_reg_id, ch_road_id, ch_logo_id,
+            name, game, fmt_label, prize_pool, date, time_str, max_players,
+            team_size, group_size, rounds, reg_end, nations, rules, stream,
+            description, poster_url, roadmap_url)
 
         # Update server tournament count
         srv = await get_server_record(gid)
@@ -869,9 +854,9 @@ async def on_ready():
     print("=" * 60, flush=True)
 
 
-# ══════════════════════════════════════════════════════════
+# ──────────────────────────────────────────────────────────
 #  BASE44 ENTITY HELPERS
-# ══════════════════════════════════════════════════════════
+# ──────────────────────────────────────────────────────────
 def _b44_headers() -> dict:
     return {"Authorization": "Bearer " + SVC_TOKEN, "Content-Type": "application/json"}
 
@@ -941,11 +926,11 @@ async def b44_delete(entity: str, record_id: str) -> bool:
         return False
 
 
-# ══════════════════════════════════════════════════════════
+# ──────────────────────────────────────────────────────────
 #  SUBSCRIPTION GATE
 #  Every staff command calls this first. If the server isn't
 #  registered or has expired, the command is blocked.
-# ══════════════════════════════════════════════════════════
+# ──────────────────────────────────────────────────────────
 async def get_server_record(guild_id: str) -> dict | None:
     servers = await b44_list("Server", {"guild_id": guild_id})
     return servers[0] if servers else None
@@ -996,11 +981,11 @@ async def is_allowed(guild_id: str, guild: discord.Guild = None) -> tuple[bool, 
     return False, "This server's NexPlay subscription has expired.\nRenew at: https://nexplay-server-portal.vercel.app/subscription\nPlans from NPR 99/mo (Starter) · NPR 299/mo (Pro AI) · NPR 399/mo (Elite)"
 
 
-# ══════════════════════════════════════════════════════════
+# ──────────────────────────────────────────────────────────
 #  DYNAMIC CHANNEL RESOLVER
 #  Finds channels by name — works in ANY server.
 #  Falls back to first available channel if not found.
-# ══════════════════════════════════════════════════════════
+# ──────────────────────────────────────────────────────────
 CHANNEL_NAMES = {
     "announcements": ["tourney-announcements", "tournament-announcements", "announcements", "general"],
     "registration":  ["tourney-registration", "tournament-registration", "registration", "general"],
@@ -1059,9 +1044,9 @@ async def get_or_create_channels(guild: discord.Guild) -> dict:
     return result
 
 
-# ══════════════════════════════════════════════════════════
+# ──────────────────────────────────────────────────────────
 #  DISCORD REST HELPER
-# ══════════════════════════════════════════════════════════
+# ──────────────────────────────────────────────────────────
 async def dpost(channel_id: int, embed: discord.Embed, content: str = "") -> dict:
     if not channel_id:
         return {}
@@ -1078,9 +1063,9 @@ async def dpost(channel_id: int, embed: discord.Embed, content: str = "") -> dic
         return {}
 
 
-# ══════════════════════════════════════════════════════════
+# ──────────────────────────────────────────────────────────
 #  SMALL UTILITIES
-# ══════════════════════════════════════════════════════════
+# ──────────────────────────────────────────────────────────
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -1147,9 +1132,9 @@ def img_url(t_name: str, game: str, kind: str, extra: str = "") -> str:
     )
 
 
-# ══════════════════════════════════════════════════════════
+# ──────────────────────────────────────────────────────────
 #  AI SUPPORT ENGINE  — Pollinations AI + one-reply-per-user lock
-# ══════════════════════════════════════════════════════════
+# ──────────────────────────────────────────────────────────
 #
 #  RULES:
 #  1. Bot replies to a user ONCE per support session
@@ -1157,7 +1142,7 @@ def img_url(t_name: str, game: str, kind: str, extra: str = "") -> str:
 #  3. Uses Pollinations free text AI for natural, accurate responses
 #  4. Always mentions real channel names from the server
 #  5. Unknown/complex queries → staff-log with full context
-# ══════════════════════════════════════════════════════════
+# ──────────────────────────────────────────────────────────
 
 import urllib.parse
 
@@ -1233,9 +1218,9 @@ def build_server_context(guild: discord.Guild, active_tournament: dict | None) -
         ctx += "\nNo active tournament.\n"
     return ctx
 
-# ══════════════════════════════════════════════════════════
+# ──────────────────────────────────────────────────────────
 #  EXCEL LOG BUILDER
-# ══════════════════════════════════════════════════════════
+# ──────────────────────────────────────────────────────────
 def _xl_header_style(cell, bg="1F4E79"):
     cell.font      = Font(bold=True, color="FFFFFF", size=10)
     cell.fill      = PatternFill("solid", fgColor=bg)
@@ -1244,157 +1229,94 @@ def _xl_header_style(cell, bg="1F4E79"):
 def _xl_border(cell):
     thin = {"border_style": "thin", "color": "AAAAAA"}
     from openpyxl.styles import Border, Side
-    cell.border = Border(
-        left=Side(**thin), right=Side(**thin),
-        top=Side(**thin), bottom=Side(**thin)
-    )
+    cell.border = Border(left=Side(**thin), right=Side(**thin), top=Side(**thin), bottom=Side(**thin))
+
+def _xl_sheet(wb, title, headers, rows, color="1F4E79", widths=None, status_col=0, status_colors=None):
+    """Create a styled Excel sheet with headers and data rows."""
+    ws = wb.create_sheet(title)
+    for ci, h in enumerate(headers, 1):
+        _xl_header_style(ws_t := ws.cell(row=1, column=ci, value=h), color)
+        _xl_border(ws_t)
+    ws.row_dimensions[1].height = 20
+    for ri, row in enumerate(rows, 2):
+        for ci, val in enumerate(row, 1):
+            c = ws.cell(row=ri, column=ci, value=str(val) if val is not None else "")
+            _xl_border(c)
+            c.alignment = Alignment(vertical="center", wrap_text=(ci == 2 and len(headers) <= 4))
+    if status_col and status_colors:
+        for ri, row in enumerate(rows, 2):
+            ws.cell(row=ri, column=status_col).fill = PatternFill("solid", fgColor=status_colors.get(row[status_col-1], "FFFFFF"))
+    if widths:
+        for ci, w in enumerate(widths, 1):
+            ws.column_dimensions[get_column_letter(ci)].width = w
+    return ws
 
 async def build_daily_excel(guild: discord.Guild) -> io.BytesIO:
-    """Build a full-day Excel report for one guild."""
+    """Build a daily Excel report for one guild with 5 sheets."""
     wb = openpyxl.Workbook()
     gid = str(guild.id)
-    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    tournaments = await b44_list("Tournament", {"guild_id": gid})
+    all_regs = await b44_list("Registration", {"guild_id": gid})
+    support_msgs = await b44_list("SupportMessage", {"guild_id": gid})
+    matches = await b44_list("Match", {"guild_id": gid})
+    t_map = {t["id"]: t.get("name","?") for t in tournaments}
 
-    # ── Sheet 1: TOURNAMENTS ────────────────────────────────────────────
+    # Sheet 1: Tournaments
     ws_t = wb.active
     ws_t.title = "Tournaments"
-    t_headers = ["ID", "Name", "Game", "Status", "Slots", "Registered",
-                 "Prize Pool", "Date", "Time", "Format", "Created"]
+    t_headers = ["ID","Name","Game","Status","Slots","Registered","Prize","Date","Time","Format","Created"]
     for ci, h in enumerate(t_headers, 1):
-        c = ws_t.cell(row=1, column=ci, value=h)
-        _xl_header_style(c)
-        _xl_border(c)
-    ws_t.row_dimensions[1].height = 20
-
-    tournaments = await b44_list("Tournament", {"guild_id": gid})
+        _xl_header_style(ws_t.cell(row=1, column=ci, value=h))
+        _xl_border(ws_t.cell(row=1, column=ci))
+    t_sc = {"registration_open":"C6EFCE","registration_closed":"FFEB9C","groups_generated":"BDD7EE","scheduled":"FCE4D6","completed":"E2EFDA","deleted":"DDDDDD"}
     for ri, t in enumerate(tournaments, 2):
-        row = [
-            t.get("id","")[:8], t.get("name",""), t.get("game",""),
-            t.get("status",""), t.get("max_players",""), t.get("registered_count",0),
-            t.get("prize_pool",""), t.get("tournament_date",""),
-            t.get("tournament_time",""), t.get("format",""),
-            t.get("created_date","")[:10] if t.get("created_date") else ""
-        ]
+        row = [t.get("id","")[:8], t.get("name",""), t.get("game",""), t.get("status",""),
+               t.get("max_players",""), t.get("registered_count",0), t.get("prize_pool",""),
+               t.get("tournament_date",""), t.get("tournament_time",""), t.get("format",""), str(t.get("created_date",""))[:10]]
         for ci, val in enumerate(row, 1):
-            c = ws_t.cell(row=ri, column=ci, value=str(val))
-            _xl_border(c)
-            c.alignment = Alignment(vertical="center")
-        # Color by status
-        status_colors = {
-            "registration_open": "C6EFCE", "registration_closed": "FFEB9C",
-            "groups_generated": "BDD7EE", "scheduled": "FCE4D6",
-            "completed": "E2EFDA", "deleted": "DDDDDD"
-        }
-        sc = status_colors.get(t.get("status",""), "FFFFFF")
-        ws_t.cell(row=ri, column=4).fill = PatternFill("solid", fgColor=sc)
+            _xl_border(ws_t.cell(row=ri, column=ci, value=str(val)))
+        ws_t.cell(row=ri, column=4).fill = PatternFill("solid", fgColor=t_sc.get(t.get("status",""),"FFFFFF"))
+    for ci, w in enumerate([8,25,14,18,6,10,12,12,12,16,12], 1):
+        ws_t.column_dimensions[get_column_letter(ci)].width = w
 
-    for ci in range(1, len(t_headers)+1):
-        ws_t.column_dimensions[get_column_letter(ci)].width = [8,25,14,18,6,10,12,12,12,16,12][ci-1]
+    # Sheet 2-4 via _xl_sheet
+    _xl_sheet(wb, "Registrations", ["Team Name","Tournament","Players","Discord User","Reg At","Group","Status","Slot"],
+        [[r.get("player_name",""), t_map.get(r.get("tournament_id",""),"?"), r.get("player_username",""),
+          r.get("player_discord_tag",""), str(r.get("registered_at",""))[:16], r.get("group_label","—"),
+          r.get("status","registered"), r.get("seed_number","")] for r in all_regs],
+        "375623", widths=[18,22,30,18,16,8,12,7])
 
-    # ── Sheet 2: REGISTRATIONS ─────────────────────────────────────────
-    ws_r = wb.create_sheet("Registrations")
-    r_headers = ["Team Name", "Tournament", "Players", "Discord User",
-                 "Registered At", "Group", "Status", "Slot #"]
-    for ci, h in enumerate(r_headers, 1):
-        c = ws_r.cell(row=1, column=ci, value=h)
-        _xl_header_style(c, "375623")
-        _xl_border(c)
-    ws_r.row_dimensions[1].height = 20
+    _xl_sheet(wb, "Support Log", ["ID","Message","Status","Created"],
+        [[sm.get("id","")[:8], sm.get("message","")[:200], sm.get("status",""), str(sm.get("created_date",""))[:16]] for sm in support_msgs],
+        "843C0C", widths=[8,60,12,16], status_col=3,
+        status_colors={"resolved":"C6EFCE","pending":"FFEB9C","escalated":"FCE4D6","dismissed":"DDDDDD","saved":"BDD7EE"})
 
-    all_regs = await b44_list("Registration", {"guild_id": gid})
-    t_map = {t["id"]: t.get("name","?") for t in tournaments}
-    for ri, r in enumerate(all_regs, 2):
-        row = [
-            r.get("player_name",""), t_map.get(r.get("tournament_id",""),"?"),
-            r.get("player_username",""), r.get("player_discord_tag",""),
-            r.get("registered_at","")[:16] if r.get("registered_at") else "",
-            r.get("group_label","—"), r.get("status","registered"), r.get("seed_number","")
-        ]
-        for ci, val in enumerate(row, 1):
-            c = ws_r.cell(row=ri, column=ci, value=str(val))
-            _xl_border(c)
-            c.alignment = Alignment(vertical="center")
+    _xl_sheet(wb, "Match Results", ["Tournament","Round","P1","P2","Winner","Score","Status"],
+        [[t_map.get(m.get("tournament_id",""),"?"), m.get("round_number",""), m.get("player1_username",""),
+          m.get("player2_username",""), m.get("winner_username",""),
+          f"{m.get('player1_score','')}-{m.get('player2_score','')}" if m.get("player1_score") else "N/A",
+          m.get("status","")] for m in matches],
+        "4472C4", widths=[22,7,18,18,18,8,12])
 
-    for ci, w in enumerate([18,22,30,18,16,8,12,7], 1):
-        ws_r.column_dimensions[get_column_letter(ci)].width = w
-
-    # ── Sheet 3: SUPPORT LOG ───────────────────────────────────────────
-    ws_s = wb.create_sheet("Support Log")
-    s_headers = ["ID", "Message", "Status", "Created"]
-    for ci, h in enumerate(s_headers, 1):
-        c = ws_s.cell(row=1, column=ci, value=h)
-        _xl_header_style(c, "843C0C")
-        _xl_border(c)
-
-    support_msgs = await b44_list("SupportMessage", {"guild_id": gid})
-    for ri, sm in enumerate(support_msgs, 2):
-        row = [
-            sm.get("id","")[:8], sm.get("message","")[:200],
-            sm.get("status",""), sm.get("created_date","")[:16] if sm.get("created_date") else ""
-        ]
-        for ci, val in enumerate(row, 1):
-            c = ws_s.cell(row=ri, column=ci, value=str(val))
-            _xl_border(c)
-            c.alignment = Alignment(vertical="center", wrap_text=(ci==2))
-        # Color by status
-        status_colors2 = {"resolved": "C6EFCE", "pending": "FFEB9C",
-                          "escalated": "FCE4D6", "dismissed": "DDDDDD", "saved": "BDD7EE"}
-        sc = status_colors2.get(sm.get("status",""), "FFFFFF")
-        ws_s.cell(row=ri, column=3).fill = PatternFill("solid", fgColor=sc)
-
-    for ci, w in enumerate([8, 60, 12, 16], 1):
-        ws_s.column_dimensions[get_column_letter(ci)].width = w
-    ws_s.row_dimensions[1].height = 20
-
-    # ── Sheet 4: MATCH RESULTS ─────────────────────────────────────────
-    ws_m = wb.create_sheet("Match Results")
-    m_headers = ["Tournament", "Round", "Player 1", "Player 2", "Winner", "Score", "Status"]
-    for ci, h in enumerate(m_headers, 1):
-        c = ws_m.cell(row=1, column=ci, value=h)
-        _xl_header_style(c, "4472C4")
-        _xl_border(c)
-
-    matches = await b44_list("Match", {"guild_id": gid})
-    for ri, m in enumerate(matches, 2):
-        row = [
-            t_map.get(m.get("tournament_id",""),"?"), m.get("round_number",""),
-            m.get("player1_username",""), m.get("player2_username",""),
-            m.get("winner_username",""), 
-            str(m.get("player1_score","")) + "-" + str(m.get("player2_score","")) if m.get("player1_score") else "N/A",
-            m.get("status","")
-        ]
-        for ci, val in enumerate(row, 1):
-            c = ws_m.cell(row=ri, column=ci, value=str(val))
-            _xl_border(c)
-
-    for ci, w in enumerate([22,7,18,18,18,8,12], 1):
-        ws_m.column_dimensions[get_column_letter(ci)].width = w
-
-    # ── Sheet 5: SUMMARY ──────────────────────────────────────────────
-    ws_sum = wb.create_sheet("Summary")
-    ws_sum["A1"] = f"NexPlay Daily Report — {guild.name}"
-    ws_sum["A1"].font = Font(bold=True, size=14, color="1F4E79")
-    ws_sum["A2"] = f"Generated: {today_str} (12:00 AM NPT)"
-    ws_sum["A2"].font = Font(italic=True, size=10, color="666666")
-    ws_sum.merge_cells("A1:D1")
-    ws_sum.merge_cells("A2:D2")
-
-    stats = [
-        ("", ""),
-        ("📊 SUMMARY", ""),
-        ("Total Tournaments", len(tournaments)),
-        ("Active Tournaments", len([t for t in tournaments if t.get("status") not in ("completed","deleted")])),
-        ("Total Registrations", len(all_regs)),
-        ("Support Messages Today", len(support_msgs)),
-        ("Pending Support",       len([s for s in support_msgs if s.get("status") == "pending"])),
-        ("Resolved Support",      len([s for s in support_msgs if s.get("status") == "resolved"])),
-        ("Total Matches Played",  len(matches)),
-    ]
+    # Sheet 5: Summary
+    ws = wb.create_sheet("Summary")
+    ws["A1"] = f"NexPlay Daily Report — {guild.name}"
+    ws["A1"].font = Font(bold=True, size=14, color="1F4E79")
+    ws["A2"] = f"Generated: {today} (12:00 AM NPT)"
+    ws["A2"].font = Font(italic=True, size=10, color="666666")
+    ws.merge_cells("A1:D1"), ws.merge_cells("A2:D2")
+    stats = [("",""),("📊 SUMMARY",""),("Total Tournaments",len(tournaments)),
+             ("Active Tournaments",len([t for t in tournaments if t.get("status") not in ("completed","deleted")])),
+             ("Total Registrations",len(all_regs)),("Support Messages",len(support_msgs)),
+             ("Pending Support",len([s for s in support_msgs if s.get("status")=="pending"])),
+             ("Resolved Support",len([s for s in support_msgs if s.get("status")=="resolved"])),
+             ("Matches Played",len(matches))]
     for ri, (k, v) in enumerate(stats, 3):
-        ws_sum.cell(row=ri, column=1, value=k).font = Font(bold=(k.startswith("📊")), size=11)
-        ws_sum.cell(row=ri, column=2, value=v)
-    ws_sum.column_dimensions["A"].width = 28
-    ws_sum.column_dimensions["B"].width = 15
+        ws.cell(row=ri, column=1, value=k).font = Font(bold=k.startswith("📊"), size=11)
+        ws.cell(row=ri, column=2, value=v)
+    ws.column_dimensions["A"].width = 28
+    ws.column_dimensions["B"].width = 15
 
     buf = io.BytesIO()
     wb.save(buf)
@@ -1403,47 +1325,28 @@ async def build_daily_excel(guild: discord.Guild) -> io.BytesIO:
 
 
 async def send_daily_logs(bot_instance: "NexPlayBot"):
-    """Send daily Excel report to server owners + NexPlay admin."""
+    """Send daily Excel report to server owners."""
     print("[NexPlay] Sending daily logs...", flush=True)
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    servers = await b44_list("Server")
-    for srv in servers:
-        gid = srv.get("guild_id","")
-        owner_id = srv.get("owner_id","")
+    for srv in await b44_list("Server"):
+        gid, owner_id = srv.get("guild_id",""), srv.get("owner_id","")
         guild = bot_instance.get_guild(int(gid)) if gid else None
         if not guild or not owner_id:
             continue
         try:
             xl_buf = await build_daily_excel(guild)
             owner = await bot_instance.fetch_user(int(owner_id))
-            if owner:
-                dm = await owner.create_dm()
-                file = discord.File(xl_buf, filename=f"NexPlay_DailyLog_{guild.name}_{today}.xlsx")
-                summary_e = discord.Embed(
-                    title=f"📊 NexPlay Daily Report — {guild.name}",
-                    description=(
-                        f"Your daily server report for **{today}** is attached!\n\n"
-                        f"The Excel file contains:\n"
-                        f"• 🏆 All Tournaments & their status\n"
-                        f"• 👥 All Team Registrations\n"
-                        f"• 💬 Support Message Log\n"
-                        f"• ⚔️ Match Results\n"
-                        f"• 📈 Summary Stats\n\n"
-                        f"*Sent automatically every day at 12:00 AM NPT by NexPlay Bot*"
-                    ),
-                    color=0x1F4E79, timestamp=datetime.now(timezone.utc)
-                )
-                summary_e.set_footer(text="NexPlay Tournament System")
-                await dm.send(embed=summary_e, file=file)
-                print(f"[NexPlay] Daily log sent to {owner} for {guild.name}", flush=True)
+            dm = await owner.create_dm()
+            e = discord.Embed(title=f"📊 NexPlay Daily Report — {guild.name}",
+                description=f"Daily report for **{today}** — tournaments, registrations, matches & support.",
+                color=0x1F4E79, timestamp=datetime.now(timezone.utc))
+            e.set_footer(text="NexPlay Tournament System")
+            await dm.send(embed=e, file=discord.File(xl_buf, filename=f"NexPlay_DailyLog_{guild.name}_{today}.xlsx"))
+            print(f"[NexPlay] Daily log sent to {owner} for {guild.name}", flush=True)
         except Exception as e:
             print(f"[NexPlay] Daily log error for {gid}: {e}", flush=True)
 
 
-
-# ══════════════════════════════════════════════════════════
-#  STAFF LOG BUTTON VIEW
-# ══════════════════════════════════════════════════════════
 class StaffLogView(discord.ui.View):
     """Persistent button panel on staff-log messages."""
 
@@ -1615,20 +1518,11 @@ INSTRUCTIONS:
 
     needs_staff = not ai_reply or ai_reply.startswith("NEEDS_STAFF") or len(ai_reply) < 10
 
-    # ── Determine embed color by topic ────────────────────────────────────
     ql = q.lower()
-    if any(k in ql for k in ['register','join','sign up']):
-        color = 0x00FF7F
-    elif any(k in ql for k in ['when','time','date','schedule']):
-        color = 0x1E90FF
-    elif any(k in ql for k in ['prize','reward','money','win']):
-        color = 0xFFD700
-    elif any(k in ql for k in ['rule','cheat','banned','unfair']):
-        color = 0xFF4444
-    elif any(k in ql for k in ['bracket','group','opponent']):
-        color = 0x9B59B6
-    else:
-        color = 0x5865F2
+    SUPPORT_COLORS = [(0x00FF7F,['register','join','sign up']),(0x1E90FF,['when','time','date','schedule']),
+                      (0xFFD700,['prize','reward','money','win']),(0xFF4444,['rule','cheat','banned','unfair']),
+                      (0x9B59B6,['bracket','group','opponent'])]
+    color = next((c for c, kws in SUPPORT_COLORS if any(k in ql for k in kws)), 0x5865F2)
 
     # ── Reply to user ──────────────────────────────────────────────────────
     if not needs_staff and ai_reply:
@@ -1709,6 +1603,14 @@ INSTRUCTIONS:
             )
         except Exception:
             pass
+async def find_tournament_by_short(guild_id: str, short_name: str, statuses: tuple = ("registration_open",)) -> dict | None:
+    """Find a tournament by short_name in a guild."""
+    for t in await b44_list("Tournament", {"guild_id": guild_id}):
+        if t.get("short_name", "").lower() == short_name.lower() and t.get("status") in statuses:
+            return t
+    return None
+
+
 def parse_registration(text: str, team_size: int) -> dict | None:
     """
     Parse a team registration message. Returns dict or None if invalid.
@@ -1850,19 +1752,9 @@ async def on_message(message: discord.Message):
     ch_name = message.channel.name  # e.g. "npo26-register"
 
     if ch_name.endswith("-register"):
-        short_candidate = ch_name[:-9]  # strip "-register"
-
-        # Find the matching active tournament
-        all_ts = await b44_list("Tournament", {"guild_id": gid})
-        tournament = next(
-            (t for t in all_ts
-             if t.get("short_name", "").lower() == short_candidate.lower()
-             and t.get("status") in ("registration_open",)),
-            None
-        )
-
+        short_candidate = ch_name[:-9]
+        tournament = await find_tournament_by_short(gid, short_candidate, ("registration_open",))
         if not tournament:
-            # Not an active registration channel — ignore
             await bot.process_commands(message)
             return
 
@@ -1996,16 +1888,8 @@ async def on_message(message: discord.Message):
 
     # ── Logo submission channel handler ──────────────────────────────────────
     if ch_name.endswith("-team-logo"):
-        short_candidate = ch_name[:-10]  # strip "-team-logo"
-
-        all_ts = await b44_list("Tournament", {"guild_id": gid})
-        tournament = next(
-            (t for t in all_ts
-             if t.get("short_name", "").lower() == short_candidate.lower()
-             and t.get("status") in ("registration_open", "registration_closed")),
-            None
-        )
-
+        short_candidate = ch_name[:-10]
+        tournament = await find_tournament_by_short(gid, short_candidate, ("registration_open", "registration_closed"))
         if not tournament:
             await bot.process_commands(message)
             return
@@ -2097,14 +1981,14 @@ async def on_message(message: discord.Message):
     await bot.process_commands(message)
 
 
-# ══════════════════════════════════════════════════════════
+# ──────────────────────────────────────────────────────────
 #  SLASH COMMANDS  — NO guild= parameter → global commands
-# ══════════════════════════════════════════════════════════
+# ──────────────────────────────────────────────────────────
 
 # ── /setup ────────────────────────────────────────────────
-# ══════════════════════════════════════════════════════════
+# ──────────────────────────────────────────────────────────
 #  /clearlog — Staff command to clear a user support lock
-# ══════════════════════════════════════════════════════════
+# ──────────────────────────────────────────────────────────
 @tree.command(name="clearlog", description="[Staff] Clear a user support lock so they can ask again")
 @app_commands.describe(user="The user whose support lock to clear")
 async def clearlog(interaction: discord.Interaction, user: discord.Member):
@@ -2305,9 +2189,9 @@ async def cmd_edit_tournament_new(interaction: discord.Interaction, tournament_n
 
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ────────────────────────────────────────────────────────────══════════════════
 #  ELITE FEATURE COMMANDS
-# ══════════════════════════════════════════════════════════════════════════════
+# ────────────────────────────────────────────────────────────══════════════════
 
 @tree.command(name="host_game", description="[Elite] Host a mini-game event (Trivia, Prediction, GG Hunt)")
 @app_commands.describe(game_type="Type of mini-game to host")
@@ -2401,146 +2285,53 @@ async def cmd_suggest_improvement(interaction: discord.Interaction):
 
 
 async def build_tournament_export_excel(tournament: dict, registrations: list, groups: list, matches: list) -> io.BytesIO:
-    """Build an Excel sheet with ALL data for a single tournament — used before deletion."""
+    """Build an Excel backup for a single tournament — 4 sheets."""
     wb = openpyxl.Workbook()
 
-    # ── Sheet 1: TOURNAMENT DETAILS ────────────────────────────────
+    # Sheet 1: Tournament details
     ws_t = wb.active
     ws_t.title = "Tournament"
-    details = [
-        ("Field", "Value"),
-        ("ID", tournament.get("id", "")),
-        ("Name", tournament.get("name", "")),
-        ("Short Name", tournament.get("short_name", "")),
-        ("Game", tournament.get("game", "")),
-        ("Status", tournament.get("status", "")),
-        ("Format", tournament.get("format", "")),
-        ("Prize Pool", tournament.get("prize_pool", "")),
-        ("Description", tournament.get("description", "")),
-        ("Rules", tournament.get("rules", "")),
-        ("Max Players", tournament.get("max_players", "")),
-        ("Team Size", tournament.get("team_size", "")),
-        ("Group Size", tournament.get("group_size", "")),
-        ("Rounds", tournament.get("rounds", "")),
-        ("Registered Count", tournament.get("registered_count", 0)),
-        ("Tournament Date", tournament.get("tournament_date", "")),
-        ("Tournament Time", tournament.get("tournament_time", "")),
-        ("Reg Deadline", tournament.get("reg_deadline", "")),
-        ("Stream Channel", tournament.get("stream_channel", "")),
-        ("Eligible Nations", tournament.get("eligible_nations", "")),
-        ("Category Name", tournament.get("category_name", "")),
-        ("Announcement Channel ID", tournament.get("announcement_channel_id", "")),
-        ("Registration Channel ID", tournament.get("registration_channel_id", "")),
-        ("Created By", tournament.get("created_by_discord_id", "")),
-        ("Created At", str(tournament.get("created_date", ""))),
-        ("Started At", tournament.get("started_at", "")),
-    ]
-    for ri, (field, val) in enumerate(details, 1):
-        c1 = ws_t.cell(row=ri, column=1, value=field)
-        c2 = ws_t.cell(row=ri, column=2, value=str(val) if val is not None else "")
-        if ri == 1:
-            _xl_header_style(c1)
-            _xl_header_style(c2)
-        else:
-            c1.font = Font(bold=True)
-            _xl_border(c1)
-            _xl_border(c2)
-            c2.alignment = Alignment(vertical="top", wrap_text=True)
+    fields = ["id","name","short_name","game","status","format","prize_pool","description","rules",
+              "max_players","team_size","group_size","rounds","registered_count","tournament_date",
+              "tournament_time","reg_deadline","stream_channel","eligible_nations","category_name",
+              "announcement_channel_id","registration_channel_id","created_by_discord_id","created_date","started_at"]
+    labels = ["ID","Name","Short Name","Game","Status","Format","Prize Pool","Description","Rules",
+              "Max Players","Team Size","Group Size","Rounds","Registered","Date","Time","Reg Deadline",
+              "Stream","Nations","Category","Ann Ch ID","Reg Ch ID","Created By","Created At","Started At"]
+    for ci, h in enumerate(["Field","Value"], 1):
+        _xl_header_style(ws_t.cell(row=1, column=ci, value=h))
+    for ri, (label, key) in enumerate(zip(labels, fields), 2):
+        ws_t.cell(row=ri, column=1, value=label).font = Font(bold=True)
+        _xl_border(ws_t.cell(row=ri, column=1))
+        c2 = ws_t.cell(row=ri, column=2, value=str(tournament.get(key, "")))
+        _xl_border(c2)
+        c2.alignment = Alignment(vertical="top", wrap_text=True)
     ws_t.column_dimensions["A"].width = 24
     ws_t.column_dimensions["B"].width = 50
 
-    # ── Sheet 2: REGISTRATIONS ─────────────────────────────────────
-    ws_r = wb.create_sheet("Registrations")
-    r_headers = ["Team Name", "Discord User", "Team Members", "Status", "Seed #", "Group", "Logo URL", "Registered At"]
-    for ci, h in enumerate(r_headers, 1):
-        c = ws_r.cell(row=1, column=ci, value=h)
-        _xl_header_style(c, "375623")
-        _xl_border(c)
-    ws_r.row_dimensions[1].height = 20
+    # Sheets 2-4 via _xl_sheet
+    _xl_sheet(wb, "Registrations", ["Team Name","Discord User","Team Members","Status","Seed #","Group","Logo URL","Registered At"],
+        [[r.get("player_name",""), r.get("player_discord_id",""), str(r.get("team_members","")),
+          r.get("status",""), r.get("seed_number",""), r.get("group_label","—"),
+          r.get("logo_url",""), str(r.get("registered_at",""))] for r in registrations],
+        "375623", widths=[18,18,35,14,7,8,30,20])
 
-    for ri, reg in enumerate(registrations, 2):
-        row = [
-            reg.get("player_name", ""),
-            reg.get("player_discord_id", ""),
-            str(reg.get("team_members", "")),
-            reg.get("status", ""),
-            reg.get("seed_number", ""),
-            reg.get("group_label", "—"),
-            reg.get("logo_url", ""),
-            str(reg.get("registered_at", "")),
-        ]
-        for ci, val in enumerate(row, 1):
-            c = ws_r.cell(row=ri, column=ci, value=str(val) if val is not None else "")
-            _xl_border(c)
-            c.alignment = Alignment(vertical="center", wrap_text=(ci == 3))
+    _xl_sheet(wb, "Groups", ["Group Label","Player Names","Player IDs","Generated At"],
+        [[g.get("group_label",""), str(g.get("player_names","")), str(g.get("player_ids","")), str(g.get("generated_at",""))] for g in groups],
+        "843C0C", widths=[12,40,40,20])
 
-    for ci, w in enumerate([18, 18, 35, 14, 7, 8, 30, 20], 1):
-        ws_r.column_dimensions[get_column_letter(ci)].width = w
-
-    # ── Sheet 3: GROUPS ─────────────────────────────────────────────
-    ws_g = wb.create_sheet("Groups")
-    g_headers = ["Group Label", "Player Names", "Player IDs", "Generated At"]
-    for ci, h in enumerate(g_headers, 1):
-        c = ws_g.cell(row=1, column=ci, value=h)
-        _xl_header_style(c, "843C0C")
-        _xl_border(c)
-    ws_g.row_dimensions[1].height = 20
-
-    for ri, grp in enumerate(groups, 2):
-        row = [
-            grp.get("group_label", ""),
-            str(grp.get("player_names", "")),
-            str(grp.get("player_ids", "")),
-            str(grp.get("generated_at", "")),
-        ]
-        for ci, val in enumerate(row, 1):
-            c = ws_g.cell(row=ri, column=ci, value=str(val) if val is not None else "")
-            _xl_border(c)
-            c.alignment = Alignment(vertical="center", wrap_text=(ci in (2, 3)))
-
-    for ci, w in enumerate([12, 40, 40, 20], 1):
-        ws_g.column_dimensions[get_column_letter(ci)].width = w
-
-    # ── Sheet 4: MATCHES ────────────────────────────────────────────
-    ws_m = wb.create_sheet("Matches")
-    m_headers = ["Round", "Match #", "Group", "Player 1", "Player 2", "P1 Score", "P2 Score", "Winner", "Status", "Scheduled At", "Results Card"]
-    for ci, h in enumerate(m_headers, 1):
-        c = ws_m.cell(row=1, column=ci, value=h)
-        _xl_header_style(c, "1F4E79")
-        _xl_border(c)
-    ws_m.row_dimensions[1].height = 20
-
-    for ri, m in enumerate(matches, 2):
-        row = [
-            m.get("round_number", ""),
-            m.get("match_number", ""),
-            m.get("group_label", "—"),
-            m.get("player1_username", ""),
-            m.get("player2_username", ""),
-            m.get("player1_score", ""),
-            m.get("player2_score", ""),
-            m.get("winner_username", ""),
-            m.get("status", ""),
-            str(m.get("scheduled_at", "")),
-            m.get("results_card_image_url", ""),
-        ]
-        for ci, val in enumerate(row, 1):
-            c = ws_m.cell(row=ri, column=ci, value=str(val) if val is not None else "")
-            _xl_border(c)
-            c.alignment = Alignment(vertical="center")
-
-    for ci, w in enumerate([7, 8, 8, 18, 18, 8, 8, 18, 12, 20, 30], 1):
-        ws_m.column_dimensions[get_column_letter(ci)].width = w
+    _xl_sheet(wb, "Matches", ["Round","Match #","Group","P1","P2","P1 Score","P2 Score","Winner","Status","Scheduled","Results Card"],
+        [[m.get("round_number",""), m.get("match_number",""), m.get("group_label","—"),
+          m.get("player1_username",""), m.get("player2_username",""), m.get("player1_score",""),
+          m.get("player2_score",""), m.get("winner_username",""), m.get("status",""),
+          str(m.get("scheduled_at","")), m.get("results_card_image_url","")] for m in matches],
+        "1F4E79", widths=[7,8,8,18,18,8,8,18,12,20,30])
 
     buf = io.BytesIO()
     wb.save(buf)
     buf.seek(0)
     return buf
 
-
-# ══════════════════════════════════════════════════════════
-#  CHANNEL / CATEGORY / TOURNAMENT DELETION COMMANDS
-# ══════════════════════════════════════════════════════════
 
 @tree.command(name="delete_channel", description="[Host] Delete a channel by name or ID")
 @app_commands.describe(channel="The channel to delete (name, ID, or #mention)")
@@ -2669,78 +2460,43 @@ async def cmd_delete_tournament(interaction: discord.Interaction, name: str):
     failed_channels = []
     category_deleted = False
 
-    # 0. Export Excel backup BEFORE deleting anything
-    excel_sent = False
+    # 0. Excel backup BEFORE deleting
     try:
-        regs_for_export = await b44_list("Registration", {"tournament_id": t_id})
-        groups_for_export = await b44_list("TournamentGroup", {"tournament_id": t_id})
-        matches_for_export = await b44_list("Match", {"tournament_id": t_id})
-
-        xl_buf = await build_tournament_export_excel(
-            tournament, regs_for_export, groups_for_export, matches_for_export
-        )
+        regs = await b44_list("Registration", {"tournament_id": t_id})
+        groups = await b44_list("TournamentGroup", {"tournament_id": t_id})
+        matches = await b44_list("Match", {"tournament_id": t_id})
+        xl_buf = await build_tournament_export_excel(tournament, regs, groups, matches)
         safe_name = "".join(c for c in t_name if c.isalnum() or c in " -_")[:30].strip() or "tournament"
         filename = f"NexPlay_Backup_{safe_name}_{datetime.now(timezone.utc).strftime('%Y%m%d')}.xlsx"
-
-        # DM the server owner
+        dm_embed = discord.Embed(title="📦 Tournament Data Backup",
+            description=f"Backup of **{t_name}** before deletion.\nRegs: {len(regs)} | Groups: {len(groups)} | Matches: {len(matches)}\nDeleted by: {interaction.user.mention}",
+            color=0xFFA500)
         owner = interaction.guild.owner
-        if owner:
-            try:
-                dm_ch = await owner.create_dm()
-                file = discord.File(xl_buf, filename=filename)
-                dm_embed = discord.Embed(
-                    title="📦 Tournament Data Backup",
-                    description=(
-                        f"An Excel backup of **{t_name}** has been exported before deletion.\n\n"
-                        f"**Server:** {interaction.guild.name}\n"
-                        f"**Tournament:** {t_name}\n"
-                        f"**Registrations:** {len(regs_for_export)}\n"
-                        f"**Groups:** {len(groups_for_export)}\n"
-                        f"**Matches:** {len(matches_for_export)}\n\n"
-                        f"Deleted by: {interaction.user.mention}\n"
-                        f"Date: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
-                    ),
-                    color=0xFFA500
-                )
-                await dm_ch.send(embed=dm_embed, file=file)
-                excel_sent = True
-                log(f"[Delete] Excel backup sent to {owner.display_name} for tournament '{t_name}'")
-            except discord.Forbidden:
-                log(f"[Delete] Cannot DM owner {owner.display_name} — sending to channel instead")
-                file = discord.File(xl_buf, filename=filename)
-                await interaction.channel.send(embed=dm_embed, file=file)
-                excel_sent = True
+        try:
+            await (await owner.create_dm()).send(embed=dm_embed, file=discord.File(xl_buf, filename=filename))
+        except discord.Forbidden:
+            await interaction.channel.send(embed=dm_embed, file=discord.File(xl_buf, filename=filename))
     except Exception as e:
         log(f"[Delete] Excel export failed: {e}")
 
-    # 1. Delete tournament channels by short_name prefix
+    # 1. Delete channels by short_name prefix
+    deleted_channels, failed_channels = [], []
     if short:
-        prefix = short.lower()
         for ch in list(interaction.guild.text_channels):
-            if ch.name.lower().startswith(prefix):
-                try:
-                    await ch.delete(reason=f"NexPlay: Tournament '{t_name}' deleted by {interaction.user.display_name}")
-                    deleted_channels.append(ch.name)
-                except Exception:
-                    failed_channels.append(ch.name)
+            if ch.name.lower().startswith(short.lower()):
+                try: await ch.delete(reason=f"NexPlay: Tournament '{t_name}' deleted"); deleted_channels.append(ch.name)
+                except: failed_channels.append(ch.name)
 
-    # 2. Delete the category
-    if cat_name:
-        cat = discord.utils.get(interaction.guild.categories, name=cat_name)
-        if cat:
-            # Delete any remaining channels in the category
-            for ch in list(cat.channels):
-                if ch.name not in deleted_channels:
-                    try:
-                        await ch.delete(reason=f"NexPlay: Tournament cleanup")
-                        deleted_channels.append(ch.name)
-                    except Exception:
-                        failed_channels.append(ch.name)
-            try:
-                await cat.delete(reason=f"NexPlay: Tournament '{t_name}' deleted")
-                category_deleted = True
-            except Exception:
-                pass
+    # 2. Delete category + remaining channels
+    category_deleted = False
+    cat = discord.utils.get(interaction.guild.categories, name=cat_name) if cat_name else None
+    if cat:
+        for ch in list(cat.channels):
+            if ch.name not in deleted_channels:
+                try: await ch.delete(reason="NexPlay: Tournament cleanup"); deleted_channels.append(ch.name)
+                except: failed_channels.append(ch.name)
+        try: await cat.delete(reason=f"NexPlay: Tournament '{t_name}' deleted"); category_deleted = True
+        except: pass
 
     # 3. Delete registrations from DB
     reg_count = 0
@@ -2763,34 +2519,21 @@ async def cmd_delete_tournament(interaction: discord.Interaction, name: str):
     # 6. Delete the tournament record itself
     t_deleted = await b44_delete("Tournament", t_id) if t_id else False
 
-    # Build summary
-    desc = f"🗑️ **Tournament: {t_name}**\n\n"
-    desc += f"**Channels deleted:** {len(deleted_channels)}\n"
-    if deleted_channels:
-        desc += "\n".join(f"• #{c}" for c in deleted_channels) + "\n"
-    if category_deleted:
-        desc += f"**Category deleted:** {cat_name}\n"
-    if failed_channels:
-        desc += f"\n⚠️ **Failed to delete {len(failed_channels)} channel(s)**\n"
-    desc += f"\n**Registrations deleted:** {reg_count}\n"
-    desc += f"**Groups deleted:** {group_count}\n"
-    desc += f"**Matches deleted:** {match_count}\n"
-    desc += f"**Tournament record:** {'✅ Deleted' if t_deleted else '❌ Failed'}"
-
+    desc = f"🗑️ **{t_name}**\nChannels: {len(deleted_channels)} deleted"
+    if failed_channels: desc += f", {len(failed_channels)} failed"
+    if category_deleted: desc += f"\nCategory: {cat_name} deleted"
+    desc += f"\nRegs: {reg_count} | Groups: {group_count} | Matches: {match_count}"
+    desc += f"\nRecord: {'✅ Deleted' if t_deleted else '❌ Failed'}"
     if t_deleted:
         await interaction.followup.send(embed=ok_e("Tournament Deleted", desc), ephemeral=True)
     else:
-        await interaction.followup.send(embed=err_e("Tournament channels cleaned but DB record could not be deleted. Check API connection."), ephemeral=True)
+        await interaction.followup.send(embed=err_e("DB record could not be deleted."), ephemeral=True)
 
 
 
-# ══════════════════════════════════════════════════════════
+# ──────────────────────────────────────────────────────────
 #  MUSIC PLAYER — /play, /skip, /stop, /queue, /loop, /leave, /volume
-# ══════════════════════════════════════════════════════════
-import yt_dlp
-import asyncio as _aio
-from collections import deque
-
+# ──────────────────────────────────────────────────────────
 # Per-guild music state
 _music_queues: dict[int, deque] = {}      # guild_id → song queue
 _music_now: dict[int, dict] = {}          # guild_id → currently playing info
@@ -2815,7 +2558,7 @@ FFMPEG_OPTS = {
 
 async def _extract_audio(query: str) -> dict:
     """Extract audio info from YouTube URL or search query. Returns dict with title, url, duration, uploader, thumbnail, webpage_url."""
-    loop = _aio.get_event_loop()
+    loop = asyncio.get_event_loop()
 
     def extract():
         with yt_dlp.YoutubeDL(_YDL_OPTS) as ydl:
@@ -2874,7 +2617,7 @@ async def _play_next(guild_id: int, voice_client):
                 _music_queues.setdefault(guild_id, deque()).appendleft(song)
             # Play next song
             try:
-                _aio.run_coroutine_threadsafe(
+                asyncio.run_coroutine_threadsafe(
                     _play_next(guild_id, voice_client),
                     bot.loop
                 )
@@ -3081,9 +2824,9 @@ async def cmd_resume(interaction: discord.Interaction):
     await interaction.response.send_message(embed=ok_e("▶️ Resumed", "Music resumed."))
 
 
-# ══════════════════════════════════════════════════════════
+# ──────────────────────────────────────────────────────────
 #  AUTO-REGISTER WHEN BOT JOINS A NEW SERVER
-# ══════════════════════════════════════════════════════════
+# ──────────────────────────────────────────────────────────
 @bot.event
 async def on_guild_join(guild: discord.Guild):
     """Auto-register new servers with Free Trial plan. Works for unlimited servers."""
