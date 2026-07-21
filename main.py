@@ -1,39 +1,9 @@
 """
-NexPlay Tournament Bot
-======================
-Author  : Unish Ghimire / NexPlay ORG
-Version : 4.0.0  (multi-server production)
-Python  : 3.10+
+NexPlay Tournament Bot v4.0 — Multi-server Discord tournament management.
+Author: Unish Ghimire / NexPlay ORG | Python 3.11+
 
-CHANGELOG v4.0.0
------------------
-FIXED  - Global slash commands (removed guild= from all decorators).
-         Commands now appear in EVERY server that adds the bot.
-FIXED  - Channel IDs are now resolved dynamically from the guild,
-         not hardcoded to NEXPLAY ORG channel IDs.
-FIXED  - on_guild_join auto-registers new servers into Base44 DB
-         and posts an alert to the owner's log channel.
-FIXED  - Subscription gate on every staff command — unregistered
-         or expired servers cannot use tournament commands.
-FIXED  - get_or_create_channels() provisions required channels in
-         any new server automatically (no manual setup needed).
-FIXED  - Support handler resolves the correct channel per guild.
-ADDED  - on_guild_remove logs server departures.
-ADDED  - /setup command for server owners to initialize their server.
-
-ARCHITECTURE
-------------
-One bot process → connects to Discord gateway once → serves N servers.
-Each guild interaction is fully isolated via guild_id field in every
-Base44 entity record. Zero cross-server data leakage.
-
-SECURITY
---------
-* No hardcoded secrets — all from env.
-* Subscription gate enforced server-side on every write command.
-* is_staff() checks role names — cannot be bypassed by renaming.
-* All user input stored as plain string — no eval/exec surface.
-* aiohttp 10s timeout on every external call.
+Architecture: One bot process → N servers, isolated by guild_id in all DB records.
+Security: All secrets from env. Subscription gate on write commands. is_staff() role check.
 """
 
 import discord
@@ -71,7 +41,6 @@ STAFF_ROLE_NAMES = {
     "Owner", "Co-Owner", "Manager", "Staff",
 }
 
-log = print  # alias
 
 # ── Status emoji map ───────────────────────────────────────
 STATUS_EMOJI = {
@@ -582,9 +551,6 @@ class TournamentStep3Modal(discord.ui.Modal, title="🏆 Create Tournament (3/3)
         s   = _tourney_sessions.pop(uid)
         gid = str(interaction.guild.id)
 
-        def safe_int(v, d=16):
-            try: return int(v)
-            except: return d
 
         name        = s["name"]
         game        = s["game"]
@@ -837,9 +803,6 @@ class TournamentEditSlotsModal(discord.ui.Modal, title="✏️ Edit Tournament �
 
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(thinking=True, ephemeral=True)
-        def safe_int(v, d):
-            try: return int(v)
-            except: return d
         t = self.tournament
         updates = {
             "max_players":      safe_int(self.t_max.value, t.get("max_players", 16)),
@@ -1111,6 +1074,11 @@ def now_iso() -> str:
 def now_ts() -> int:
     return int(datetime.now(timezone.utc).timestamp())
 
+def safe_int(v, d=16):
+    """Safe int conversion with default fallback."""
+    try: return int(v)
+    except: return d
+
 def is_staff(member: discord.Member) -> bool:
     if member.guild.owner_id == member.id:
         return True
@@ -1135,20 +1103,22 @@ def ok_e(title: str, desc: str, color: int = 0x00FF7F) -> discord.Embed:
     return e
 
 def img_url(t_name: str, game: str, kind: str, extra: str = "") -> str:
+    """Generate a fixed-size tournament image URL via Pollinations.
+    Each image type has a FIXED pixel dimension — no free-form sizes."""
     templates = {
-        "poster":   "professional esports tournament poster {n} {g} neon dark background gold purple cinematic",
-        "roadmap":  "tournament roadmap timeline {n} {g} stages Registration GroupDraw Schedule MatchDay Champion modern dark",
-        "group":    "esports group draw reveal {n} {g} {x} dark neon panels",
-        "schedule": "match schedule card {n} {g} {x} dark professional infographic",
-        "result":   "match result card {x} {n} dark dramatic victory graphic",
-        "champion": "champion victory {x} wins {n} {g} golden trophy confetti epic cinematic",
+        "poster":   ("professional esports tournament poster {n} {g} neon dark background gold purple cinematic", 1280, 720),
+        "roadmap":  ("tournament roadmap timeline {n} {g} stages Registration GroupDraw Schedule MatchDay Champion modern dark", 1280, 720),
+        "group":    ("esports group draw reveal {n} {g} {x} dark neon panels", 1024, 576),
+        "schedule": ("match schedule card {n} {g} {x} dark professional infographic", 1024, 576),
+        "result":   ("match result card {x} {n} dark dramatic victory graphic", 1024, 576),
+        "champion": ("champion victory {x} wins {n} {g} golden trophy confetti epic cinematic", 1280, 720),
     }
-    tpl    = templates.get(kind, "professional esports graphic {n} {g}")
+    tpl, w, h = templates.get(kind, ("professional esports graphic {n} {g}", 1280, 720))
     prompt = tpl.format(n=t_name, g=game, x=extra)
     prompt = prompt.replace(" ", "%20").replace(",", "%2C")
     return (
         "https://image.pollinations.ai/prompt/" + prompt
-        + "?width=1280&height=640&nologo=true&seed=" + str(now_ts()) + "&model=flux"
+        + f"?width={w}&height={h}&nologo=true&seed={now_ts()}&model=flux"
     )
 
 
@@ -2884,65 +2854,24 @@ async def cmd_delete_tournament(interaction: discord.Interaction, name: str):
 
     # 3. Delete registrations from DB
     reg_count = 0
-    regs = await b44_list("Registration", {"tournament_id": t_id})
-    for reg in regs:
-        try:
-            # Delete via API
-            reg_id = reg.get("id")
-            if reg_id:
-                async with bot.http_session.delete(
-                    BASE44_API + "/Registration/" + reg_id,
-                    headers=_b44_headers()
-                ) as r:
-                    if r.status in (200, 204):
-                        reg_count += 1
-        except Exception:
-            pass
+    for reg in await b44_list("Registration", {"tournament_id": t_id}):
+        if reg.get("id") and await b44_delete("Registration", reg["id"]):
+            reg_count += 1
 
     # 4. Delete tournament groups from DB
     group_count = 0
-    groups = await b44_list("TournamentGroup", {"tournament_id": t_id})
-    for grp in groups:
-        try:
-            grp_id = grp.get("id")
-            if grp_id:
-                async with bot.http_session.delete(
-                    BASE44_API + "/TournamentGroup/" + grp_id,
-                    headers=_b44_headers()
-                ) as r:
-                    if r.status in (200, 204):
-                        group_count += 1
-        except Exception:
-            pass
+    for grp in await b44_list("TournamentGroup", {"tournament_id": t_id}):
+        if grp.get("id") and await b44_delete("TournamentGroup", grp["id"]):
+            group_count += 1
 
     # 5. Delete matches from DB
     match_count = 0
-    matches = await b44_list("Match", {"tournament_id": t_id})
-    for m in matches:
-        try:
-            m_id = m.get("id")
-            if m_id:
-                async with bot.http_session.delete(
-                    BASE44_API + "/Match/" + m_id,
-                    headers=_b44_headers()
-                ) as r:
-                    if r.status in (200, 204):
-                        match_count += 1
-        except Exception:
-            pass
+    for m in await b44_list("Match", {"tournament_id": t_id}):
+        if m.get("id") and await b44_delete("Match", m["id"]):
+            match_count += 1
 
     # 6. Delete the tournament record itself
-    t_deleted = False
-    if t_id:
-        try:
-            async with bot.http_session.delete(
-                BASE44_API + "/Tournament/" + t_id,
-                headers=_b44_headers()
-            ) as r:
-                if r.status in (200, 204):
-                    t_deleted = True
-        except Exception:
-            pass
+    t_deleted = await b44_delete("Tournament", t_id) if t_id else False
 
     # Build summary
     desc = f"🗑️ **Tournament: {t_name}**\n\n"
