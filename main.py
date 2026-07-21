@@ -13,7 +13,6 @@ import aiohttp
 import os
 import asyncio
 import io
-import csv
 import re
 import openpyxl
 import yt_dlp
@@ -27,9 +26,6 @@ from dotenv import load_dotenv
 # Load .env file if present (local dev). Render injects vars directly.
 load_dotenv()
 
-# ──────────────────────────────────────────────────────────
-#  CONFIG  — all values come from environment variables
-# ──────────────────────────────────────────────────────────
 BOT_TOKEN   = os.environ.get("DISCORD_BOT_TOKEN", "")
 HOME_GUILD  = int(os.environ.get("DISCORD_GUILD_ID", "0"))   # owner's server only
 SVC_TOKEN   = os.environ.get("BASE44_SERVICE_TOKEN", "")
@@ -57,11 +53,11 @@ STATUS_EMOJI = {
 }
 
 
-# ────────────────────────────────────────────────────────────══════════════════
+# ────────────────────────────────────────────────────────────
 #  PLAN FEATURE GATES
 #  Keys match features checked throughout the bot.
 #  Plans: trial / starter / pro / elite
-# ────────────────────────────────────────────────────────────══════════════════
+# ────────────────────────────────────────────────────────────
 PLAN_FEATURES = {
     # (plan_name_lower) → set of unlocked feature keys
     # meme_post is available on ALL plans — every server gets trending memes
@@ -147,9 +143,6 @@ def log(msg: str):
 
 
 
-# ──────────────────────────────────────────────────────────
-#  BOT CLASS
-# ──────────────────────────────────────────────────────────
 class NexPlayBot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
@@ -200,9 +193,6 @@ bot  = NexPlayBot()
 tree = bot.tree
 
 
-# ──────────────────────────────────────────────────────────
-#  MEME / FUNNY VIDEO AUTO-POSTER  (Elite plan only)
-# ──────────────────────────────────────────────────────────
 
 MEME_SUBREDDITS = [
     "dankmemes", "gaming", "freefire", "PUBGMobile", "FreeFireBattlegrounds",
@@ -339,9 +329,6 @@ async def auto_meme_loop():
         await asyncio.sleep(MEME_INTERVAL)
 
 
-# ──────────────────────────────────────────────────────────
-#  WELCOME MESSAGE  (Elite plan only)
-# ──────────────────────────────────────────────────────────
 
 @bot.event
 async def on_member_join(member: discord.Member):
@@ -383,9 +370,6 @@ async def on_member_join(member: discord.Member):
     await welcome_ch.send(embed=embed)
 
 
-# ──────────────────────────────────────────────────────────
-#  ANNOUNCEMENT COMMAND  (all plans)
-# ──────────────────────────────────────────────────────────
 
 @tree.command(name="announce", description="[Host] Post a tournament announcement embed")
 @app_commands.describe(
@@ -413,17 +397,15 @@ async def cmd_announce(
     await target.send(embed=embed)
     await interaction.followup.send(embed=ok_e("Announced!", f"Posted to {target.mention}"), ephemeral=True)
 
-# ────────────────────────────────────────────────────────────══════════════════
+# ────────────────────────────────────────────────────────────
 #  MULTI-STEP TOURNAMENT CREATION MODALS
-# ────────────────────────────────────────────────────────────══════════════════
+# ────────────────────────────────────────────────────────────
 
-# ──────────────────────────────────────────────────────────
 #  TOURNAMENT CREATION — MODAL → BUTTON → MODAL FLOW
 #  Discord does NOT allow opening a modal from inside another
 #  modal's on_submit. Pattern: Modal → ephemeral View with
 #  Next button → button opens next Modal → repeat.
 #  Step data stored in _tourney_sessions[user_id].
-# ──────────────────────────────────────────────────────────
 
 _tourney_sessions: dict[int, dict] = {}
 
@@ -832,9 +814,6 @@ async def on_ready():
     print("=" * 60, flush=True)
 
 
-# ──────────────────────────────────────────────────────────
-#  BASE44 ENTITY HELPERS
-# ──────────────────────────────────────────────────────────
 def _b44_headers() -> dict:
     return {"Authorization": "Bearer " + SVC_TOKEN, "Content-Type": "application/json"}
 
@@ -903,12 +882,18 @@ async def b44_delete(entity: str, record_id: str) -> bool:
         print(f"[b44_delete] ❌ {entity} error: {e}", flush=True)
         return False
 
+async def _b44_delete_by_tournament(entity: str, tournament_id: str) -> int:
+    """Delete all records of an entity matching tournament_id. Returns count."""
+    count = 0
+    for rec in await b44_list(entity, {"tournament_id": tournament_id}):
+        if rec.get("id") and await b44_delete(entity, rec["id"]):
+            count += 1
+    return count
 
-# ──────────────────────────────────────────────────────────
+
 #  SUBSCRIPTION GATE
 #  Every staff command calls this first. If the server isn't
 #  registered or has expired, the command is blocked.
-# ──────────────────────────────────────────────────────────
 async def get_server_record(guild_id: str) -> dict | None:
     servers = await b44_list("Server", {"guild_id": guild_id})
     return servers[0] if servers else None
@@ -959,11 +944,9 @@ async def is_allowed(guild_id: str, guild: discord.Guild = None) -> tuple[bool, 
     return False, "This server's NexPlay subscription has expired.\nRenew at: https://nexplay-server-portal.vercel.app/subscription\nPlans from NPR 99/mo (Starter) · NPR 299/mo (Pro AI) · NPR 399/mo (Elite)"
 
 
-# ──────────────────────────────────────────────────────────
 #  DYNAMIC CHANNEL RESOLVER
 #  Finds channels by name — works in ANY server.
 #  Falls back to first available channel if not found.
-# ──────────────────────────────────────────────────────────
 CHANNEL_NAMES = {
     "announcements": ["tourney-announcements", "tournament-announcements", "announcements", "general"],
     "registration":  ["tourney-registration", "tournament-registration", "registration", "general"],
@@ -1022,9 +1005,6 @@ async def get_or_create_channels(guild: discord.Guild) -> dict:
     return result
 
 
-# ──────────────────────────────────────────────────────────
-#  DISCORD REST HELPER
-# ──────────────────────────────────────────────────────────
 async def dpost(channel_id: int, embed: discord.Embed, content: str = "") -> dict:
     if not channel_id:
         return {}
@@ -1041,9 +1021,6 @@ async def dpost(channel_id: int, embed: discord.Embed, content: str = "") -> dic
         return {}
 
 
-# ──────────────────────────────────────────────────────────
-#  SMALL UTILITIES
-# ──────────────────────────────────────────────────────────
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -1110,9 +1087,6 @@ def img_url(t_name: str, game: str, kind: str, extra: str = "") -> str:
     )
 
 
-# ──────────────────────────────────────────────────────────
-#  AI SUPPORT ENGINE  — Pollinations AI + one-reply-per-user lock
-# ──────────────────────────────────────────────────────────
 #
 #  RULES:
 #  1. Bot replies to a user ONCE per support session
@@ -1120,7 +1094,6 @@ def img_url(t_name: str, game: str, kind: str, extra: str = "") -> str:
 #  3. Uses Pollinations free text AI for natural, accurate responses
 #  4. Always mentions real channel names from the server
 #  5. Unknown/complex queries → staff-log with full context
-# ──────────────────────────────────────────────────────────
 
 import urllib.parse
 
@@ -1129,48 +1102,32 @@ import urllib.parse
 _replied_users: dict[str, dict[str, str]] = {}
 
 async def ai_generate(prompt: str) -> str:
-    """Try Groq (fast, free) first — fallback to Pollinations if no key or error."""
+    """Try Groq (fast) first, fallback to Pollinations (no key needed)."""
     GROQ_KEY = os.environ.get("GROQ_API_KEY", "")
 
-    # ── PRIMARY: Groq (llama-3.3-70b-versatile) ──────────────────────────
     if GROQ_KEY:
         try:
-            payload = {
-                "model": "llama-3.3-70b-versatile",
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 300,
-                "temperature": 0.7,
-            }
             async with aiohttp.ClientSession() as s:
-                async with s.post(
-                    "https://api.groq.com/openai/v1/chat/completions",
-                    json=payload,
+                async with s.post("https://api.groq.com/openai/v1/chat/completions",
+                    json={"model": "llama-3.3-70b-versatile",
+                          "messages": [{"role": "user", "content": prompt}],
+                          "max_tokens": 300, "temperature": 0.7},
                     headers={"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"},
-                    timeout=aiohttp.ClientTimeout(total=12),
-                ) as r:
+                    timeout=aiohttp.ClientTimeout(total=12)) as r:
                     if r.status == 200:
-                        data = await r.json()
-                        reply = data["choices"][0]["message"]["content"].strip()
-                        print(f"[AI] Groq OK — {len(reply)} chars", flush=True)
-                        return reply
-                    else:
-                        err = await r.text()
-                        print(f"[AI] Groq error {r.status}: {err[:200]}", flush=True)
+                        return (await r.json())["choices"][0]["message"]["content"].strip()
+                    print(f"[AI] Groq error {r.status}: {(await r.text())[:200]}", flush=True)
         except Exception as e:
             print(f"[AI] Groq exception: {e}", flush=True)
 
-    # ── FALLBACK: Pollinations (no key needed) ────────────────────────────
     try:
-        encoded = urllib.parse.quote(prompt[:1500])  # URL-safe trim
-        url = f"https://text.pollinations.ai/{encoded}"
+        encoded = urllib.parse.quote(prompt[:1500])
         async with aiohttp.ClientSession() as s:
-            async with s.get(url, timeout=aiohttp.ClientTimeout(total=15)) as r:
+            async with s.get(f"https://text.pollinations.ai/{encoded}",
+                timeout=aiohttp.ClientTimeout(total=15)) as r:
                 if r.status == 200:
-                    reply = (await r.text()).strip()
-                    print(f"[AI] Pollinations OK — {len(reply)} chars", flush=True)
-                    return reply
-                else:
-                    print(f"[AI] Pollinations {r.status}", flush=True)
+                    return (await r.text()).strip()
+                print(f"[AI] Pollinations {r.status}", flush=True)
     except Exception as e:
         print(f"[AI] Pollinations exception: {e}", flush=True)
 
@@ -1178,27 +1135,22 @@ async def ai_generate(prompt: str) -> str:
 
 def build_server_context(guild: discord.Guild, active_tournament: dict | None) -> str:
     """Build context string about the server for the AI prompt."""
-    channels = ", ".join(f"#{ch.name}" for ch in guild.text_channels[:30])
-    roles    = ", ".join(r.name for r in guild.roles if not r.is_default()[:20])
+    channels = ", ".join(f"#{c.name}" for c in guild.text_channels[:30])
+    roles = ", ".join(r.name for r in [r for r in guild.roles if not r.is_default()][:20])
     ctx = f"Server: {guild.name}\nChannels: {channels}\nRoles: {roles}\n"
     if active_tournament:
         t = active_tournament
-        ctx += (
-            f"\nActive Tournament: {t.get('name','?')}\n"
-            f"Game: {t.get('game','?')} | Status: {t.get('status','?')} | "
-            f"Date: {t.get('tournament_date','?')} | Time: {t.get('tournament_time','?')}\n"
-            f"Slots: {t.get('max_players','?')} | Registered: {t.get('registered_count',0)} | "
-            f"Team Size: {t.get('team_size',4)} | Prize: {t.get('prize_pool','?')}\n"
-        )
+        ctx += (f"\nActive Tournament: {t.get('name','?')}\n"
+                f"Game: {t.get('game','?')} | Status: {t.get('status','?')} | "
+                f"Date: {t.get('tournament_date','?')} | Time: {t.get('tournament_time','?')}\n"
+                f"Slots: {t.get('max_players','?')} | Registered: {t.get('registered_count',0)} | "
+                f"Team Size: {t.get('team_size',4)} | Prize: {t.get('prize_pool','?')}\n")
         if t.get('short_name'):
             ctx += f"Registration channel: #{t['short_name']}-register\n"
     else:
         ctx += "\nNo active tournament.\n"
     return ctx
 
-# ──────────────────────────────────────────────────────────
-#  EXCEL LOG BUILDER
-# ──────────────────────────────────────────────────────────
 def _xl_header_style(cell, bg="1F4E79"):
     cell.font      = Font(bold=True, color="FFFFFF", size=10)
     cell.fill      = PatternFill("solid", fgColor=bg)
@@ -1827,57 +1779,24 @@ async def on_message(message: discord.Message):
     await bot.process_commands(message)
 
 
-# ──────────────────────────────────────────────────────────
-#  SLASH COMMANDS  — NO guild= parameter → global commands
-# ──────────────────────────────────────────────────────────
 
 # ── /setup ────────────────────────────────────────────────
-# ──────────────────────────────────────────────────────────
-#  /clearlog — Staff command to clear a user support lock
-# ──────────────────────────────────────────────────────────
 @tree.command(name="clearlog", description="[Staff] Clear a user support lock so they can ask again")
 @app_commands.describe(user="The user whose support lock to clear")
 async def clearlog(interaction: discord.Interaction, user: discord.Member):
     if not is_staff(interaction.user):
-        await interaction.response.send_message(
-            "❌ You need the **Tournament Host** role to use this command.", ephemeral=True
-        )
-        return
-
-    gid = str(interaction.guild.id)
-    uid = str(user.id)
+        return await interaction.response.send_message("❌ Staff only.", ephemeral=True)
+    gid, uid = str(interaction.guild.id), str(user.id)
     guild_locks = _replied_users.get(gid, {})
-
     if uid not in guild_locks:
-        await interaction.response.send_message(
-            f"✅ {user.mention} has no active support lock — they can already ask freely.",
-            ephemeral=True
-        )
-        return
-
+        return await interaction.response.send_message(f"✅ {user.mention} has no active lock.", ephemeral=True)
     rec_id = guild_locks.pop(uid, None)
     if rec_id:
-        try:
-            await b44_update('SupportMessage', rec_id, {'status': 'resolved'})
-        except Exception:
-            pass
-
-    embed = discord.Embed(
-        title="🔓 Support Lock Cleared",
-        description=f"{user.mention} support lock has been cleared. They can now ask the bot again.",
-        color=0x00FF00
-    )
-    embed.set_footer(text=f"Cleared by {interaction.user.display_name}")
-    await interaction.response.send_message(embed=embed)
-
-    try:
-        notify = discord.Embed(
-            description=f"Hey {user.mention}, a staff member has cleared your support session. Feel free to ask anything! 😊",
-            color=0x00FF00
-        )
-        await interaction.channel.send(embed=notify)
-    except Exception:
-        pass
+        try: await b44_update('SupportMessage', rec_id, {'status': 'resolved'})
+        except: pass
+    await interaction.response.send_message(embed=ok_e("🔓 Lock Cleared", f"{user.mention} can now ask again."), ephemeral=True)
+    try: await interaction.channel.send(embed=discord.Embed(description=f"Hey {user.mention}, your support session was cleared! 😊", color=0x00FF00))
+    except: pass
 
 
 @tree.command(name="setup", description="Initialize NexPlay in this server (server owner only)")
@@ -1917,22 +1836,13 @@ async def cmd_setup(interaction: discord.Interaction):
 async def make_tournament_channels(guild: discord.Guild, tournament_name: str) -> dict:
     """Create a tournament category + 8 channels. Returns dict with channel IDs."""
     
-    # ── Generate short name from tournament name ──────────────────────────────
+    # Generate short name: initials + numbers, max 6 chars
     words = tournament_name.strip().split()
-    short = ""
     if len(words) == 1:
-        # Single word: take first 4 chars
         short = words[0][:4].lower()
     else:
-        # Multiple words: take first letter of each word + last word digits if any
-        initials = "".join(w[0] for w in words if w).lower()
-        # Add any numbers found in the name
-        nums = re.sub(r"[^0-9]", "", tournament_name)[-2:]
-        short = (initials + nums)[:6]
-    
-    short = re.sub(r"[^a-z0-9]", "", short)[:6]
-    if not short:
-        short = "tourney"
+        short = ("".join(w[0] for w in words) + re.sub(r"[^0-9]", "", tournament_name)[-2:])[:6].lower()
+    short = re.sub(r"[^a-z0-9]", "", short)[:6] or "tourney"
 
     cat_name = f"🏆 {short.upper()}"
     
@@ -2035,9 +1945,9 @@ async def cmd_edit_tournament_new(interaction: discord.Interaction, tournament_n
 
 
 
-# ────────────────────────────────────────────────────────────══════════════════
+# ────────────────────────────────────────────────────────────
 #  ELITE FEATURE COMMANDS
-# ────────────────────────────────────────────────────────────══════════════════
+# ────────────────────────────────────────────────────────────
 
 @tree.command(name="host_game", description="[Elite] Host a mini-game event (Trivia, Prediction, GG Hunt)")
 @app_commands.describe(game_type="Type of mini-game to host")
@@ -2239,29 +2149,18 @@ async def cmd_delete_category(interaction: discord.Interaction, category: str):
     if not cat:
         return await interaction.followup.send(embed=err_e(f"Category `{category}` not found."), ephemeral=True)
 
-    # Delete all channels inside the category first
-    deleted_channels = []
-    failed_channels = []
+    # Delete all channels in category, then the category
+    deleted, failed = [], []
     for ch in list(cat.channels):
-        try:
-            await ch.delete(reason=f"NexPlay: Category cleanup by {interaction.user.display_name}")
-            deleted_channels.append(ch.name)
-        except Exception:
-            failed_channels.append(ch.name)
-
-    # Delete the category itself
+        try: await ch.delete(reason="NexPlay: Category cleanup"); deleted.append(ch.name)
+        except: failed.append(ch.name)
     cat_name = cat.name
     try:
         await cat.delete(reason=f"NexPlay: Deleted by {interaction.user.display_name}")
     except Exception as e:
-        return await interaction.followup.send(embed=err_e(f"Deleted {len(deleted_channels)} channels but failed to delete category: {e}"), ephemeral=True)
-
-    desc = f"🗑️ Category **{cat_name}** deleted along with **{len(deleted_channels)}** channels.\n"
-    if deleted_channels:
-        desc += "\n**Deleted channels:**\n" + "\n".join(f"• #{c}" for c in deleted_channels)
-    if failed_channels:
-        desc += "\n\n⚠️ **Failed to delete:**\n" + "\n".join(f"• #{c}" for c in failed_channels)
-
+        return await interaction.followup.send(embed=err_e(f"Deleted {len(deleted)} channels but category failed: {e}"), ephemeral=True)
+    desc = f"🗑️ Category **{cat_name}** + **{len(deleted)}** channels deleted."
+    if failed: desc += f"\n⚠️ Failed: {', '.join('#'+c for c in failed)}"
     await interaction.followup.send(embed=ok_e("Category Deleted", desc), ephemeral=True)
 
 
@@ -2336,23 +2235,10 @@ async def cmd_delete_tournament(interaction: discord.Interaction, name: str):
         try: await cat.delete(reason=f"NexPlay: Tournament '{t_name}' deleted"); category_deleted = True
         except: pass
 
-    # 3. Delete registrations from DB
-    reg_count = 0
-    for reg in await b44_list("Registration", {"tournament_id": t_id}):
-        if reg.get("id") and await b44_delete("Registration", reg["id"]):
-            reg_count += 1
-
-    # 4. Delete tournament groups from DB
-    group_count = 0
-    for grp in await b44_list("TournamentGroup", {"tournament_id": t_id}):
-        if grp.get("id") and await b44_delete("TournamentGroup", grp["id"]):
-            group_count += 1
-
-    # 5. Delete matches from DB
-    match_count = 0
-    for m in await b44_list("Match", {"tournament_id": t_id}):
-        if m.get("id") and await b44_delete("Match", m["id"]):
-            match_count += 1
+    # 3-5. Delete all child records from DB
+    reg_count = await _b44_delete_by_tournament("Registration", t_id)
+    group_count = await _b44_delete_by_tournament("TournamentGroup", t_id)
+    match_count = await _b44_delete_by_tournament("Match", t_id)
 
     # 6. Delete the tournament record itself
     t_deleted = await b44_delete("Tournament", t_id) if t_id else False
@@ -2369,14 +2255,19 @@ async def cmd_delete_tournament(interaction: discord.Interaction, name: str):
 
 
 
-# ──────────────────────────────────────────────────────────
-#  MUSIC PLAYER — /play, /skip, /stop, /queue, /loop, /leave, /volume
-# ──────────────────────────────────────────────────────────
 # Per-guild music state
-_music_queues: dict[int, deque] = {}      # guild_id → song queue
-_music_now: dict[int, dict] = {}          # guild_id → currently playing info
-_music_loops: dict[int, bool] = {}         # guild_id → loop mode
-_music_volumes: dict[int, float] = {}      # guild_id → volume (0.0-1.0)
+_music_queues: dict[int, deque] = {}
+_music_now: dict[int, dict] = {}
+_music_loops: dict[int, bool] = {}
+_music_volumes: dict[int, float] = {}
+
+def _fmt_dur(sec: int) -> str:
+    """Format seconds as m:ss, or LIVE if 0."""
+    return f"{sec//60}:{sec%60:02d}" if sec else "LIVE"
+
+def _get_vc(interaction: discord.Interaction):
+    """Get the bot's voice client for this guild."""
+    return discord.utils.get(bot.voice_clients, guild=interaction.guild)
 
 # yt-dlp options — extract audio only
 _YDL_OPTS = {
@@ -2490,7 +2381,7 @@ async def cmd_play(interaction: discord.Interaction, query: str):
     guild_id = interaction.guild.id
 
     # Connect to voice channel
-    voice_client = discord.utils.get(bot.voice_clients, guild=interaction.guild)
+    voice_client = _get_vc(interaction)
     if not voice_client:
         try:
             voice_client = await voice_channel.connect(timeout=30, reconnect=True)
@@ -2522,7 +2413,7 @@ async def cmd_play(interaction: discord.Interaction, query: str):
         "requested_by": interaction.user.display_name,
     }
 
-    duration_fmt = f"{song['duration']//60}:{song['duration']%60:02d}" if song["duration"] else "LIVE"
+    duration_fmt = _fmt_dur(song["duration"])
 
     # If nothing playing, start immediately
     if not voice_client.is_playing() and not voice_client.is_paused() and len(_music_queues.get(guild_id, [])) == 0:
@@ -2547,7 +2438,7 @@ async def cmd_play(interaction: discord.Interaction, query: str):
 
 @tree.command(name="skip", description="⏭️ Skip the current song")
 async def cmd_skip(interaction: discord.Interaction):
-    voice_client = discord.utils.get(bot.voice_clients, guild=interaction.guild)
+    voice_client = _get_vc(interaction)
     if not voice_client or not voice_client.is_playing():
         await interaction.response.send_message(embed=err_e("Nothing is playing right now."), ephemeral=True)
         return
@@ -2561,7 +2452,7 @@ async def cmd_skip(interaction: discord.Interaction):
 
 @tree.command(name="stop", description="⏹️ Stop music and clear the queue")
 async def cmd_stop(interaction: discord.Interaction):
-    voice_client = discord.utils.get(bot.voice_clients, guild=interaction.guild)
+    voice_client = _get_vc(interaction)
     guild_id = interaction.guild.id
 
     _music_queues[guild_id] = deque()
@@ -2588,13 +2479,13 @@ async def cmd_queue(interaction: discord.Interaction):
     desc = ""
     if now:
         dur = now.get("duration", 0)
-        dur_fmt = f"{dur//60}:{dur%60:02d}" if dur else "LIVE"
+        dur_fmt = _fmt_dur(dur)
         desc += f"▶️ **NOW PLAYING:** [{now['title']}]({now.get('webpage_url', '')})\n⏱️ {dur_fmt} | 👤 {now.get('uploader', '')}\n\n"
     if queue:
         desc += "**UP NEXT:**\n"
         for i, song in enumerate(list(queue)[:10], 1):
             dur = song.get("duration", 0)
-            dur_fmt = f"{dur//60}:{dur%60:02d}" if dur else "LIVE"
+            dur_fmt = _fmt_dur(dur)
             desc += f"`{i}.` [{song['title']}]({song.get('webpage_url', '')}) — {dur_fmt}\n"
         if len(queue) > 10:
             desc += f"\n*...and {len(queue) - 10} more*\n"
@@ -2619,7 +2510,7 @@ async def cmd_loop(interaction: discord.Interaction):
 
 @tree.command(name="leave", description="👋 Disconnect the bot from voice channel")
 async def cmd_leave(interaction: discord.Interaction):
-    voice_client = discord.utils.get(bot.voice_clients, guild=interaction.guild)
+    voice_client = _get_vc(interaction)
     if not voice_client:
         await interaction.response.send_message(embed=err_e("I'm not in a voice channel."))
         return
@@ -2636,7 +2527,7 @@ async def cmd_volume(interaction: discord.Interaction, level: int):
         return
     vol = level / 100
     _music_volumes[interaction.guild.id] = vol
-    voice_client = discord.utils.get(bot.voice_clients, guild=interaction.guild)
+    voice_client = _get_vc(interaction)
     if voice_client and hasattr(voice_client.source, "volume"):
         voice_client.source.volume = vol
     await interaction.response.send_message(embed=ok_e("🔊 Volume", f"Volume set to **{level}%**."))
@@ -2644,7 +2535,7 @@ async def cmd_volume(interaction: discord.Interaction, level: int):
 
 @tree.command(name="pause", description="⏸️ Pause the current song")
 async def cmd_pause(interaction: discord.Interaction):
-    voice_client = discord.utils.get(bot.voice_clients, guild=interaction.guild)
+    voice_client = _get_vc(interaction)
     if not voice_client or not voice_client.is_playing():
         await interaction.response.send_message(embed=err_e("Nothing is playing right now."), ephemeral=True)
         return
@@ -2654,7 +2545,7 @@ async def cmd_pause(interaction: discord.Interaction):
 
 @tree.command(name="resume", description="▶️ Resume the paused song")
 async def cmd_resume(interaction: discord.Interaction):
-    voice_client = discord.utils.get(bot.voice_clients, guild=interaction.guild)
+    voice_client = _get_vc(interaction)
     if not voice_client or not voice_client.is_paused():
         await interaction.response.send_message(embed=err_e("Nothing is paused right now."), ephemeral=True)
         return
@@ -2662,9 +2553,6 @@ async def cmd_resume(interaction: discord.Interaction):
     await interaction.response.send_message(embed=ok_e("▶️ Resumed", "Music resumed."))
 
 
-# ──────────────────────────────────────────────────────────
-#  AUTO-REGISTER WHEN BOT JOINS A NEW SERVER
-# ──────────────────────────────────────────────────────────
 @bot.event
 async def on_guild_join(guild: discord.Guild):
     """Auto-register new servers with Free Trial plan. Works for unlimited servers."""
