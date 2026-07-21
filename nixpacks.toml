@@ -1,0 +1,6 @@
+# Nixpacks config for Railway — installs ffmpeg (required for music playback)
+[phases.setup]
+aptPkgs = ["ffmpeg", "opus", "libopus-dev"]
+
+[variables]
+PYTHON_VERSION = "3.11.9"

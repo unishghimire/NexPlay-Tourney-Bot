@@ -2674,7 +2674,7 @@ def _get_vc(interaction: discord.Interaction):
     """Get the bot's voice client for this guild."""
     return discord.utils.get(bot.voice_clients, guild=interaction.guild)
 
-# yt-dlp options — extract audio only
+# yt-dlp options — robust audio extraction with anti-throttling
 _YDL_OPTS = {
     "format": "bestaudio/best",
     "quiet": True,
@@ -2682,7 +2682,19 @@ _YDL_OPTS = {
     "default_search": "ytsearch",
     "source_address": "0.0.0.0",
     "noplaylist": True,
+    "extract_flat": False,
+    "socket_timeout": 15,
+    "retries": 3,
+    "fragment_retries": 3,
+    "http_headers": {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9",
+    },
 }
+
+# Track consecutive playback failures per guild — prevent infinite join-leave loops
+_music_fail_counts: dict[int, int] = {}
+MAX_PLAYBACK_RETRIES = 3
 
 FFMPEG_OPTS = {
     "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -vn",
@@ -2691,7 +2703,9 @@ FFMPEG_OPTS = {
 
 
 async def _extract_audio(query: str) -> dict:
-    """Extract audio info from YouTube URL or search query. Returns dict with title, url, duration, uploader, thumbnail, webpage_url."""
+    """Extract audio info from YouTube URL or search query.
+    Returns dict with title, url, duration, uploader, thumbnail, webpage_url.
+    Handles YouTube throttling and expired URLs with fresh extraction."""
     loop = asyncio.get_event_loop()
 
     def extract():
@@ -2703,17 +2717,29 @@ async def _extract_audio(query: str) -> dict:
 
     info = await loop.run_in_executor(None, extract)
 
-    # Get the best audio-only stream URL
+    # Get the best audio-only stream URL — prefer audio-only formats
     audio_url = info.get("url", "")
     if not audio_url:
+        # Try to find an audio-only format first (no video)
+        best_audio = None
         for fmt in info.get("formats", []):
-            if fmt.get("acodec", "none") != "none" and fmt.get("vcodec", "none") == "none":
-                audio_url = fmt["url"]
-                break
+            acodec = fmt.get("acodec", "none")
+            vcodec = fmt.get("vcodec", "none")
+            if acodec != "none" and vcodec == "none":
+                if not best_audio or fmt.get("abr", 0) > best_audio.get("abr", 0):
+                    best_audio = fmt
+        if best_audio:
+            audio_url = best_audio["url"]
+        # Fallback: any format with audio
+        if not audio_url:
+            for fmt in info.get("formats", []):
+                if fmt.get("acodec", "none") != "none":
+                    audio_url = fmt["url"]
+                    break
     if not audio_url and info.get("formats"):
         audio_url = info["formats"][-1]["url"]
     if not audio_url:
-        raise RuntimeError("Could not extract audio URL")
+        raise RuntimeError("Could not extract audio URL from " + str(query))
 
     return {
         "title":       info.get("title", "Unknown"),
@@ -2749,9 +2775,30 @@ async def _pick_autoplay_song(guild_id: int) -> dict:
     }
 
 async def _play_next(guild_id: int, voice_client):
-    """Play next song from queue, or auto-play from playlist if 24/7 mode is on."""
+    """Play next song from queue, or auto-play from playlist if 24/7 mode is on.
+    Has retry limiting to prevent infinite join-leave loops."""
+    if not voice_client or not voice_client.is_connected():
+        _music_now.pop(guild_id, None)
+        return
+
     queue = _music_queues.get(guild_id)
     is_247 = _music_247.get(guild_id, False)
+    fail_count = _music_fail_counts.get(guild_id, 0)
+
+    # Too many consecutive failures → stop trying, disable 24/7 to prevent loop
+    if fail_count >= MAX_PLAYBACK_RETRIES:
+        print(f"[Music] ❌ {fail_count} consecutive failures in guild {guild_id} — stopping playback.", flush=True)
+        _music_fail_counts[guild_id] = 0
+        _music_now.pop(guild_id, None)
+        if is_247:
+            _music_247[guild_id] = False
+            print(f"[Music] 24/7 disabled for guild {guild_id} due to repeated failures.", flush=True)
+        try:
+            if voice_client.is_connected():
+                await voice_client.disconnect()
+        except:
+            pass
+        return
 
     # Queue empty + 24/7 on → pick a random song from the curated playlist
     if (not queue or len(queue) == 0) and is_247 and voice_client and voice_client.is_connected():
@@ -2761,7 +2808,7 @@ async def _play_next(guild_id: int, voice_client):
             queue = _music_queues.get(guild_id)
         except Exception as e:
             print(f"[Music/247] Auto-play pick failed: {e}", flush=True)
-            # Retry after a short delay
+            _music_fail_counts[guild_id] = fail_count + 1
             await asyncio.sleep(5)
             if is_247 and voice_client.is_connected():
                 asyncio.ensure_future(_play_next(guild_id, voice_client))
@@ -2775,6 +2822,7 @@ async def _play_next(guild_id: int, voice_client):
     _music_now[guild_id] = song
 
     try:
+        # Always extract fresh URL — YouTube audio URLs expire quickly
         fresh_info = await _extract_audio(song["webpage_url"])
         audio_url = fresh_info["url"]
 
@@ -2784,6 +2832,10 @@ async def _play_next(guild_id: int, voice_client):
         def after_play(error):
             if error:
                 print(f"[Music] Playback error: {error}", flush=True)
+                _music_fail_counts[guild_id] = _music_fail_counts.get(guild_id, 0) + 1
+            else:
+                # Success — reset failure count
+                _music_fail_counts[guild_id] = 0
             if _music_loops.get(guild_id):
                 _music_queues.setdefault(guild_id, deque()).appendleft(song)
             try:
@@ -2797,10 +2849,12 @@ async def _play_next(guild_id: int, voice_client):
 
     except Exception as e:
         print(f"[Music] Error playing next: {e}", flush=True)
+        _music_fail_counts[guild_id] = fail_count + 1
         _music_now.pop(guild_id, None)
-        # If 24/7 is on, retry with next song after short delay
+        # If 24/7 is on, retry with next song after delay (with backoff)
         if is_247 and voice_client and voice_client.is_connected():
-            await asyncio.sleep(3)
+            backoff = min(3 * (fail_count + 1), 15)
+            await asyncio.sleep(backoff)
             asyncio.ensure_future(_play_next(guild_id, voice_client))
         elif queue:
             await _play_next(guild_id, voice_client)
@@ -2851,6 +2905,9 @@ async def cmd_play(interaction: discord.Interaction, query: str):
 
     duration_fmt = _fmt_dur(song["duration"])
 
+    # Reset failure count on manual play
+    _music_fail_counts[guild_id] = 0
+
     # If nothing playing, start immediately
     if not voice_client.is_playing() and not voice_client.is_paused() and len(_music_queues.get(guild_id, [])) == 0:
         _music_queues[guild_id].append(song)
@@ -2897,6 +2954,7 @@ async def cmd_stop(interaction: discord.Interaction):
     _music_loops[guild_id] = False
     _music_247[guild_id] = False  # Disable 24/7
     _247_channel.pop(guild_id, None)
+    _music_fail_counts[guild_id] = 0  # Reset failure count
 
     if voice_client:
         if voice_client.is_playing():
@@ -2960,6 +3018,7 @@ async def cmd_leave(interaction: discord.Interaction):
     _music_now.pop(gid, None)
     _music_247[gid] = False
     _247_channel.pop(gid, None)
+    _music_fail_counts[gid] = 0
     await voice_client.disconnect()
     await interaction.response.send_message(embed=ok_e("👋 Left", "Disconnected. 24/7 disabled."))
 
@@ -2972,7 +3031,7 @@ async def cmd_volume(interaction: discord.Interaction, level: int):
     vol = level / 100
     _music_volumes[interaction.guild.id] = vol
     voice_client = _get_vc(interaction)
-    if voice_client and hasattr(voice_client.source, "volume"):
+    if voice_client and hasattr(voice_client.source, "volume") and voice_client.source:
         voice_client.source.volume = vol
     await interaction.response.send_message(embed=ok_e("🔊 Volume", f"Volume set to **{level}%**."))
 
@@ -2984,7 +3043,7 @@ async def cmd_pause(interaction: discord.Interaction):
         await interaction.response.send_message(embed=err_e("Nothing is playing right now."), ephemeral=True)
         return
     voice_client.pause()
-    await interaction.response.send_message(embed=ok_e("⏸️ Paused", "Music paused. Use /play to resume."))
+    await interaction.response.send_message(embed=ok_e("⏸️ Paused", "Music paused. Use `/resume` to continue."))
 
 
 @tree.command(name="resume", description="▶️ Resume the paused song")
@@ -3036,9 +3095,10 @@ async def cmd_247(interaction: discord.Interaction):
     elif voice_client.channel != voice_channel:
         await voice_client.move_to(voice_channel)
 
-    # Enable 24/7
+    # Enable 24/7 + reset failure count
     _music_247[gid] = True
     _247_channel[gid] = voice_channel.id
+    _music_fail_counts[gid] = 0
     if gid not in _music_queues:
         _music_queues[gid] = deque()
         _music_volumes[gid] = 0.5
@@ -3123,15 +3183,19 @@ async def cmd_nowplaying(interaction: discord.Interaction):
 
 
 async def _247_health_check():
-    """Background task: every 60s, check all guilds with 24/7 enabled.
-    If bot disconnected from VC, reconnect and resume auto-play."""
+    """Background task: every 90s, check guilds with 24/7 enabled.
+    If bot disconnected from VC, reconnect and resume auto-play.
+    Uses backoff to prevent aggressive reconnect loops."""
     await bot.wait_until_ready()
-    print("[NexPlay] 24/7 health check started.", flush=True)
+    print("[NexPlay] 24/7 health check started (90s interval).", flush=True)
     while not bot.is_closed():
         try:
             for guild in bot.guilds:
                 gid = guild.id
                 if not _music_247.get(gid, False):
+                    continue
+                # Skip if too many recent failures — _play_next already disabled 24/7
+                if _music_fail_counts.get(gid, 0) >= MAX_PLAYBACK_RETRIES:
                     continue
                 vc = discord.utils.get(bot.voice_clients, guild=guild)
                 ch_id = _247_channel.get(gid)
@@ -3139,24 +3203,46 @@ async def _247_health_check():
                 if not vc or not vc.is_connected():
                     ch = guild.get_channel(ch_id) if ch_id else None
                     if not ch:
-                        # Find any voice channel the bot can join
                         ch = discord.utils.find(lambda c: c.permissions_for(guild.me).connect, guild.voice_channels)
                     if ch:
                         try:
-                            vc = await ch.connect(timeout=15, reconnect=True)
+                            vc = await ch.connect(timeout=20, reconnect=True)
                             _247_channel[gid] = ch.id
+                            _music_fail_counts[gid] = 0  # Reset on successful connect
                             print(f"[NexPlay/247] Reconnected to {ch.name} in {guild.name}", flush=True)
-                            if not vc.is_playing():
+                            if not vc.is_playing() and not vc.is_paused():
                                 await _play_next(gid, vc)
                         except Exception as e:
                             print(f"[NexPlay/247] Reconnect failed in {guild.name}: {e}", flush=True)
+                            _music_fail_counts[gid] = _music_fail_counts.get(gid, 0) + 1
                 # Connected but nothing playing → resume auto-play
                 elif vc.is_connected() and not vc.is_playing() and not vc.is_paused():
                     if len(_music_queues.get(gid, deque())) == 0:
                         await _play_next(gid, vc)
         except Exception as e:
             print(f"[NexPlay/247] Health check error: {e}", flush=True)
-        await asyncio.sleep(60)
+        await asyncio.sleep(90)
+
+
+@bot.event
+async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
+    """Handle voice state changes — clean up when bot is disconnected or alone."""
+    # Only care about our own voice state
+    if member.id != bot.user.id:
+        return
+    gid = member.guild.id
+
+    # Bot was disconnected from voice
+    if before.channel and not after.channel:
+        print(f"[Music] Bot disconnected from voice in {member.guild.name}", flush=True)
+        _music_now.pop(gid, None)
+        _music_queues[gid] = deque()
+        _music_fail_counts[gid] = 0
+        # Don't disable 24/7 — health check will reconnect
+
+    # Bot connected to a new channel
+    elif not before.channel and after.channel:
+        print(f"[Music] Bot joined voice in {member.guild.name} → #{after.channel.name}", flush=True)
 
 
 @bot.event
@@ -3233,6 +3319,9 @@ async def on_guild_remove(guild: discord.Guild):
     _music_247.pop(guild.id, None)
     _247_channel.pop(guild.id, None)
     _247_history.pop(guild.id, None)
+    _music_fail_counts.pop(guild.id, None)
+    _music_queues.pop(guild.id, None)
+    _music_now.pop(guild.id, None)
 
 
 @bot.event
