@@ -437,9 +437,18 @@ async def _post_tournament_info(ch_info, ch_ann, ch_reg, ch_road, ch_logo, name,
         await dpost(ch_ann, e)
 
     if ch_reg:
-        d = f"Use `/register` to sign up!\n\n**Deadline:** {reg_end} | **Team Size:** {t_size}\n**Open Slots:** {max_p}"
-        if ch_logo: d += f"\nAfter registering, submit logo in <#{ch_logo}> 🖼️"
-        e = discord.Embed(title=f"✍️ Register for {name}", description=d, color=0xFFD700)
+        lines = "\n".join([f"Player {i+1}: @mention" for i in range(t_size)])
+        d = (f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+             f"🎮 **Game:** {game}\n💰 **Prize:** {prize}\n"
+             f"📅 **Date:** {date} | ⏰ {time_str}\n"
+             f"👥 **Slots:** {max_p} teams ({t_size}v{t_size})\n"
+             f"🗓️ **Deadline:** {reg_end}\n"
+             f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+             f"@everyone **Registration OPEN!**\n"
+             f"```\nTeam Name: <name>\n{lines}\n```\n"
+             f"⚠️ All {t_size} players must be @mentioned.")
+        if ch_logo: d += f"\n🎨 Submit logo in <#{ch_logo}> — `Team Name: <name>` + image"
+        e = discord.Embed(title=f"✍️ Register for {name}", description=d, color=0x00FF7F, timestamp=datetime.now(timezone.utc))
         e.set_footer(text="NexPlay Registration")
         await dpost(ch_reg, e)
 
@@ -818,6 +827,9 @@ async def b44_list(entity: str, filters: dict | None = None) -> list:
 
 async def b44_create(entity: str, payload: dict) -> dict:
     url = BASE44_API + "/" + entity
+    if not SVC_TOKEN:
+        print("[b44_create] ⚠️ SVC_TOKEN is empty! Base44 API calls will fail.", flush=True)
+        return {}
     try:
         async with bot.http_session.post(url, json=payload, headers=_b44_headers()) as r:
             if r.status in (200, 201):
@@ -920,6 +932,8 @@ async def is_allowed(guild_id: str, guild: discord.Guild = None) -> tuple[bool, 
     status = rec.get("subscription_status", "trial")
     if status == "banned":
         return False, "This server has been banned from NexPlay. Contact support."
+    if status == "inactive":
+        return False, "This server was previously removed. Run `/setup` to reactivate your account. Your previous data has been preserved."
     if status in ("active", "trial"):
         return True, ""
     return False, "This server's NexPlay subscription has expired.\nRenew at: https://nexplay-server-portal.vercel.app/subscription\nPlans from NPR 99/mo (Starter) · NPR 299/mo (Pro AI) · NPR 399/mo (Elite)"
@@ -1766,11 +1780,28 @@ async def cmd_setup(interaction: discord.Interaction):
     # Register or update server record
     existing = await get_server_record(gid)
     if not existing:
-        created = await register_server(interaction.guild)
-        if created and created.get("id"):
-            status_msg = "Server registered! You have a **free trial** with 3 tournaments."
+        # No record at all — try to create one
+        if not SVC_TOKEN:
+            status_msg = "⚠️ **Database not configured.** `BASE44_SERVICE_TOKEN` env var is missing on the bot server. Contact the bot owner."
         else:
-            status_msg = "⚠️ Failed to register server in the database. Please try again or contact support."
+            created = await register_server(interaction.guild)
+            if created and created.get("id"):
+                status_msg = "Server registered! You have a **free trial** with 3 tournaments."
+            else:
+                status_msg = "⚠️ Failed to register server in the database. Check bot logs for the error."
+    elif existing.get("subscription_status") == "inactive":
+        # Server was previously removed — reactivate, preserving plan + tournament history
+        await b44_update("Server", existing["id"], {
+            "subscription_status": "trial" if existing.get("plan_name", "Free Trial") == "Free Trial" else "active",
+            "guild_name": interaction.guild.name,
+            "owner_id": str(interaction.guild.owner.id) if interaction.guild.owner else existing.get("owner_id", ""),
+            "owner_name": interaction.guild.owner.display_name if interaction.guild.owner else existing.get("owner_name", ""),
+            "member_count": interaction.guild.member_count or 0,
+            "last_active": now_iso(),
+        })
+        plan = existing.get("plan_name", "Free Trial")
+        t_used = existing.get("tournaments_used", 0)
+        status_msg = f"♻️ **Welcome back!** Your server has been reactivated.\nPlan: **{plan}** | Tournaments used: **{t_used}**\nAll your previous data has been preserved."
     else:
         status_msg = "Server already registered. Status: **" + str(existing.get("subscription_status", "?")) + "**"
 
@@ -1810,8 +1841,9 @@ async def make_tournament_channels(guild: discord.Guild, tournament_name: str) -
         ("roadmap",       f"{short}-roadmap",         "🗺️ Tournament roadmap and schedule overview"),
         ("results",       f"{short}-results",         "🏅 Match results and standings"),
         ("groups",        f"{short}-groups",          "🎯 Group draws and bracket reveal"),
-        ("register",      f"{short}-register",        "✍️ Player registration — use /register here"),
+        ("register",      f"{short}-register",        "✍️ Player registration — type Team Name: + Player 1: @mention ..."),
         ("confirm-teams", f"{short}-confirm-teams",   "✅ Team confirmation and roster lock"),
+        ("team-logo",     f"{short}-team-logo",       "🎨 Submit team logo — type Team Name: <name> + attach image"),
         ("help",          f"{short}-help",            "❓ Support and help for this tournament"),
     ]
     
@@ -1998,6 +2030,407 @@ async def build_tournament_export_excel(tournament: dict, registrations: list, g
     wb.save(buf)
     buf.seek(0)
     return buf
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  TOURNAMENT MANAGEMENT COMMANDS
+# ═══════════════════════════════════════════════════════════════════════════
+
+@tree.command(name="register", description="✍️ Register your team for a tournament")
+@app_commands.describe(tournament="Tournament name (or leave blank if in a #xxx-register channel)")
+async def cmd_register(interaction: discord.Interaction, tournament: str = ""):
+    """Show registration instructions for a tournament."""
+    gid = str(interaction.guild.id)
+    # Try to find tournament by name or by current channel
+    t = None
+    if tournament:
+        t = await _find_tournament(gid, tournament)
+    else:
+        # Detect from channel name: <short>-register
+        ch = interaction.channel.name
+        if ch.endswith("-register"):
+            short = ch[:-9]
+            t = await find_tournament_by_short(gid, short, ("registration_open",))
+        if not t:
+            # List open tournaments
+            all_t = await b44_list("Tournament", {"guild_id": gid})
+            open_ts = [x for x in all_t if x.get("status") == "registration_open"]
+            if len(open_ts) == 1:
+                t = open_ts[0]
+            elif len(open_ts) > 1:
+                names = "\n".join(f"• **{x['name']}** — Register in #{x.get('short_name','')}-register" for x in open_ts[:10])
+                return await interaction.response.send_message(embed=err_e(
+                    f"Multiple tournaments open. Specify one:\n\n{names}"), ephemeral=True)
+
+    if not t:
+        return await interaction.response.send_message(embed=err_e(
+            "No open tournament found. Go to a #<short>-register channel or specify a tournament name."), ephemeral=True)
+
+    if t.get("status") != "registration_open":
+        return await interaction.response.send_message(embed=err_e(
+            f"**{t['name']}** registration is **{t.get('status','closed')}**."), ephemeral=True)
+
+    team_size = int(t.get("team_size", 4))
+    max_p = int(t.get("max_players", 16))
+    registered = int(t.get("registered_count", 0))
+    slots_left = max_p - registered
+    lines = "\n".join([f"Player {i+1}: @mention" for i in range(team_size)])
+    short = t.get("short_name", "")
+
+    e = discord.Embed(title=f"✍️ Register for {t['name']}", color=0xFFD700, timestamp=datetime.now(timezone.utc))
+    e.description = (
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🎮 **Game:** {t.get('game','')}\n"
+        f"💰 **Prize:** {t.get('prize_pool','')}\n"
+        f"📅 **Date:** {t.get('tournament_date','')}\n"
+        f"👥 **Slots:** {registered}/{max_p} ({slots_left} left)\n"
+        f"🏷️ **Team Size:** {team_size}v{team_size}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"**📋 FORMAT — Copy & fill in this #register channel:**\n"
+        f"```\nTeam Name: <your team name>\n{lines}\n```\n"
+        f"⚠️ All {team_size} players MUST be @mentioned.")
+    e.set_footer(text="NexPlay Registration")
+    await interaction.response.send_message(embed=e)
+
+
+@tree.command(name="groups", description="🎯 Generate group draws for a tournament")
+@app_commands.describe(tournament="Tournament name")
+async def cmd_groups(interaction: discord.Interaction, tournament: str):
+    """Generate random group draws from registered teams."""
+    if not is_staff(interaction.user):
+        return await interaction.response.send_message(embed=err_e("❌ You need the **Tournament Host** role!"), ephemeral=True)
+    await interaction.response.defer(thinking=True)
+    ok, msg = await check_feature(str(interaction.guild.id), "groups")
+    if not ok:
+        return await interaction.followup.send(embed=err_e(msg), ephemeral=True)
+
+    gid = str(interaction.guild.id)
+    t = await _find_tournament(gid, tournament)
+    if not t:
+        return await interaction.followup.send(embed=err_e(f"Tournament **{tournament}** not found."), ephemeral=True)
+
+    if t.get("status") not in ("registration_closed", "registration_open"):
+        return await interaction.followup.send(embed=err_e(f"Close registration first. Current status: **{t.get('status')}**"), ephemeral=True)
+
+    regs = await b44_list("Registration", {"tournament_id": t["id"]})
+    if len(regs) < 2:
+        return await interaction.followup.send(embed=err_e("Need at least 2 registered teams to generate groups."), ephemeral=True)
+
+    group_size = int(t.get("group_size", 4))
+    teams = list(regs)
+    random.shuffle(teams)
+    num_groups = max(1, (len(teams) + group_size - 1) // group_size)
+    groups = [[] for _ in range(num_groups)]
+    for i, team in enumerate(teams):
+        groups[i % num_groups].append(team)
+
+    # Save to DB + post to #groups channel
+    short = t.get("short_name", "")
+    groups_ch = discord.utils.get(interaction.guild.text_channels, name=f"{short}-groups")
+    desc = ""
+    for gi, group in enumerate(groups):
+        label = chr(65 + gi)  # A, B, C...
+        player_names = [r.get("player_name", "?") for r in group]
+        player_ids = [r.get("player_discord_id", "") for r in group]
+        desc += f"**🏆 Group {label}**\n" + "\n".join(f"{i+1}. {n}" for i, n in enumerate(player_names)) + "\n\n"
+        # Save group to DB
+        await b44_create("TournamentGroup", {
+            "tournament_id": t["id"], "guild_id": gid,
+            "group_label": label,
+            "player_ids": player_ids,
+            "player_names": player_names,
+            "generated_at": now_iso(),
+        })
+        # Update registration records with group label
+        for r in group:
+            await b44_update("Registration", r["id"], {"group_label": label, "seed_number": groups.index(group) * group_size + group.index(r) + 1})
+
+    # Update tournament status
+    await b44_update("Tournament", t["id"], {"status": "groups_generated"})
+
+    e = discord.Embed(title=f"🎯 Group Draw — {t['name']}", description=desc, color=0x5865F2, timestamp=datetime.now(timezone.utc))
+    e.set_footer(text="NexPlay | Groups Generated")
+    await interaction.followup.send(embed=ok_e("Groups Generated!", f"{len(groups)} groups created for **{t['name']}**. Check #{short}-groups."))
+    if groups_ch:
+        await groups_ch.send(embed=e)
+
+
+@tree.command(name="results", description="🏅 Post match results for a tournament")
+@app_commands.describe(tournament="Tournament name", match_info="Match result (e.g. 'Group A: Team1 2-1 Team2')")
+async def cmd_results(interaction: discord.Interaction, tournament: str, match_info: str):
+    """Post match results to the results channel and save to DB."""
+    if not is_staff(interaction.user):
+        return await interaction.response.send_message(embed=err_e("❌ You need the **Tournament Host** role!"), ephemeral=True)
+    await interaction.response.defer(thinking=True)
+    ok, msg = await check_feature(str(interaction.guild.id), "results")
+    if not ok:
+        return await interaction.followup.send(embed=err_e(msg), ephemeral=True)
+
+    gid = str(interaction.guild.id)
+    t = await _find_tournament(gid, tournament)
+    if not t:
+        return await interaction.followup.send(embed=err_e(f"Tournament **{tournament}** not found."), ephemeral=True)
+
+    short = t.get("short_name", "")
+    results_ch = discord.utils.get(interaction.guild.text_channels, name=f"{short}-results")
+    if not results_ch:
+        return await interaction.followup.send(embed=err_e(f"#{short}-results channel not found."), ephemeral=True)
+
+    e = discord.Embed(title=f"🏅 Result — {t['name']}", description=match_info, color=0xFFD700, timestamp=datetime.now(timezone.utc))
+    e.set_footer(text=f"Posted by {interaction.user.display_name} | NexPlay")
+    await results_ch.send(embed=e)
+    await interaction.followup.send(embed=ok_e("Result Posted!", f"Match result posted to #{short}-results."), ephemeral=True)
+
+
+@tree.command(name="export_csv", description="📊 Export tournament registrations as CSV")
+@app_commands.describe(tournament="Tournament name")
+async def cmd_export_csv(interaction: discord.Interaction, tournament: str):
+    """Export registrations as a CSV file."""
+    if not is_staff(interaction.user):
+        return await interaction.response.send_message(embed=err_e("❌ You need the **Tournament Host** role!"), ephemeral=True)
+    await interaction.response.defer(thinking=True, ephemeral=True)
+    ok, msg = await check_feature(str(interaction.guild.id), "export_csv")
+    if not ok:
+        return await interaction.followup.send(embed=err_e(msg), ephemeral=True)
+
+    gid = str(interaction.guild.id)
+    t = await _find_tournament(gid, tournament)
+    if not t:
+        return await interaction.followup.send(embed=err_e(f"Tournament **{tournament}** not found."), ephemeral=True)
+
+    regs = await b44_list("Registration", {"tournament_id": t["id"]})
+    import csv
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["Team Name", "Captain ID", "Team Members", "Status", "Group", "Seed #", "Logo URL", "Registered At"])
+    for r in regs:
+        members = r.get("team_members", [])
+        if isinstance(members, list): members = ", ".join(members)
+        writer.writerow([
+            r.get("player_name", ""), r.get("player_discord_id", ""),
+            members, r.get("status", ""), r.get("group_label", "—"),
+            r.get("seed_number", ""), r.get("logo_url", ""),
+            str(r.get("registered_at", ""))[:16],
+        ])
+    buf.seek(0)
+    safe_name = "".join(c for c in t.get("name","export") if c.isalnum() or c in " -_")[:30]
+    file = discord.File(io.BytesIO(buf.getvalue().encode()), filename=f"{safe_name}_registrations.csv")
+    await interaction.followup.send(embed=ok_e("CSV Export", f"Exported {len(regs)} registrations for **{t['name']}**."), file=file, ephemeral=True)
+
+
+@tree.command(name="export_registrations", description="📊 Export registrations (alias for /export_csv)")
+@app_commands.describe(tournament="Tournament name")
+async def cmd_export_registrations(interaction: discord.Interaction, tournament: str):
+    """Alias for /export_csv."""
+    await cmd_export_csv(interaction, tournament)
+
+
+@tree.command(name="schedule_post", description="📅 Post the match schedule to the schedule channel")
+@app_commands.describe(tournament="Tournament name")
+async def cmd_schedule_post(interaction: discord.Interaction, tournament: str):
+    """Post tournament schedule to roadmap/results channel."""
+    if not is_staff(interaction.user):
+        return await interaction.response.send_message(embed=err_e("❌ You need the **Tournament Host** role!"), ephemeral=True)
+    await interaction.response.defer(thinking=True)
+    ok, msg = await check_feature(str(interaction.guild.id), "schedule_post")
+    if not ok:
+        return await interaction.followup.send(embed=err_e(msg), ephemeral=True)
+
+    gid = str(interaction.guild.id)
+    t = await _find_tournament(gid, tournament)
+    if not t:
+        return await interaction.followup.send(embed=err_e(f"Tournament **{tournament}** not found."), ephemeral=True)
+
+    short = t.get("short_name", "")
+    groups = await b44_list("TournamentGroup", {"tournament_id": t["id"]})
+    rounds = int(t.get("rounds", 3))
+    date = t.get("tournament_date", "TBD")
+    time_str = t.get("tournament_time", "TBD")
+
+    desc = f"📅 **Schedule for {t['name']}**\n🗓️ **Date:** {date} | ⏰ **Time:** {time_str}\n\n"
+    for gi, g in enumerate(groups):
+        label = g.get("group_label", chr(65+gi))
+        names = g.get("player_names", [])
+        if isinstance(names, list): names = ", ".join(names)
+        desc += f"**Group {label}:** {names}\n"
+
+    desc += "\n"
+    stage_names = STAGE_NAMES[:rounds] if rounds <= len(STAGE_NAMES) else [f"Round {i+1}" for i in range(rounds)]
+    for i, stage in enumerate(stage_names):
+        desc += f"**Stage {i+1}:** {stage} — {date} (Day {i+1})\n"
+
+    e = discord.Embed(title=f"📅 Match Schedule — {t['name']}", description=desc, color=0x1E90FF, timestamp=datetime.now(timezone.utc))
+    e.set_footer(text="NexPlay Schedule")
+
+    # Post to roadmap channel
+    road_ch = discord.utils.get(interaction.guild.text_channels, name=f"{short}-roadmap")
+    if road_ch:
+        await road_ch.send(embed=e)
+
+    # Generate schedule GFX (Pro+)
+    can_gfx, _ = await check_feature(gid, "ai_gfx_schedule")
+    if can_gfx:
+        gfx = img_url(t["name"], t.get("game",""), "schedule", f"{len(groups)} groups")
+        e.set_image(url=gfx)
+
+    await interaction.followup.send(embed=ok_e("Schedule Posted!", f"Schedule posted to #{short}-roadmap."))
+
+
+@tree.command(name="roadmap_post", description="🗺️ Post the tournament roadmap")
+@app_commands.describe(tournament="Tournament name")
+async def cmd_roadmap_post(interaction: discord.Interaction, tournament: str):
+    """Post tournament roadmap to the roadmap channel."""
+    if not is_staff(interaction.user):
+        return await interaction.response.send_message(embed=err_e("❌ You need the **Tournament Host** role!"), ephemeral=True)
+    await interaction.response.defer(thinking=True)
+    ok, msg = await check_feature(str(interaction.guild.id), "roadmap_post")
+    if not ok:
+        return await interaction.followup.send(embed=err_e(msg), ephemeral=True)
+
+    gid = str(interaction.guild.id)
+    t = await _find_tournament(gid, tournament)
+    if not t:
+        return await interaction.followup.send(embed=err_e(f"Tournament **{tournament}** not found."), ephemeral=True)
+
+    short = t.get("short_name", "")
+    rounds = int(t.get("rounds", 3))
+    road_ch = discord.utils.get(interaction.guild.text_channels, name=f"{short}-roadmap")
+    if not road_ch:
+        return await interaction.followup.send(embed=err_e(f"#{short}-roadmap channel not found."), ephemeral=True)
+
+    stage_names = STAGE_NAMES[:rounds] if rounds <= len(STAGE_NAMES) else [f"Round {i+1}" for i in range(rounds)]
+    lines = "\n".join([f"**Stage {i+1}:** {stage_names[i]} — {t.get('tournament_date','TBD')}" for i in range(rounds)])
+    e = discord.Embed(title=f"🗺️ {t['name']} — Roadmap", description=lines, color=0xFF6B35, timestamp=datetime.now(timezone.utc))
+    e.set_footer(text="NexPlay Roadmap")
+
+    # AI GFX roadmap (Pro+)
+    can_gfx, _ = await check_feature(gid, "ai_gfx_poster")
+    if can_gfx:
+        e.set_image(url=img_url(t["name"], t.get("game",""), "roadmap"))
+
+    await road_ch.send(embed=e)
+    await interaction.followup.send(embed=ok_e("Roadmap Posted!", f"Roadmap posted to #{short}-roadmap."))
+
+
+@tree.command(name="standings_post", description="🏅 Post current standings/leaderboard")
+@app_commands.describe(tournament="Tournament name")
+async def cmd_standings_post(interaction: discord.Interaction, tournament: str):
+    """Post current standings based on match results."""
+    if not is_staff(interaction.user):
+        return await interaction.response.send_message(embed=err_e("❌ You need the **Tournament Host** role!"), ephemeral=True)
+    await interaction.response.defer(thinking=True)
+    ok, msg = await check_feature(str(interaction.guild.id), "standings_post")
+    if not ok:
+        return await interaction.followup.send(embed=err_e(msg), ephemeral=True)
+
+    gid = str(interaction.guild.id)
+    t = await _find_tournament(gid, tournament)
+    if not t:
+        return await interaction.followup.send(embed=err_e(f"Tournament **{tournament}** not found."), ephemeral=True)
+
+    short = t.get("short_name", "")
+    matches = await b44_list("Match", {"tournament_id": t["id"]})
+    completed = [m for m in matches if m.get("status") == "completed" and m.get("winner_id")]
+
+    if not completed:
+        # No completed matches — show group stage standings instead
+        groups = await b44_list("TournamentGroup", {"tournament_id": t["id"]})
+        if not groups:
+            return await interaction.followup.send(embed=err_e("No matches completed and no groups generated yet. Run /groups first."), ephemeral=True)
+        desc = ""
+        for g in groups:
+            label = g.get("group_label", "?")
+            names = g.get("player_names", [])
+            if isinstance(names, list): names = "\n".join(f"  {i+1}. {n}" for i, n in enumerate(names))
+            desc += f"**🏆 Group {label}**\n{names}\n\n"
+        e = discord.Embed(title=f"🏅 Standings — {t['name']} (Group Stage)", description=desc, color=0xFFD700, timestamp=datetime.now(timezone.utc))
+    else:
+        # Count wins per player
+        wins = {}
+        for m in completed:
+            wid = m.get("winner_id", "")
+            wname = m.get("winner_username", "Unknown")
+            wins[wname] = wins.get(wname, 0) + 1
+        standings = sorted(wins.items(), key=lambda x: -x[1])
+        desc = "\n".join([f"{'🥇' if i==0 else '🥈' if i==1 else '🥉' if i==2 else f'{i+1}.'} **{name}** — {w} wins" for i, (name, w) in enumerate(standings)])
+        e = discord.Embed(title=f"🏅 Standings — {t['name']}", description=desc, color=0xFFD700, timestamp=datetime.now(timezone.utc))
+
+    e.set_footer(text="NexPlay Standings")
+    results_ch = discord.utils.get(interaction.guild.text_channels, name=f"{short}-results")
+    if results_ch:
+        await results_ch.send(embed=e)
+    await interaction.followup.send(embed=ok_e("Standings Posted!", f"Standings posted to #{short}-results."))
+
+
+@tree.command(name="help", description="📖 Show all NexPlay commands and features")
+async def cmd_help(interaction: discord.Interaction):
+    """Show help with all available commands based on server's plan."""
+    gid = str(interaction.guild.id)
+    rec = await get_server_record(gid)
+    plan = "trial"
+    if rec:
+        plan = (rec.get("plan_name") or rec.get("subscription_status") or "trial").lower()
+        if plan in ("free trial", "free_trial"): plan = "trial"
+
+    features = PLAN_FEATURES.get(plan, PLAN_FEATURES["trial"])
+
+    e = discord.Embed(title="📖 NexPlay Commands", description=f"**Plan:** {plan.title()} | **Server:** {interaction.guild.name}", color=0x5865F2, timestamp=datetime.now(timezone.utc))
+
+    e.add_field(name="🏆 Tournament", value=(
+        "`/create_tournament` — Create a new tournament (3-step form)\n"
+        "`/edit_tournament` — Edit tournament details\n"
+        "`/register` — Show registration instructions\n"
+        "`/groups` — Generate group draws\n"
+        "`/results` — Post match results\n"
+        "`/standings_post` — Post current standings\n"
+        "`/schedule_post` — Post match schedule\n"
+        "`/roadmap_post` — Post tournament roadmap\n"
+        "`/export_csv` — Export registrations as CSV\n"
+        "`/delete_tournament` — Delete tournament + channels\n"
+        "`/delete_channel` — Delete a channel\n"
+        "`/delete_category` — Delete a category + channels"
+    ), inline=False)
+
+    e.add_field(name="🎵 Music", value=(
+        "`/play <song>` — Play music from YouTube\n"
+        "`/skip` — Skip current song\n"
+        "`/queue` — Show music queue\n"
+        "`/loop` — Toggle loop\n"
+        "`/pause` — Pause music\n"
+        "`/resume` — Resume music\n"
+        "`/volume <0-100>` — Set volume\n"
+        "`/247` — 24/7 auto-play (Gen Z Hindi/Nepali)\n"
+        "`/nowplaying` — Now playing\n"
+        "`/playlist` — View 24/7 playlist\n"
+        "`/leave` — Disconnect bot"
+    ), inline=False)
+
+    e.add_field(name="🛠️ Server", value=(
+        "`/setup` — Initialize NexPlay channels\n"
+        "`/announce` — Post an announcement\n"
+        "`/clearlog` — Clear support lock\n"
+        "`/help` — This message"
+    ), inline=False)
+
+    elite_features = []
+    if "ai_support" in features: elite_features.append("🤖 AI Support in #support/#help")
+    if "host_game" in features: elite_features.append("🎮 `/host_game` — Mini-games")
+    if "suggest_improvement" in features: elite_features.append("💡 `/suggest_improvement` — AI growth advisor")
+    if "welcome_message" in features: elite_features.append("👋 Auto welcome messages")
+    if "meme_post" in features: elite_features.append("😂 Auto trending memes (15 min)")
+    if "daily_report" in features: elite_features.append("📊 Daily Excel reports via DM")
+    if "ai_gfx_poster" in features: elite_features.append("🎨 AI GFX posters, groups, results, schedule")
+
+    if elite_features:
+        e.add_field(name="✨ Active Features", value="\n".join(elite_features), inline=False)
+
+    e.add_field(name="🔗 Links", value=(
+        "Portal: https://nexplay-server-portal.vercel.app\n"
+        "Billing: https://nexplay-server-portal.vercel.app/subscription"
+    ), inline=False)
+
+    e.set_footer(text="NexPlay Tournament System")
+    await interaction.response.send_message(embed=e, ephemeral=True)
 
 
 @tree.command(name="delete_channel", description="[Host] Delete a channel by name or ID")
@@ -2728,14 +3161,34 @@ async def _247_health_check():
 
 @bot.event
 async def on_guild_join(guild: discord.Guild):
-    """Auto-register new servers with Free Trial plan. Works for unlimited servers."""
+    """Auto-register new servers OR reactivate previously removed servers.
+    When bot is re-invited to a server it was previously in, it restores the
+    old server record (plan, tournament count, etc.) instead of creating a new one."""
     print(f"[NexPlay] 🆕 Joined: {guild.name} ({guild.id}) — {guild.member_count} members", flush=True)
-    existing = await b44_list("Server", {"guild_id": str(guild.id)})
+    gid = str(guild.id)
+    existing = await b44_list("Server", {"guild_id": gid})
     if not existing:
+        # Brand new server — register as Free Trial
         await register_server(guild)
         print(f"[NexPlay] ✅ Registered {guild.name} as Free Trial (3 tournaments)", flush=True)
     else:
-        print(f"[NexPlay] {guild.name} already registered", flush=True)
+        srv = existing[0]
+        status = srv.get("subscription_status", "trial")
+        if status == "inactive":
+            # Server was previously removed — reactivate it, preserving plan + data
+            await b44_update("Server", srv["id"], {
+                "subscription_status": "trial" if srv.get("plan_name", "Free Trial") == "Free Trial" else "active",
+                "guild_name": guild.name,  # Update name in case it changed
+                "owner_id": str(guild.owner.id) if guild.owner else srv.get("owner_id", ""),
+                "owner_name": guild.owner.display_name if guild.owner else srv.get("owner_name", ""),
+                "member_count": guild.member_count or 0,
+                "last_active": now_iso(),
+            })
+            plan = srv.get("plan_name", "Free Trial")
+            t_used = srv.get("tournaments_used", 0)
+            print(f"[NexPlay] ♻️ Reactivated {guild.name} — Plan: {plan}, Tournaments used: {t_used}", flush=True)
+        else:
+            print(f"[NexPlay] {guild.name} already registered (status: {status})", flush=True)
 
     # Auto-create needed roles if missing
     try:
