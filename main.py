@@ -92,10 +92,11 @@ STATUS_EMOJI = {
 # ══════════════════════════════════════════════════════════════════════════════
 PLAN_FEATURES = {
     # (plan_name_lower) → set of unlocked feature keys
-    "trial":   {"create_tournament", "register", "groups", "results", "export_csv"},
-    "starter": {"create_tournament", "register", "groups", "results", "export_csv",
+    # meme_post is available on ALL plans — every server gets trending memes
+    "trial":   {"create_tournament", "register", "groups", "results", "export_csv", "meme_post"},
+    "starter": {"create_tournament", "register", "groups", "results", "export_csv", "meme_post",
                 "schedule_post", "edit_tournament", "roadmap_post", "standings_post"},
-    "pro":     {"create_tournament", "register", "groups", "results", "export_csv",
+    "pro":     {"create_tournament", "register", "groups", "results", "export_csv", "meme_post",
                 "schedule_post", "edit_tournament", "roadmap_post", "standings_post",
                 "ai_gfx_poster", "ai_gfx_groups", "ai_gfx_results", "ai_gfx_schedule",
                 "auto_announce", "daily_report"},
