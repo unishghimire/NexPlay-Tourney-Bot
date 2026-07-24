@@ -291,14 +291,30 @@ async def auto_meme_loop():
                     target = guild.get_channel(_meme_channel_cache.get(guild.id, 0))
                     if target and not target.permissions_for(guild.me).send_messages: target = None
                     if not target:
-                        for hint in ("meme-server", "memes", "meme", "funny", "media", "general", "chat"):
+                        # Reset stale cache
+                        _meme_channel_cache.pop(guild.id, None)
+                        for hint in ("meme-server", "memes", "meems", "meme", "memez", "funny", 
+                                      "shitpost", "media", "general", "chat", "lounge"):
                             target = discord.utils.find(
                                 lambda c, h=hint: isinstance(c, discord.TextChannel) and h in c.name.lower()
                                 and c.permissions_for(guild.me).send_messages, guild.text_channels)
                             if target:
                                 _meme_channel_cache[guild.id] = target.id
                                 break
-                    if not target: continue
+                    if not target:
+                        # Last resort: find any channel the bot can send to that's NOT a tournament channel
+                        for ch in guild.text_channels:
+                            if ch.permissions_for(guild.me).send_messages and not any(
+                                x in ch.name.lower() for x in ("register", "info", "announcements", 
+                                "roadmap", "results", "groups", "confirm", "team-logo", "help", 
+                                "ticket", "log", "voice", "bot-commands", "staff", "mod")
+                            ):
+                                target = ch
+                                _meme_channel_cache[guild.id] = ch.id
+                                break
+                    if not target:
+                        print(f"[NexPlay] No meme channel found in {guild.name} — searched all text channels", flush=True)
+                        continue
 
                     # Pick subreddit — rotate per guild per cycle for variety
                     sub_idx = (guild.id // 1000 + int(asyncio.get_event_loop().time()) // 900) % len(MEME_SUBREDDITS)
