@@ -450,7 +450,10 @@ async def _post_tournament_info(ch_info, ch_ann, ch_reg, ch_road, ch_logo, name,
         if ch_logo: d += f"\n🎨 Submit logo in <#{ch_logo}> — `Team Name: <name>` + image"
         e = discord.Embed(title=f"✍️ Register for {name}", description=d, color=0x00FF7F, timestamp=datetime.now(timezone.utc))
         e.set_footer(text="NexPlay Registration")
-        await dpost(ch_reg, e)
+        reg_msg = await dpost(ch_reg, e)
+        reg_msg_id = reg_msg.get("id", "") if reg_msg else ""
+    else:
+        reg_msg_id = ""
 
     if ch_road:
         lines = [f"**Stage {i+1}:** {STAGE_NAMES[i] if i < 5 else f'Round {i+1}'}" for i in range(min(rounds, 5))]
@@ -458,6 +461,7 @@ async def _post_tournament_info(ch_info, ch_ann, ch_reg, ch_road, ch_logo, name,
         e.set_footer(text="NexPlay Roadmap")
         if roadmap: e.set_image(url=roadmap)
         await dpost(ch_road, e)
+    return reg_msg_id
 
 # ── Step 1 Modal ──────────────────────────────────────────
 class TournamentStep1Modal(discord.ui.Modal, title="🏆 Create Tournament (1/3) — Basics"):
@@ -620,12 +624,13 @@ class TournamentStep3Modal(discord.ui.Modal, title="🏆 Create Tournament (3/3)
             "short_name": short, "category_name": cat_name,
             "created_by_discord_id": str(interaction.user.id),
             "started_at": now_iso(),
+            "registration_msg_id": reg_msg_id,
         })
         tid = rec.get("id", "")
 
         fmt_label = FMT_LABELS.get(fmt.lower().replace(" ", "_"), fmt)
 
-        await _post_tournament_info(ch_info_id, ch_ann_id, ch_reg_id, ch_road_id, ch_logo_id,
+        reg_msg_id = await _post_tournament_info(ch_info_id, ch_ann_id, ch_reg_id, ch_road_id, ch_logo_id,
             name, game, fmt_label, prize_pool, date, time_str, max_players,
             team_size, group_size, rounds, reg_end, nations, rules, stream,
             description, poster_url, roadmap_url)
@@ -1207,8 +1212,8 @@ async def build_daily_excel(guild: discord.Guild) -> io.BytesIO:
 
     # Sheet 2-4 via _xl_sheet
     _xl_sheet(wb, "Registrations", ["Team Name","Tournament","Players","Discord User","Reg At","Group","Status","Slot"],
-        [[r.get("player_name",""), t_map.get(r.get("tournament_id",""),"?"), r.get("player_username",""),
-          r.get("player_discord_tag",""), str(r.get("registered_at",""))[:16], r.get("group_label","—"),
+        [[r.get("player_name",""), t_map.get(r.get("tournament_id",""),"?"), str(r.get("team_members","")),
+          r.get("player_discord_id",""), str(r.get("registered_at",""))[:16], r.get("group_label","—"),
           r.get("status","registered"), r.get("seed_number","")] for r in all_regs],
         "375623", widths=[18,22,30,18,16,8,12,7])
 
@@ -2392,6 +2397,7 @@ async def cmd_help(interaction: discord.Interaction):
     e.add_field(name="🎵 Music", value=(
         "`/play <song>` — Play music from YouTube\n"
         "`/skip` — Skip current song\n"
+        "`/stop` — Stop music & clear queue\n"
         "`/queue` — Show music queue\n"
         "`/loop` — Toggle loop\n"
         "`/pause` — Pause music\n"
