@@ -20,7 +20,7 @@ import random
 from collections import deque
 from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 
 # Load .env file if present (local dev). Render injects vars directly.
@@ -183,7 +183,7 @@ class NexPlayBot(commands.Bot):
                 # Target: 18:15 UTC daily (= midnight NPT)
                 target = now_utc.replace(hour=18, minute=15, second=0, microsecond=0)
                 if now_utc >= target:
-                    target = target.replace(day=target.day + 1)
+                    target = target + timedelta(days=1)
                 wait_secs = (target - now_utc).total_seconds()
                 print(f"[NexPlay] Daily log fires in {wait_secs/3600:.1f}h", flush=True)
                 await asyncio.sleep(wait_secs)
