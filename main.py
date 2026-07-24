@@ -287,34 +287,47 @@ async def auto_meme_loop():
                     if not ok:
                         continue  # Skip servers without meme_post feature
 
-                    # Find meme channel (cached or by name hint)
+                    # ── Find or create meme channel ─────────────────────────────
                     target = guild.get_channel(_meme_channel_cache.get(guild.id, 0))
-                    if target and not target.permissions_for(guild.me).send_messages: target = None
-                    if not target:
-                        # Reset stale cache
+                    if target and not target.permissions_for(guild.me).send_messages:
+                        target = None
                         _meme_channel_cache.pop(guild.id, None)
-                        for hint in ("meme-server", "memes", "meems", "meme", "memez", "funny", 
-                                      "shitpost", "media", "general", "chat", "lounge"):
+
+                    # Search by name hint
+                    if not target:
+                        _meme_channel_cache.pop(guild.id, None)
+                        for hint in ("meme-server", "memes", "meems", "meme", "memez", "funny",
+                                      "shitpost", "media", "lounge"):
                             target = discord.utils.find(
                                 lambda c, h=hint: isinstance(c, discord.TextChannel) and h in c.name.lower()
                                 and c.permissions_for(guild.me).send_messages, guild.text_channels)
                             if target:
                                 _meme_channel_cache[guild.id] = target.id
+                                print(f"[NexPlay] Meme channel found → #{target.name} in {guild.name}", flush=True)
                                 break
+
+                    # Not found → auto-create a #memes channel
                     if not target:
-                        # Last resort: find any channel the bot can send to that's NOT a tournament channel
-                        for ch in guild.text_channels:
-                            if ch.permissions_for(guild.me).send_messages and not any(
-                                x in ch.name.lower() for x in ("register", "info", "announcements", 
-                                "roadmap", "results", "groups", "confirm", "team-logo", "help", 
-                                "ticket", "log", "voice", "bot-commands", "staff", "mod")
-                            ):
-                                target = ch
-                                _meme_channel_cache[guild.id] = ch.id
-                                break
-                    if not target:
-                        print(f"[NexPlay] No meme channel found in {guild.name} — searched all text channels", flush=True)
-                        continue
+                        try:
+                            # Find a NexPlay category, or any manageable category
+                            cat = discord.utils.find(
+                                lambda c: isinstance(c, discord.CategoryChannel) and "nexplay" in c.name.lower(),
+                                guild.categories)
+                            if not cat:
+                                cat = discord.utils.find(
+                                    lambda c: isinstance(c, discord.CategoryChannel) and c.permissions_for(guild.me).manage_channels,
+                                    guild.categories)
+                            target = await guild.create_text_channel(
+                                name="memes",
+                                category=cat,
+                                topic="Trending memes posted every 15 minutes by NexPlay Bot!",
+                                reason="Auto-created by NexPlay Bot for meme posting"
+                            )
+                            _meme_channel_cache[guild.id] = target.id
+                            print(f"[NexPlay] Created meme channel → #{target.name} in {guild.name}", flush=True)
+                        except Exception as create_err:
+                            print(f"[NexPlay] Could not create meme channel in {guild.name}: {create_err}", flush=True)
+                            continue
 
                     # Pick subreddit — rotate per guild per cycle for variety
                     sub_idx = (guild.id // 1000 + int(asyncio.get_event_loop().time()) // 900) % len(MEME_SUBREDDITS)
