@@ -2360,66 +2360,6 @@ async def cmd_standings_post(interaction: discord.Interaction, tournament: str):
     if results_ch:
         await results_ch.send(embed=e)
     await interaction.followup.send(embed=ok_e("Standings Posted!", f"Standings posted to #{short}-results."))
-
-
-@tree.command(name="obs_setup", description="🎥 Get OBS Studio overlay setup instructions + URLs")
-@app_commands.describe(tournament="Tournament name (for overlay URLs)")
-async def cmd_obs_setup(interaction: discord.Interaction, tournament: str = ""):
-    """Show OBS Studio setup guide with overlay URLs for the tournament."""
-    gid = str(interaction.guild.id)
-    base = "https://nexplay-server-portal.vercel.app/overlay"
-
-    # Try to find tournament
-    t = None
-    if tournament:
-        t = await _find_tournament(gid, tournament)
-    else:
-        all_t = await b44_list("Tournament", {"guild_id": gid})
-        active = [x for x in all_t if x.get("status") not in ("completed", "cancelled", "deleted")]
-        if len(active) == 1:
-            t = active[0]
-        elif len(active) > 1:
-            names = ", ".join(x.get("name", "?") for x in active[:10])
-            return await interaction.response.send_message(embed=err_e(
-                f"Multiple active tournaments. Specify one:\n**{names}**"), ephemeral=True)
-
-    if not t:
-        return await interaction.response.send_message(embed=err_e(
-            "No active tournament found. Create one with `/create_tournament` first, or specify a tournament name."), ephemeral=True)
-
-    tid = t.get("id", "")
-    tname = t.get("name", "Tournament")
-
-    overlays = [
-        ("📊 Scoreboard", "Live standings bar", "scoreboard"),
-        ("⚔️ Match", "Current match P1 vs P2", "match"),
-        ("🌳 Bracket", "Tournament bracket tree", "bracket"),
-        ("🎯 Groups", "Group standings tables", "groups"),
-        ("📰 Info Bar", "Scrolling tournament ticker", "infobar"),
-        ("👑 Champion", "Victory screen", "champion"),
-        ("✍️ Registration", "Slots filled progress", "registration"),
-    ]
-
-    desc = f"**🎥 OBS Studio Overlay Setup**\n**Tournament:** {tname}\n\n"
-    desc += "**📋 Available Overlays:**\n"
-    for emoji_name, odesc, otype in overlays:
-        desc += f"**{emoji_name}** — {odesc}\n  `{base}/{otype}/{tid}`\n\n"
-
-    desc += "**⚙️ OBS Setup Steps:**\n"
-    desc += "1️⃣ Open **OBS Studio**\n"
-    desc += "2️⃣ In your scene, click **+** under Sources → **Browser**\n"
-    desc += "3️⃣ Paste the overlay URL from above\n"
-    desc += "4️⃣ Set **Width:** 1920, **Height:** 1080\n"
-    desc += "5️⃣ Check ✅ **Refresh browser when scene becomes active**\n"
-    desc += "6️⃣ Click **OK** — overlay appears with transparent background!\n\n"
-    desc += "**💡 Tip:** Add each overlay as a separate source. Toggle visibility per scene.\n"
-    desc += "**🔗 Full overlay hub:** https://nexplay-server-portal.vercel.app/overlays"
-
-    e = discord.Embed(title="🎥 OBS Studio Overlays", description=desc, color=0x5865F2, timestamp=datetime.now(timezone.utc))
-    e.set_footer(text="NexPlay OBS Integration | IC S1 Overlays")
-    await interaction.response.send_message(embed=e)
-
-
 @tree.command(name="help", description="📖 Show all NexPlay commands and features")
 async def cmd_help(interaction: discord.Interaction):
     """Show help with all available commands based on server's plan."""
