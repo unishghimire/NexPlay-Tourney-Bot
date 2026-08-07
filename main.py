@@ -638,7 +638,16 @@ class TournamentStep3Modal(discord.ui.Modal, title="🏆 Create Tournament (3/3)
         poster_url  = img_url(name, game, "poster", f"prize {prize_pool} date {date}") if can_gfx else ""
         roadmap_url = img_url(name, game, "roadmap") if can_gfx else ""
 
-        # Save to DB
+        # Post tournament info to channels FIRST — we need the registration
+        # message ID returned by _post_tournament_info to save it in the DB.
+        fmt_label = FMT_LABELS.get(fmt.lower().replace(" ", "_"), fmt)
+
+        reg_msg_id = await _post_tournament_info(ch_info_id, ch_ann_id, ch_reg_id, ch_road_id, ch_logo_id,
+            name, game, fmt_label, prize_pool, date, time_str, max_players,
+            team_size, group_size, rounds, reg_end, nations, rules, stream,
+            description, poster_url, roadmap_url)
+
+        # Now save to DB — reg_msg_id is populated from the registration channel post
         rec = await b44_create("Tournament", {
             "guild_id": gid, "name": name, "game": game, "format": fmt,
             "prize_pool": prize_pool, "description": description,
@@ -656,13 +665,6 @@ class TournamentStep3Modal(discord.ui.Modal, title="🏆 Create Tournament (3/3)
             "registration_msg_id": reg_msg_id,
         })
         tid = rec.get("id", "")
-
-        fmt_label = FMT_LABELS.get(fmt.lower().replace(" ", "_"), fmt)
-
-        reg_msg_id = await _post_tournament_info(ch_info_id, ch_ann_id, ch_reg_id, ch_road_id, ch_logo_id,
-            name, game, fmt_label, prize_pool, date, time_str, max_players,
-            team_size, group_size, rounds, reg_end, nations, rules, stream,
-            description, poster_url, roadmap_url)
 
         # Update server tournament count
         srv = await get_server_record(gid)
@@ -737,9 +739,11 @@ class TournamentEditModal(discord.ui.Modal, title="✏️ Edit Tournament"):
                  f"**🌏 Nations:** {t.get('eligible_nations','🇳🇵')}")
             if updates['rules']: d += f"\n**📜 Rules:**\n{updates['rules']}"
             if updates['stream_channel']: d += f"\n**📺 Stream:** {updates['stream_channel']}"
-            await dpost(ch_info_id, discord.Embed(
+            updated_embed = discord.Embed(
                 title=f"📋 {t['name']} — Updated", description=d, color=0xFFA500,
-                timestamp=datetime.now(timezone.utc)).set_footer(text="NexPlay | Updated"))
+                timestamp=datetime.now(timezone.utc))
+            updated_embed.set_footer(text="NexPlay | Updated")
+            await dpost(ch_info_id, updated_embed)
 
         await interaction.followup.send(embed=ok_e("Tournament Updated!", f"**{t['name']}** details have been updated and #info channel refreshed."), ephemeral=True)
 
@@ -1136,27 +1140,25 @@ async def ai_generate(prompt: str) -> str:
 
     if GROQ_KEY:
         try:
-            async with aiohttp.ClientSession() as s:
-                async with s.post("https://api.groq.com/openai/v1/chat/completions",
-                    json={"model": "llama-3.3-70b-versatile",
-                          "messages": [{"role": "user", "content": prompt}],
-                          "max_tokens": 300, "temperature": 0.7},
-                    headers={"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"},
-                    timeout=aiohttp.ClientTimeout(total=12)) as r:
-                    if r.status == 200:
-                        return (await r.json())["choices"][0]["message"]["content"].strip()
-                    print(f"[AI] Groq error {r.status}: {(await r.text())[:200]}", flush=True)
+            async with bot.http_session.post("https://api.groq.com/openai/v1/chat/completions",
+                json={"model": "llama-3.3-70b-versatile",
+                      "messages": [{"role": "user", "content": prompt}],
+                      "max_tokens": 300, "temperature": 0.7},
+                headers={"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"},
+                timeout=aiohttp.ClientTimeout(total=12)) as r:
+                if r.status == 200:
+                    return (await r.json())["choices"][0]["message"]["content"].strip()
+                print(f"[AI] Groq error {r.status}: {(await r.text())[:200]}", flush=True)
         except Exception as e:
             print(f"[AI] Groq exception: {e}", flush=True)
 
     try:
         encoded = urllib.parse.quote(prompt[:1500])
-        async with aiohttp.ClientSession() as s:
-            async with s.get(f"https://text.pollinations.ai/{encoded}",
-                timeout=aiohttp.ClientTimeout(total=15)) as r:
-                if r.status == 200:
-                    return (await r.text()).strip()
-                print(f"[AI] Pollinations {r.status}", flush=True)
+        async with bot.http_session.get(f"https://text.pollinations.ai/{encoded}",
+            timeout=aiohttp.ClientTimeout(total=15)) as r:
+            if r.status == 200:
+                return (await r.text()).strip()
+            print(f"[AI] Pollinations {r.status}", flush=True)
     except Exception as e:
         print(f"[AI] Pollinations exception: {e}", flush=True)
 
@@ -1739,8 +1741,9 @@ async def on_message(message: discord.Message):
         await bot.process_commands(message)
         return
 
-    # ── Debug log every message so we can verify receipt ─────────────────────
-    print(f"[MSG] #{message.channel.name} | {message.author} | {message.content[:80]}", flush=True)
+    # Verbose message logging — only when DEBUG=1 is set (avoid Railway log spam)
+    if os.environ.get("DEBUG"):
+        print(f"[MSG] #{message.channel.name} | {message.author} | {message.content[:80]}", flush=True)
 
     # ── Support handler — ONLY in designated support/help channels ──────────────
     ch_name_lower = message.channel.name.lower()
