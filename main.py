@@ -2999,9 +2999,12 @@ GENZ_PLAYLIST = [
     "Dil Galti Kar Baitha Hai Jubin Nautiyal",
 ]
 
-def _fmt_dur(sec: int) -> str:
-    """Format seconds as m:ss, or LIVE if 0."""
-    return f"{sec//60}:{sec%60:02d}" if sec else "LIVE"
+def _fmt_dur(sec) -> str:
+    """Format seconds as m:ss, or LIVE if 0/None."""
+    if not sec:
+        return "LIVE"
+    sec = int(sec)  # yt-dlp sometimes returns float (e.g. 187.5)
+    return f"{sec//60}:{sec%60:02d}"
 
 def _get_vc(interaction: discord.Interaction):
     """Get the bot's voice client for this guild."""
