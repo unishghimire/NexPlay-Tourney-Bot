@@ -289,6 +289,15 @@ async def auto_meme_loop():
     print(f"[NexPlay] auto_meme_loop started — interval={MEME_INTERVAL}s (15 min, ALL servers)", flush=True)
     while not bot.is_closed():
         try:
+            # ── Cleanup stale tournament creation sessions (>10 min old) ──────
+            now = now_ts()
+            stale = [uid for uid, ts in _tourney_session_ts.items() if now - ts > 600]
+            for uid in stale:
+                _tourney_sessions.pop(uid, None)
+                _tourney_session_ts.pop(uid, None)
+            if stale:
+                log(f"[Cleanup] Removed {len(stale)} stale tournament sessions")
+
             for guild in bot.guilds:
                 try:
                     # ── Self-heal: if server isn't in DB, register it first ──────
@@ -438,7 +447,12 @@ async def cmd_announce(
         timestamp=datetime.now(timezone.utc)
     )
     embed.set_footer(text=f"NexPlay Announcement • {interaction.guild.name}")
-    await target.send(embed=embed)
+    try:
+        await target.send(embed=embed)
+    except discord.Forbidden:
+        return await interaction.followup.send(embed=err_e(f"❌ I don't have permission to send messages in {target.mention}."), ephemeral=True)
+    except Exception as e:
+        return await interaction.followup.send(embed=err_e(f"❌ Failed to post announcement: {e}"), ephemeral=True)
     await interaction.followup.send(embed=ok_e("Announced!", f"Posted to {target.mention}"), ephemeral=True)
 
 # ────────────────────────────────────────────────────────────
@@ -452,6 +466,7 @@ async def cmd_announce(
 #  Step data stored in _tourney_sessions[user_id].
 
 _tourney_sessions: dict[int, dict] = {}
+_tourney_session_ts: dict[int, float] = {}  # user_id → creation timestamp (for cleanup)
 
 FMT_LABELS = {"single_elim":"Single Elimination","double_elim":"Double Elimination","round_robin":"Round Robin","battle_royale":"Battle Royale"}
 STAGE_NAMES = ["Group Stage","Quarter Final","Semi Final","Grand Final","Championship"]
@@ -529,6 +544,7 @@ class TournamentStep1Modal(discord.ui.Modal, title="🏆 Create Tournament (1/3)
             "date":        self.t_date.value.strip(),
             "description": self.t_desc.value.strip(),
         }
+        _tourney_session_ts[interaction.user.id] = now_ts()
         embed = discord.Embed(
             title="✅ Step 1 of 3 saved!",
             description=(
@@ -686,6 +702,11 @@ class TournamentStep3Modal(discord.ui.Modal, title="🏆 Create Tournament (3/3)
             "registration_msg_id": reg_msg_id,
         })
         tid = rec.get("id", "")
+        if not tid:
+            return await interaction.followup.send(embed=err_e(
+                "❌ Database error — tournament could not be created. "
+                "Channels were created but the database record failed. "
+                "Contact staff to manually create the record or delete the channels."), ephemeral=True)
 
         # Update server tournament count
         srv = await get_server_record(gid)
@@ -740,7 +761,9 @@ class TournamentEditModal(discord.ui.Modal, title="✏️ Edit Tournament"):
             "rules":             self.t_rules.value.strip(),
             "stream_channel":    self.t_stream.value.strip(),
         }
-        await b44_update("Tournament", t["id"], updates)
+        update_result = await b44_update("Tournament", t["id"], updates)
+        if not update_result or not update_result.get("id"):
+            return await interaction.followup.send(embed=err_e("❌ Database error — tournament could not be updated."), ephemeral=True)
 
         # Refresh #info channel embed
         gid   = str(interaction.guild.id)
@@ -813,7 +836,9 @@ class TournamentEditSlotsModal(discord.ui.Modal, title="✏️ Edit Tournament �
             "rounds":           safe_int(self.t_rounds.value, t.get("rounds", 3)),
             "eligible_nations": self.t_nations.value.strip() or "🇳🇵",
         }
-        await b44_update("Tournament", t["id"], updates)
+        update_result = await b44_update("Tournament", t["id"], updates)
+        if not update_result or not update_result.get("id"):
+            return await interaction.followup.send(embed=err_e("❌ Database error — slots could not be updated."), ephemeral=True)
         await interaction.followup.send(embed=ok_e("Slots Updated!", "Tournament structure updated successfully."), ephemeral=True)
 
 
@@ -835,7 +860,9 @@ class TournamentStatusModal(discord.ui.Modal, title="🔄 Change Tournament Stat
         new_status = self.t_status.value.strip().lower()
         if new_status not in valid:
             return await interaction.followup.send(embed=err_e(f"Invalid status. Choose from: {', '.join(valid)}"), ephemeral=True)
-        await b44_update("Tournament", self.tournament["id"], {"status": new_status})
+        update_result = await b44_update("Tournament", self.tournament["id"], {"status": new_status})
+        if not update_result or not update_result.get("id"):
+            return await interaction.followup.send(embed=err_e("❌ Database error — status could not be updated."), ephemeral=True)
         await interaction.followup.send(embed=ok_e("Status Updated!", f"Tournament status → **{new_status}**"), ephemeral=True)
 
 
@@ -925,6 +952,9 @@ async def b44_create(entity: str, payload: dict) -> dict:
 
 async def b44_update(entity: str, record_id: str, payload: dict) -> dict:
     url = BASE44_API + "/" + entity + "/" + record_id
+    if not SVC_TOKEN:
+        print("[b44_update] ⚠️ SVC_TOKEN is empty! Base44 API calls will fail.", flush=True)
+        return {}
     try:
         async with bot.http_session.put(url, json=payload, headers=_b44_headers()) as r:
             if r.status in (200, 201):
@@ -939,6 +969,9 @@ async def b44_update(entity: str, record_id: str, payload: dict) -> dict:
 
 async def b44_delete(entity: str, record_id: str) -> bool:
     url = BASE44_API + "/" + entity + "/" + record_id
+    if not SVC_TOKEN:
+        print("[b44_delete] ⚠️ SVC_TOKEN is empty! Base44 API calls will fail.", flush=True)
+        return False
     try:
         async with bot.http_session.delete(url, headers=_b44_headers()) as r:
             if r.status in (200, 204):
@@ -1168,6 +1201,8 @@ import urllib.parse
 # ── Per-guild lock: {guild_id: {user_id: support_message_db_id}}
 # Prevents double-replies until staff clears the ticket
 _replied_users: dict[str, dict[str, str]] = {}
+# Cap: if _replied_users grows too large, purge oldest entries
+REPLIED_USERS_MAX = 500  # max tracked user-guild pairs
 
 async def ai_generate(prompt: str) -> str:
     """Try Groq (fast) first, fallback to Pollinations (no key needed)."""
@@ -1361,7 +1396,7 @@ class StaffLogView(discord.ui.View):
     # ── ✅ RESOLVE ────────────────────────────────────────────────────────
     @discord.ui.button(label="✅ Resolve", style=discord.ButtonStyle.success, custom_id="staff_resolve")
     async def btn_resolve(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self._set_status(interaction, "resolved", "✅ RESOLVED", 0x00FF00, True)
+        await self._set_status(interaction, "resolved", "✅ RESOLVED", 0x00FF00, True)
         try:
             await self.user_channel.send(embed=discord.Embed(
                 description=f"Hey {self.user.mention}, your query was resolved! Feel free to ask again. 😊",
@@ -1388,23 +1423,26 @@ class StaffLogView(discord.ui.View):
     # ── 🔔 ESCALATE ───────────────────────────────────────────────────────
     @discord.ui.button(label="🔔 Escalate", style=discord.ButtonStyle.danger, custom_id="staff_escalate")
     async def btn_escalate(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self._set_status(interaction, "escalated", "🚨 ESCALATED", 0xFF6600, False)
+        await self._set_status(interaction, "escalated", "🚨 ESCALATED", 0xFF6600, False)
         await interaction.response.send_message("🚨 Escalated! Staff please review.", ephemeral=True)
 
     # ── 🗑️ DISMISS ────────────────────────────────────────────────────────
     @discord.ui.button(label="🗑️ Dismiss", style=discord.ButtonStyle.secondary, custom_id="staff_dismiss")
     async def btn_dismiss(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self._set_status(interaction, "dismissed", "🗑️ DISMISSED", 0x555555, True)
+        await self._set_status(interaction, "dismissed", "🗑️ DISMISSED", 0x555555, True)
         self.stop()
         await interaction.response.send_message("🗑️ Dismissed & lock cleared.", ephemeral=True)
 
-    def _set_status(self, interaction, status, title, color, clear_lock):
+    async def _set_status(self, interaction, status, title, color, clear_lock):
         """Update DB status, rebuild embed with disabled buttons, optionally clear user lock."""
         self._status = status
         if clear_lock:
             self.guild_locks.pop(self.uid, None)
         if self.rec_id:
-            asyncio.ensure_future(b44_update("SupportMessage", self.rec_id, {"status": status}))
+            try:
+                await b44_update("SupportMessage", self.rec_id, {"status": status})
+            except Exception as e:
+                print(f"[StaffLog] DB update failed for status {status}: {e}", flush=True)
         if not self.message or not self.message.embeds:
             return
         old = self.message.embeds[0]
@@ -1474,15 +1512,7 @@ async def handle_support(message: discord.Message) -> None:
         # Set lock so this user doesn't get spammed with the same message
         guild_locks[uid] = "non_elite"
         return
-    gid = str(message.guild.id)
-    uid = str(message.author.id)
     q   = message.content.strip()
-
-    # ── ONE-REPLY LOCK ─────────────────────────────────────────────────────
-    guild_locks = _replied_users.setdefault(gid, {})
-    if uid in guild_locks:
-        # Already replied — silently ignore until staff clears
-        return
 
     # ── Fetch active tournament ────────────────────────────────────────────
     all_t  = await b44_list('Tournament', {'guild_id': gid})
@@ -1537,7 +1567,9 @@ INSTRUCTIONS:
         'message':    q,
         'status':     'pending' if needs_staff else 'ai_resolved',
     })
-    rec_id = support_rec.get('id', '')
+    rec_id = support_rec.get('id', '') if support_rec else ''
+    if not rec_id:
+        log(f"[Support] ⚠️ Failed to create SupportMessage record for {message.author} in {message.guild.name}")
 
     # ── Lock this user from getting another reply ─────────────────────────
     guild_locks[uid] = rec_id
@@ -1683,22 +1715,31 @@ async def handle_registration(message: discord.Message, gid: str, short: str, to
         await _reject_msg(message, "❌ Player Already Registered", f"{', '.join(already)} is already on another team!")
         return
 
-    # Slots full?
+    # Slots full? (re-check count to mitigate race condition)
     max_p = int(tournament.get("max_players", 16))
-    slot = len(existing_regs) + 1
+    # Use the tournament's registered_count as the authoritative count
+    # rather than len(existing_regs) which may be stale
+    current_count = max(int(tournament.get("registered_count", 0)), len(existing_regs))
+    slot = current_count + 1
     if slot > max_p:
         await message.add_reaction("❌")
         await message.reply(embed=discord.Embed(title="🔒 Registration Full",
             description=f"All {max_p} slots are taken.", color=0xFF4444))
         return
 
-    # Save registration
-    await b44_create("Registration", {
+    # Save registration — verify DB write succeeded (NO FAKE SUCCESS)
+    reg_rec = await b44_create("Registration", {
         "tournament_id": tournament["id"], "guild_id": gid,
         "player_name": team_name, "player_discord_id": str(message.author.id),
         "team_members": players, "status": "registered", "logo_url": "",
     })
-    await b44_update("Tournament", tournament["id"], {"registered_count": slot})
+    if not reg_rec or not reg_rec.get("id"):
+        await _reject_msg(message, "❌ Registration Failed",
+            "Database error — could not save your registration. Please try again or contact staff.")
+        return
+    update_ok = await b44_update("Tournament", tournament["id"], {"registered_count": slot})
+    if not update_ok:
+        log(f"[Reg] Failed to update tournament count for {tournament.get('name','?')}")
     await message.add_reaction("✅")
 
     # Post confirmation to #<short>-confirm-teams
@@ -1722,7 +1763,9 @@ async def handle_registration(message: discord.Message, gid: str, short: str, to
     updated_t = dict(tournament); updated_t["registered_count"] = slot
     await update_reg_announcement(updated_t, message.guild, slot)
     if slot >= max_p:
-        await b44_update("Tournament", tournament["id"], {"status": "registration_closed"})
+        close_ok = await b44_update("Tournament", tournament["id"], {"status": "registration_closed"})
+        if not close_ok:
+            log(f"[Reg] ⚠️ Failed to set registration_closed for {tournament.get('name','?')} — channel will still be locked")
         await lock_register_channel(message.guild, message.channel)
         await message.channel.send(embed=discord.Embed(
             title=f"🔒 REGISTRATION CLOSED — {tournament.get('name', '')}",
@@ -1872,7 +1915,10 @@ async def cmd_setup(interaction: discord.Interaction):
             if created and created.get("id"):
                 status_msg = "✅ Server registered! You have a **Free Trial** with 3 tournaments.\nRun `/setup` again to refresh channels."
             else:
-                status_msg = "⚠️ Failed to register server in the database. Check bot logs for the error.\n**Try:** Re-invite the bot to your server, or contact NexPlay support."
+                return await interaction.followup.send(embed=err_e(
+                    "⚠️ Failed to register server in the database.\n"
+                    "**Try:** Re-invite the bot to your server, or contact NexPlay support.\n"
+                    "Check that BASE44_SERVICE_TOKEN is configured."), ephemeral=True)
     elif existing.get("subscription_status") == "inactive":
         # Server was previously removed — reactivate, preserving plan + tournament history
         await b44_update("Server", existing["id"], {
@@ -2202,10 +2248,15 @@ async def cmd_groups(interaction: discord.Interaction, tournament: str):
 
     # ── Delete existing groups before regenerating (prevent duplicates) ──
     existing_groups = await b44_list("TournamentGroup", {"tournament_id": t["id"]})
+    del_ok, del_fail = 0, 0
     for eg in existing_groups:
-        await b44_delete("TournamentGroup", eg.get("id", ""))
+        if await b44_delete("TournamentGroup", eg.get("id", "")):
+            del_ok += 1
+        else:
+            del_fail += 1
     if existing_groups:
-        log(f"[Groups] Cleared {len(existing_groups)} old groups for {t.get('name','?')}")
+        log(f"[Groups] Cleared {del_ok} old groups for {t.get('name','?')}" +
+            (f" ({del_fail} failed to delete)" if del_fail else ""))
 
     group_size = int(t.get("group_size", 4))
     teams = list(regs)
@@ -2224,26 +2275,37 @@ async def cmd_groups(interaction: discord.Interaction, tournament: str):
         player_names = [r.get("player_name", "?") for r in group]
         player_ids = [r.get("player_discord_id", "") for r in group]
         desc += f"**🏆 Group {label}**\n" + "\n".join(f"{i+1}. {n}" for i, n in enumerate(player_names)) + "\n\n"
-        # Save group to DB
-        await b44_create("TournamentGroup", {
+        # Save group to DB — verify success
+        group_rec = await b44_create("TournamentGroup", {
             "tournament_id": t["id"], "guild_id": gid,
             "group_label": label,
             "player_ids": player_ids,
             "player_names": player_names,
             "generated_at": now_iso(),
         })
+        if not group_rec or not group_rec.get("id"):
+            log(f"[Groups] ⚠️ Failed to create TournamentGroup {label} for {t.get('name','?')}")
         # Update registration records with group label + sequential seed
         for idx, r in enumerate(group):
-            await b44_update("Registration", r["id"], {"group_label": label, "seed_number": gi * group_size + idx + 1})
+            upd_ok = await b44_update("Registration", r["id"], {"group_label": label, "seed_number": gi * group_size + idx + 1})
+            if not upd_ok:
+                log(f"[Groups] ⚠️ Failed to update registration {r.get('player_name','?')} with group {label}")
 
-    # Update tournament status
-    await b44_update("Tournament", t["id"], {"status": "groups_generated"})
+    # Update tournament status — verify it took
+    status_ok = await b44_update("Tournament", t["id"], {"status": "groups_generated"})
+    if not status_ok:
+        log(f"[Groups] ⚠️ Failed to set tournament status to groups_generated for {t.get('name','?')}")
 
     e = discord.Embed(title=f"🎯 Group Draw — {t['name']}", description=desc, color=0x5865F2, timestamp=datetime.now(timezone.utc))
     e.set_footer(text="NexPlay | Groups Generated")
     await interaction.followup.send(embed=ok_e("Groups Generated!", f"{len(groups)} groups created for **{t['name']}**. Check #{short}-groups."))
     if groups_ch:
-        await groups_ch.send(embed=e)
+        try:
+            await groups_ch.send(embed=e)
+        except discord.Forbidden:
+            log(f"[Groups] ⚠️ No permission to post in #{short}-groups in {interaction.guild.name}")
+        except Exception as ex:
+            log(f"[Groups] ⚠️ Failed to post groups embed: {ex}")
 
 
 @tree.command(name="results", description="🏅 Post match results for a tournament")
@@ -2287,7 +2349,7 @@ async def cmd_results(interaction: discord.Interaction, tournament: str, match_i
             p2_id = next((r.get("player_discord_id", "") for r in regs if r.get("player_name", "").lower() == p2_name.lower()), "")
             winner_id = p1_id if s1 > s2 else p2_id if s2 > s1 else ""
 
-            await b44_create("Match", {
+            match_rec = await b44_create("Match", {
                 "tournament_id": t["id"], "guild_id": gid,
                 "round_number": 0, "match_number": 0,
                 "group_label": group_match.group(1) if group_match else "",
@@ -2301,7 +2363,7 @@ async def cmd_results(interaction: discord.Interaction, tournament: str, match_i
     except Exception as ex:
         log(f"[Results] Could not parse/save match: {ex}")
 
-    await interaction.followup.send(embed=ok_e("Result Posted!", f"Match result posted to #{short}-results and saved to database."), ephemeral=True)
+    await interaction.followup.send(embed=ok_e("Result Posted!", f"Match result posted to #{short}-results." + (" Match saved to database." if 'match_rec' in dir() and match_rec and match_rec.get('id') else " Match NOT saved — parse failed or DB error.")), ephemeral=True)
 
 
 @tree.command(name="export_csv", description="📊 Export tournament registrations as CSV")
@@ -2387,7 +2449,14 @@ async def cmd_schedule_post(interaction: discord.Interaction, tournament: str):
     # Post to roadmap channel
     road_ch = discord.utils.get(interaction.guild.text_channels, name=f"{short}-roadmap")
     if road_ch:
-        await road_ch.send(embed=e)
+        try:
+            await road_ch.send(embed=e)
+        except discord.Forbidden:
+            return await interaction.followup.send(embed=err_e(f"❌ No permission to post in #{short}-roadmap."), ephemeral=True)
+        except Exception as ex:
+            return await interaction.followup.send(embed=err_e(f"❌ Failed to post schedule: {ex}"), ephemeral=True)
+    else:
+        return await interaction.followup.send(embed=err_e(f"#{short}-roadmap channel not found."), ephemeral=True)
 
     # Generate schedule GFX (Pro+)
     can_gfx, _ = await check_feature(gid, "ai_gfx_schedule")
@@ -2430,7 +2499,12 @@ async def cmd_roadmap_post(interaction: discord.Interaction, tournament: str):
     if can_gfx:
         e.set_image(url=img_url(t["name"], t.get("game",""), "roadmap"))
 
-    await road_ch.send(embed=e)
+    try:
+        await road_ch.send(embed=e)
+    except discord.Forbidden:
+        return await interaction.followup.send(embed=err_e(f"❌ No permission to post in #{short}-roadmap."), ephemeral=True)
+    except Exception as ex:
+        return await interaction.followup.send(embed=err_e(f"❌ Failed to post roadmap: {ex}"), ephemeral=True)
     await interaction.followup.send(embed=ok_e("Roadmap Posted!", f"Roadmap posted to #{short}-roadmap."))
 
 
@@ -2482,7 +2556,12 @@ async def cmd_standings_post(interaction: discord.Interaction, tournament: str):
     e.set_footer(text="NexPlay Standings")
     results_ch = discord.utils.get(interaction.guild.text_channels, name=f"{short}-results")
     if results_ch:
-        await results_ch.send(embed=e)
+        try:
+            await results_ch.send(embed=e)
+        except discord.Forbidden:
+            return await interaction.followup.send(embed=err_e(f"❌ No permission to post in #{short}-results."), ephemeral=True)
+        except Exception as ex:
+            return await interaction.followup.send(embed=err_e(f"❌ Failed to post standings: {ex}"), ephemeral=True)
     await interaction.followup.send(embed=ok_e("Standings Posted!", f"Standings posted to #{short}-results."))
 
 
@@ -2915,7 +2994,7 @@ async def _extract_audio(query: str) -> dict:
                 info = info["entries"][0]
             return info
 
-    info = await loop.run_in_executor(None, extract)
+    info = await asyncio.wait_for(loop.run_in_executor(None, extract), timeout=30)
 
     # Get the best audio-only stream URL — prefer audio-only formats
     audio_url = info.get("url", "")
@@ -3455,14 +3534,17 @@ async def on_guild_join(guild: discord.Guild):
     existing = await b44_list("Server", {"guild_id": gid})
     if not existing:
         # Brand new server — register as Free Trial
-        await register_server(guild)
-        print(f"[NexPlay] ✅ Registered {guild.name} as Free Trial (3 tournaments)", flush=True)
+        created = await register_server(guild)
+        if created and created.get("id"):
+            print(f"[NexPlay] ✅ Registered {guild.name} as Free Trial (3 tournaments)", flush=True)
+        else:
+            print(f"[NexPlay] ❌ Failed to register {guild.name} in DB!", flush=True)
     else:
         srv = existing[0]
         status = srv.get("subscription_status", "trial")
         if status == "inactive":
             # Server was previously removed — reactivate it, preserving plan + data
-            await b44_update("Server", srv["id"], {
+            react_ok = await b44_update("Server", srv["id"], {
                 "subscription_status": "trial" if srv.get("plan_name", "Free Trial") == "Free Trial" else "active",
                 "guild_name": guild.name,  # Update name in case it changed
                 "owner_id": str(guild.owner.id) if guild.owner else srv.get("owner_id", ""),
@@ -3470,6 +3552,8 @@ async def on_guild_join(guild: discord.Guild):
                 "member_count": guild.member_count or 0,
                 "last_active": now_iso(),
             })
+            if not react_ok:
+                print(f"[NexPlay] ⚠️ Failed to reactivate {guild.name} in DB!", flush=True)
             plan = srv.get("plan_name", "Free Trial")
             t_used = srv.get("tournaments_used", 0)
             print(f"[NexPlay] ♻️ Reactivated {guild.name} — Plan: {plan}, Tournaments used: {t_used}", flush=True)
@@ -3508,11 +3592,14 @@ async def on_guild_remove(guild: discord.Guild):
     print(f"[NexPlay] ❌ Removed from: {guild.name} ({guild.id})", flush=True)
     srv = await get_server_record(str(guild.id))
     if srv:
-        await b44_update("Server", srv["id"], {
+        ok = await b44_update("Server", srv["id"], {
             "subscription_status": "inactive",
             "last_active": now_iso(),
         })
-        print(f"[NexPlay] Marked {guild.name} as inactive (data preserved)", flush=True)
+        if ok:
+            print(f"[NexPlay] Marked {guild.name} as inactive (data preserved)", flush=True)
+        else:
+            print(f"[NexPlay] ⚠️ Failed to mark {guild.name} as inactive in DB!", flush=True)
     # Clean up meme cache + 24/7 state
     _last_meme_url.pop(guild.id, None)
     _meme_channel_cache.pop(guild.id, None)
@@ -3529,5 +3616,12 @@ async def on_member_remove(member: discord.Member):
     """Update member count when someone leaves."""
     await _update_member_count(member.guild)
 
+
+if not BOT_TOKEN:
+    print("[NexPlay] ❌ FATAL: DISCORD_BOT_TOKEN is not set! Bot cannot start.", flush=True)
+    raise SystemExit(1)
+
+if not SVC_TOKEN:
+    print("[NexPlay] ⚠️ WARNING: BASE44_SERVICE_TOKEN is not set! DB operations will fail.", flush=True)
 
 bot.run(BOT_TOKEN)
