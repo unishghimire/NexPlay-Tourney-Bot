@@ -3016,15 +3016,33 @@ def _user_in_same_vc(interaction: discord.Interaction) -> bool:
 
 # yt-dlp options — robust audio extraction with anti-throttling
 # ── Cookie support for YouTube bot detection workaround ─────────────
-# YouTube blocks datacenter IPs. To fix, set YOUTUBE_COOKIES_FILE env var
-# to the path of a Netscape-format cookies.txt file exported from a browser.
+# YouTube blocks datacenter IPs. To fix, either:
+# 1. Set YOUTUBE_COOKIES_FILE to the path of a Netscape cookies.txt file, OR
+# 2. Set YOUTUBE_COOKIES_B64 to a base64-encoded cookies.txt content (best for Railway)
 # See: https://github.com/yt-dlp/yt-dlp/wiki/Extractors#exporting-youtube-cookies
+import base64 as _b64
+
 _COOKIE_FILE = os.environ.get("YOUTUBE_COOKIES_FILE", "")
-if _COOKIE_FILE and os.path.exists(_COOKIE_FILE):
+_COOKIES_B64 = os.environ.get("YOUTUBE_COOKIES_B64", "")
+
+if _COOKIES_B64:
+    # Decode base64 cookies and write to temp file
+    try:
+        cookies_content = _b64.b64decode(_COOKIES_B64).decode("utf-8")
+        _cookie_path = "/tmp/yt_cookies.txt"
+        with open(_cookie_path, "w") as f:
+            f.write(cookies_content)
+        _COOKIE_FILE = _cookie_path
+        print(f"[Music] ✅ YouTube cookies decoded from YOUTUBE_COOKIES_B64 ({len(cookies_content)} bytes)", flush=True)
+    except Exception as e:
+        print(f"[Music] ❌ Failed to decode YOUTUBE_COOKIES_B64: {e}", flush=True)
+        _COOKIE_FILE = ""
+elif _COOKIE_FILE and os.path.exists(_COOKIE_FILE):
     print(f"[Music] ✅ YouTube cookies file found: {_COOKIE_FILE}", flush=True)
 else:
     _COOKIE_FILE = ""
-    print("[Music] ⚠️ No YouTube cookies file — some videos may be blocked by bot detection.", flush=True)
+    print("[Music] ⚠️ No YouTube cookies — some videos may be blocked by bot detection.", flush=True)
+    print("[Music] ⚠️ To fix: Set YOUTUBE_COOKIES_B64 env var with base64-encoded cookies.txt content.", flush=True)
 
 _YDL_OPTS = {
     "format": "bestaudio[ext=webm][acodec=opus]/bestaudio[ext=m4a]/bestaudio/best",
