@@ -33,7 +33,7 @@ HOME_GUILD  = int(os.environ.get("DISCORD_GUILD_ID", "0"))   # owner's server on
 BOT_API_KEY = os.environ.get("BOT_API_KEY", "nexplay-bot-2026").strip()
 APP_ID      = os.environ.get("APP_ID", "6a5226b5047f5c59d961130e")
 
-BOT_API_URL = os.environ.get("BOT_API_URL", f"https://{APP_ID}.base44.app/functions/botApi")
+BOT_API_URL = os.environ.get("BOT_API_URL", f"https://{APP_ID}.base44.app/api/apps/{APP_ID}/functions/botApi")
 DISCORD_API = "https://discord.com/api/v10"
 
 # ── NexPlay Brand Identity (phoenix/eagle logo — deep blue→purple gradient) ──
