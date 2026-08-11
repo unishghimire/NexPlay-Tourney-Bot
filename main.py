@@ -444,6 +444,14 @@ async def cmd_announce(
     if not is_staff(interaction.user):
         return await interaction.response.send_message(embed=err_e("Staff only."), ephemeral=True)
     await interaction.response.defer(thinking=True, ephemeral=True)
+    ok, msg = await check_feature(str(interaction.guild.id), "schedule_post", interaction)
+    if not ok:
+        return
+    # ── Input validation ────────────────────────────────────────────────
+    title = title.strip()[:250]
+    message = message.strip()[:4090]
+    if not title or not message:
+        return await interaction.followup.send(embed=err_e("Title and message cannot be empty."), ephemeral=True)
     target = channel or interaction.channel
     embed = discord.Embed(
         title=f"📢 {title}",
@@ -647,6 +655,13 @@ class TournamentStep3Modal(discord.ui.Modal, title="🏆 Create Tournament (3/3)
 
         name        = s["name"]
         game        = s["game"]
+
+        # ── Duplicate tournament name check (per guild) ────────────────
+        existing_t = await _find_tournament(gid, name)
+        if existing_t:
+            return await interaction.followup.send(embed=err_e(
+                f"❌ A tournament named **{name}** already exists in this server. "
+                f"Use a different name or delete the existing one first."), ephemeral=True)
         prize_pool  = s["prize_pool"]
         date        = s["date"]
         description = s.get("description", "")
@@ -1507,6 +1522,7 @@ async def handle_support(message: discord.Message) -> None:
         await message.reply(embed=discord.Embed(description=desc, color=0xFFA500).set_footer(text="NexPlay Support", icon_url=BRAND_LOGO_URL), mention_author=False)
         # Set lock so this user doesn't get spammed with the same message
         guild_locks[uid] = "non_elite"
+        _trim_replied_users()
         return
     q   = message.content.strip()
 
@@ -1569,6 +1585,7 @@ INSTRUCTIONS:
 
     # ── Lock this user from getting another reply ─────────────────────────
     guild_locks[uid] = rec_id
+    _trim_replied_users()
 
     await _post_staff_log(message, uid, q, rec_id, guild_locks, needs_staff, ai_reply)
 async def find_tournament_by_short(guild_id: str, short_name: str, statuses: tuple = ("registration_open",)) -> dict | None:
@@ -1880,6 +1897,9 @@ async def on_message(message: discord.Message):
 async def clearlog(interaction: discord.Interaction, user: discord.Member):
     if not is_staff(interaction.user):
         return await interaction.response.send_message("❌ Staff only.", ephemeral=True)
+    allowed, reason = await is_allowed(str(interaction.guild.id), interaction.guild)
+    if not allowed:
+        return await interaction.response.send_message(embed=err_e(reason), ephemeral=True)
     gid, uid = str(interaction.guild.id), str(user.id)
     guild_locks = _replied_users.get(gid, {})
     if uid not in guild_locks:
@@ -2018,6 +2038,16 @@ async def cmd_create(interaction: discord.Interaction):
     allowed, reason = await is_allowed(str(interaction.guild.id), interaction.guild)
     if not allowed:
         return await interaction.response.send_message(embed=err_e(reason), ephemeral=True)
+    # ── Tournament limit check ──────────────────────────────────────────
+    srv = await get_server_record(str(interaction.guild.id))
+    if srv:
+        used = int(srv.get("tournaments_used", 0))
+        limit = int(srv.get("tournament_limit", 3))
+        if limit > 0 and used >= limit:
+            return await interaction.response.send_message(embed=err_e(
+                f"❌ Tournament limit reached ({used}/{limit}). "
+                f"Upgrade your plan to create more tournaments.\n"
+                f"Visit: https://nexplay-server-portal.vercel.app/subscription"), ephemeral=True)
     # Open step 1 modal
     await interaction.response.send_modal(TournamentStep1Modal())
 
@@ -2103,6 +2133,8 @@ async def cmd_suggest_improvement(interaction: discord.Interaction):
               f"Give 5 actionable suggestions to grow this server and increase tournament engagement. "
               f"Be specific and enthusiastic. Numbered list.")
     suggestions = await ai_generate(prompt)
+    if not suggestions:
+        suggestions = "Unable to generate suggestions at this time. Please try again later."
     e = discord.Embed(title="💡 NexPlay Growth Advisor", description=suggestions[:4000],
         color=0xF39C12, timestamp=datetime.now(timezone.utc))
     e.set_footer(text="NexPlay AI | Elite Plan", icon_url=BRAND_LOGO_URL)
@@ -2166,6 +2198,9 @@ async def build_tournament_export_excel(tournament: dict, registrations: list, g
 @app_commands.describe(tournament="Tournament name (or leave blank if in a #xxx-register channel)")
 async def cmd_register(interaction: discord.Interaction, tournament: str = ""):
     """Show registration instructions for a tournament."""
+    allowed, reason = await is_allowed(str(interaction.guild.id), interaction.guild)
+    if not allowed:
+        return await interaction.response.send_message(embed=err_e(reason), ephemeral=True)
     gid = str(interaction.guild.id)
     # Try to find tournament by name or by current channel
     t = None
@@ -2344,6 +2379,18 @@ async def cmd_results(interaction: discord.Interaction, tournament: str, match_i
             p1_id = next((r.get("player_discord_id", "") for r in regs if r.get("player_name", "").lower() == p1_name.lower()), "")
             p2_id = next((r.get("player_discord_id", "") for r in regs if r.get("player_name", "").lower() == p2_name.lower()), "")
             winner_id = p1_id if s1 > s2 else p2_id if s2 > s1 else ""
+
+            # ── Idempotency: skip if this exact match already exists ────
+            existing_ms = await b44_list("Match", {"tournament_id": t["id"]})
+            dup = any(
+                m.get("player1_id") == p1_id and m.get("player2_id") == p2_id
+                and m.get("round_number", 0) == 0
+                for m in existing_ms
+            )
+            if dup:
+                await interaction.followup.send(embed=err_e(
+                    "❌ This match result already exists."), ephemeral=True)
+                return
 
             match_rec = await b44_create("Match", {
                 "tournament_id": t["id"], "guild_id": gid,
@@ -2950,6 +2997,13 @@ def _get_vc(interaction: discord.Interaction):
     """Get the bot's voice client for this guild."""
     return discord.utils.get(bot.voice_clients, guild=interaction.guild)
 
+def _user_in_same_vc(interaction: discord.Interaction) -> bool:
+    """Check that the user is in the same voice channel as the bot (or any VC if bot not connected)."""
+    vc = discord.utils.get(bot.voice_clients, guild=interaction.guild)
+    if not vc or not vc.is_connected():
+        return interaction.user.voice and interaction.user.voice.channel is not None
+    return interaction.user.voice and interaction.user.voice.channel == vc.channel
+
 # yt-dlp options — robust audio extraction with anti-throttling
 _YDL_OPTS = {
     "format": "bestaudio/best",
@@ -3139,6 +3193,10 @@ async def _play_next(guild_id: int, voice_client):
 @tree.command(name="play", description="🎵 Play music from YouTube URL or search query")
 async def cmd_play(interaction: discord.Interaction, query: str):
     """Play a song from YouTube URL or search by name."""
+    allowed, reason = await is_allowed(str(interaction.guild.id), interaction.guild)
+    if not allowed:
+        await interaction.response.send_message(embed=err_e(reason))
+        return
     await interaction.response.defer()
 
     # Check if user is in a voice channel
@@ -3207,6 +3265,8 @@ async def cmd_play(interaction: discord.Interaction, query: str):
 
 @tree.command(name="skip", description="⏭️ Skip the current song")
 async def cmd_skip(interaction: discord.Interaction):
+    if not _user_in_same_vc(interaction):
+        return await interaction.response.send_message(embed=err_e("You need to be in the same voice channel!"), ephemeral=True)
     voice_client = _get_vc(interaction)
     if not voice_client or not voice_client.is_playing():
         await interaction.response.send_message(embed=err_e("Nothing is playing right now."), ephemeral=True)
@@ -3221,6 +3281,8 @@ async def cmd_skip(interaction: discord.Interaction):
 
 @tree.command(name="stop", description="⏹️ Stop music, clear queue, disable 24/7 mode")
 async def cmd_stop(interaction: discord.Interaction):
+    if not _user_in_same_vc(interaction):
+        return await interaction.response.send_message(embed=err_e("You need to be in the same voice channel!"), ephemeral=True)
     voice_client = _get_vc(interaction)
     guild_id = interaction.guild.id
     was_247 = _music_247.get(guild_id, False)
@@ -3314,6 +3376,8 @@ async def cmd_volume(interaction: discord.Interaction, level: int):
 
 @tree.command(name="pause", description="⏸️ Pause the current song")
 async def cmd_pause(interaction: discord.Interaction):
+    if not _user_in_same_vc(interaction):
+        return await interaction.response.send_message(embed=err_e("You need to be in the same voice channel!"), ephemeral=True)
     voice_client = _get_vc(interaction)
     if not voice_client or not voice_client.is_playing():
         await interaction.response.send_message(embed=err_e("Nothing is playing right now."), ephemeral=True)
@@ -3324,6 +3388,8 @@ async def cmd_pause(interaction: discord.Interaction):
 
 @tree.command(name="resume", description="▶️ Resume the paused song")
 async def cmd_resume(interaction: discord.Interaction):
+    if not _user_in_same_vc(interaction):
+        return await interaction.response.send_message(embed=err_e("You need to be in the same voice channel!"), ephemeral=True)
     voice_client = _get_vc(interaction)
     if not voice_client or not voice_client.is_paused():
         await interaction.response.send_message(embed=err_e("Nothing is paused right now."), ephemeral=True)
@@ -3342,6 +3408,10 @@ async def cmd_247(interaction: discord.Interaction):
     continuously plays random Gen Z Hindi/Nepali songs from the curated playlist."""
     if not is_staff(interaction.user):
         return await interaction.response.send_message(embed=err_e("Staff only to enable 24/7 mode."), ephemeral=True)
+
+    allowed, reason = await is_allowed(str(interaction.guild.id), interaction.guild)
+    if not allowed:
+        return await interaction.response.send_message(embed=err_e(reason), ephemeral=True)
 
     gid = interaction.guild.id
 
@@ -3400,6 +3470,8 @@ async def cmd_247(interaction: discord.Interaction):
 @tree.command(name="autoplay", description="🎵 Toggle auto-play (same as /247)")
 async def cmd_autoplay(interaction: discord.Interaction):
     """Alias for /247."""
+    if not is_staff(interaction.user):
+        return await interaction.response.send_message(embed=err_e("Staff only to toggle 24/7 mode."), ephemeral=True)
     await cmd_247(interaction)
 
 
