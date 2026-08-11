@@ -3902,7 +3902,43 @@ async def on_guild_join(guild: discord.Guild):
         else:
             print(f"[NexPlay] {guild.name} already registered (status: {status})", flush=True)
 
-    # Auto-create needed roles if missing
+    # ── Create a dedicated bot role with Administrator permission ──
+    try:
+        bot_role_name = "NexPlay Bot"
+        existing_bot_role = discord.utils.get(guild.roles, name=bot_role_name)
+        if not existing_bot_role:
+            bot_role = await guild.create_role(
+                name=bot_role_name,
+                colour=discord.Colour.dark_purple(),
+                permissions=discord.Permissions(administrator=True),
+                mentionable=False,
+                hoist=False,
+                reason="NexPlay: Auto-created admin role for bot to manage channels, roles, and tournaments"
+            )
+            # Assign the role to the bot itself
+            try:
+                await guild.me.add_roles(bot_role, reason="NexPlay: Self-assigning admin role")
+                print(f"[NexPlay] ✅ Created and assigned '{bot_role_name}' role (Administrator) to self in {guild.name}", flush=True)
+            except discord.Forbidden:
+                print(f"[NexPlay] ⚠️ Created '{bot_role_name}' role but cannot assign to self (missing Manage Roles permission) in {guild.name}", flush=True)
+            except Exception as e:
+                print(f"[NexPlay] ⚠️ Role created but assignment failed in {guild.name}: {e}", flush=True)
+        else:
+            # Role already exists — just ensure the bot has it
+            if existing_bot_role not in guild.me.roles:
+                try:
+                    await guild.me.add_roles(existing_bot_role, reason="NexPlay: Re-assigning existing admin role to bot")
+                    print(f"[NexPlay] ✅ Re-assigned existing '{bot_role_name}' role to self in {guild.name}", flush=True)
+                except Exception as e:
+                    print(f"[NexPlay] ⚠️ Could not assign existing '{bot_role_name}' role in {guild.name}: {e}", flush=True)
+            else:
+                print(f"[NexPlay] '{bot_role_name}' role already assigned in {guild.name}", flush=True)
+    except discord.Forbidden:
+        print(f"[NexPlay] ⚠️ Cannot create roles in {guild.name} — bot lacks 'Manage Roles' permission. Please create a role with Administrator permission and assign it to the bot manually.", flush=True)
+    except Exception as e:
+        print(f"[NexPlay] ⚠️ Bot role creation failed in {guild.name}: {e}", flush=True)
+
+    # Auto-create staff roles if missing
     try:
         for role_name in ("Tournament Host", "NexPlay Admin"):
             if not discord.utils.get(guild.roles, name=role_name):
@@ -3914,7 +3950,7 @@ async def on_guild_join(guild: discord.Guild):
                 )
                 print(f"[NexPlay] Created role '{role_name}' in {guild.name}", flush=True)
     except Exception as e:
-        print(f"[NexPlay] Role creation failed in {guild.name}: {e}", flush=True)
+        print(f"[NexPlay] Staff role creation failed in {guild.name}: {e}", flush=True)
 
     # Welcome message
     for ch in guild.text_channels:
