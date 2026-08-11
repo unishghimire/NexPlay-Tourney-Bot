@@ -1,6 +1,8 @@
 # Nixpacks config for Railway — installs ffmpeg (required for music playback)
+# Note: "opus" is a Nix package, not an apt package. Nixpacks already installs
+# it via the nix setup phase. Only apt-compatible names go in aptPkgs.
 [phases.setup]
-aptPkgs = ["ffmpeg", "opus", "libopus-dev"]
+aptPkgs = ["ffmpeg", "libopus-dev"]
 
 [variables]
 PYTHON_VERSION = "3.11.9"
