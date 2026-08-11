@@ -3073,60 +3073,128 @@ FFMPEG_OPTS = {
 }
 
 
+# ── Invidious instances (YouTube proxy — bypasses bot detection) ──────────
+_INVIDIOUS_INSTANCES = [
+    "https://invidious.fdn.fr",
+    "https://inv.nadeko.net",
+    "https://yewtu.be",
+    "https://invidious.nerdvpn.de",
+]
+
+def _youtube_to_invidious(url: str) -> str:
+    """Convert a YouTube URL to an Invidious proxy URL."""
+    import re
+    # Extract video ID from various YouTube URL formats
+    match = re.search(r'(?:youtube\.com/watch\?v=|youtu\.be/|youtube\.com/embed/)([\w-]{11})', url)
+    if match:
+        vid_id = match.group(1)
+        return f"{_INVIDIOUS_INSTANCES[0]}/watch?v={vid_id}"
+    return url
+
+
 async def _extract_audio(query: str) -> dict:
-    """Extract audio info from YouTube URL or search query.
-    Returns dict with title, url, duration, uploader, thumbnail, webpage_url.
-    Handles YouTube throttling, expired URLs, and bot detection.
-    Retries with alternative player clients if the default client is blocked."""
+    """Extract audio info from a search query or URL.
+    Multi-source fallback strategy:
+      1. If YouTube URL → use Invidious proxy (bypasses bot detection)
+      2. If SoundCloud/direct URL → use directly
+      3. If search term → search SoundCloud first, then YouTube via Invidious
+    Returns dict with title, url, duration, uploader, thumbnail, webpage_url."""
     loop = asyncio.get_event_loop()
     print(f"[Music] Extracting audio for: {query[:80]}", flush=True)
 
-    # Try different player clients — YouTube blocks some, others work
-    client_variants = [
-        {},
-        {"extractor_args": {"youtube": {"player_client": ["android"]}}},
-        {"extractor_args": {"youtube": {"player_client": ["ios"]}}},
-        {"extractor_args": {"youtube": {"player_client": ["tv_simply"]}}},
-        {"extractor_args": {"youtube": {"player_client": ["web_embedded"]}}},
-    ]
+    is_url = query.startswith(("http://", "https://"))
+    is_yt_url = is_url and ("youtube.com" in query or "youtu.be" in query)
+    is_sc_url = is_url and "soundcloud.com" in query
 
-    last_error = None
-    for i, extra_opts in enumerate(client_variants):
-        opts = {**_YDL_OPTS, **extra_opts}
+    # ── Strategy 1: YouTube URL → Invidious proxy ───────────────────
+    if is_yt_url:
+        for instance in _INVIDIOUS_INSTANCES:
+            invidious_url = _youtube_to_invidious(query) if "invidious" not in query else query
+            if "invidious" not in invidious_url:
+                invidious_url = f"{instance}/watch?v={query.split('v=')[-1].split('&')[0] if 'v=' in query else query.split('/')[-1]}"
+            try:
+                def _extract_yt():
+                    with yt_dlp.YoutubeDL({**_YDL_OPTS, "format": "bestaudio/best"}) as ydl:
+                        return ydl.extract_info(invidious_url, download=False)
+                info = await asyncio.wait_for(loop.run_in_executor(None, _extract_yt), timeout=20)
+                print(f"[Music] ✅ Extracted via Invidious ({instance.split('//')[1]})", flush=True)
+                return info
+            except Exception as e:
+                print(f"[Music] Invidious {instance} failed: {str(e)[:80]}", flush=True)
+                continue
+        # If all Invidious instances fail, try direct YouTube (might work with cookies)
+        try:
+            def _extract_yt_direct():
+                with yt_dlp.YoutubeDL(_YDL_OPTS) as ydl:
+                    return ydl.extract_info(query, download=False)
+            return await asyncio.wait_for(loop.run_in_executor(None, _extract_yt_direct), timeout=20)
+        except Exception as e:
+            raise RuntimeError(f"All Invidious instances failed and direct YouTube extraction blocked: {str(e)[:100]}")
 
-        def extract():
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(query, download=False)
+    # ── Strategy 2: SoundCloud URL → direct extraction ──────────────
+    if is_sc_url:
+        try:
+            def _extract_sc():
+                with yt_dlp.YoutubeDL({**_YDL_OPTS, "format": "bestaudio/best"}) as ydl:
+                    return ydl.extract_info(query, download=False)
+            info = await asyncio.wait_for(loop.run_in_executor(None, _extract_sc), timeout=20)
+            print(f"[Music] ✅ Extracted via SoundCloud", flush=True)
+            return info
+        except Exception as e:
+            raise RuntimeError(f"SoundCloud extraction failed: {str(e)[:100]}")
+
+    # ── Strategy 3: Direct URL → try directly ────────────────────────
+    if is_url:
+        try:
+            def _extract_direct():
+                with yt_dlp.YoutubeDL({**_YDL_OPTS, "format": "bestaudio/best"}) as ydl:
+                    return ydl.extract_info(query, download=False)
+            info = await asyncio.wait_for(loop.run_in_executor(None, _extract_direct), timeout=20)
+            print(f"[Music] ✅ Extracted via direct URL", flush=True)
+            return info
+        except Exception as e:
+            raise RuntimeError(f"Direct URL extraction failed: {str(e)[:100]}")
+
+    # ── Strategy 4: Search term → SoundCloud search ──────────────────
+    try:
+        sc_opts = {**_YDL_OPTS, "format": "bestaudio/best", "default_search": "scsearch"}
+        def _extract_sc_search():
+            with yt_dlp.YoutubeDL(sc_opts) as ydl:
+                info = ydl.extract_info(f"scsearch1:{query}", download=False)
                 if "entries" in info:
                     info = info["entries"][0]
                 return info
+        info = await asyncio.wait_for(loop.run_in_executor(None, _extract_sc_search), timeout=25)
+        print(f"[Music] ✅ Found on SoundCloud: {info.get('title', '')[:50]}", flush=True)
+        return info
+    except Exception as sc_err:
+        print(f"[Music] SoundCloud search failed: {str(sc_err)[:80]}", flush=True)
 
+    # ── Strategy 5: Fallback → YouTube search via Invidious API ──────
+    for instance in _INVIDIOUS_INSTANCES:
         try:
-            info = await asyncio.wait_for(loop.run_in_executor(None, extract), timeout=30)
-            if i > 0:
-                print(f"[Music] ✅ Extraction succeeded with client variant {i}", flush=True)
-            return info  # Success — return immediately
-        except asyncio.TimeoutError:
-            print(f"[Music] ⏱️ Extraction timed out (variant {i}) for: {query[:80]}", flush=True)
-            last_error = RuntimeError("Audio extraction timed out (30s). YouTube may be slow or rate-limiting.")
+            import requests as _req
+            def _search_invidious():
+                r = _req.get(f"{instance}/api/v1/search",
+                            params={"q": query, "type": "video"},
+                            timeout=10)
+                if r.status_code == 200:
+                    results = r.json()
+                    if results:
+                        vid_id = results[0].get("videoId", "")
+                        if vid_id:
+                            with yt_dlp.YoutubeDL({**_YDL_OPTS, "format": "bestaudio/best"}) as ydl:
+                                return ydl.extract_info(f"{instance}/watch?v={vid_id}", download=False)
+                return None
+            info = await asyncio.wait_for(loop.run_in_executor(None, _search_invidious), timeout=20)
+            if info and info.get("url", "").startswith("http"):
+                print(f"[Music] ✅ Found via Invidious search ({instance.split('//')[1]})", flush=True)
+                return info
         except Exception as e:
-            err_str = str(e)
-            print(f"[Music] ❌ Extraction failed (variant {i}) for {query[:80]}: {type(e).__name__}: {err_str[:120]}", flush=True)
-            if "Sign in to confirm" in err_str:
-                last_error = RuntimeError(
-                    "YouTube is blocking this server's IP (bot detection). "
-                    "Set YOUTUBE_COOKIES_FILE env var with a cookies.txt file to fix this. "
-                    "See: https://github.com/yt-dlp/yt-dlp/wiki/Extractors#exporting-youtube-cookies"
-                )
-                continue  # Try next client variant
-            elif "429" in err_str or "Too Many Requests" in err_str:
-                last_error = RuntimeError("YouTube rate limit exceeded. Please wait a few minutes and try again.")
-                break  # No point trying other clients if rate limited
-            else:
-                last_error = e
-                continue  # Try next variant
+            print(f"[Music] Invidious search {instance} failed: {str(e)[:80]}", flush=True)
+            continue
 
-    raise last_error if last_error else RuntimeError("Audio extraction failed for unknown reason.")
+    raise RuntimeError("Could not find this song on SoundCloud or YouTube. Try a different search term or paste a direct URL.")
 
     # Get the best audio-only stream URL — prefer audio-only formats
     audio_url = info.get("url", "")
@@ -3377,12 +3445,12 @@ async def cmd_play(interaction: discord.Interaction, query: str):
         err_msg = str(e)
         if "bot detection" in err_msg:
             await interaction.followup.send(embed=err_e(
-                "❌ YouTube is blocking this server (bot detection).\n"
-                "To fix: Unish needs to upload a YouTube cookies file.\n"
-                "See: https://github.com/yt-dlp/yt-dlp/wiki/Extractors#exporting-youtube-cookies"
+                "❌ Could not find this song on SoundCloud or YouTube.\n"
+                "Try a different search term, or paste a direct YouTube/SoundCloud URL.\n"
+                "If the issue persists, contact the bot owner."
             ))
         elif "rate limit" in err_msg:
-            await interaction.followup.send(embed=err_e("⏱️ YouTube rate limit hit. Please wait a few minutes and try again."))
+            await interaction.followup.send(embed=err_e("⏱️ Rate limit hit. Please wait a few minutes and try again."))
         else:
             await interaction.followup.send(embed=err_e(f"Could not find song: {err_msg}"))
         return
