@@ -3761,10 +3761,14 @@ async def cmd_nowplaying(interaction: discord.Interaction):
     await interaction.response.send_message(embed=e)
 
 
+# Track reconnect failures separately from playback failures
+_247_reconnect_fails = {}  # guild_id → consecutive reconnect failure count
+MAX_RECONNECT_ATTEMPTS = 3  # After this many fails, disable 24/7 for the guild
+
 async def _247_health_check():
     """Background task: every 90s, check guilds with 24/7 enabled.
     If bot disconnected from VC, reconnect and resume auto-play.
-    Uses backoff to prevent aggressive reconnect loops."""
+    Disables 24/7 after MAX_RECONNECT_ATTEMPTS consecutive failures to prevent loops."""
     await bot.wait_until_ready()
     print("[NexPlay] 24/7 health check started (90s interval).", flush=True)
     while not bot.is_closed():
@@ -3773,8 +3777,15 @@ async def _247_health_check():
                 gid = guild.id
                 if not _music_247.get(gid, False):
                     continue
-                # Skip if too many recent failures — _play_next already disabled 24/7
+                # Skip if too many playback failures
                 if _music_fail_counts.get(gid, 0) >= MAX_PLAYBACK_RETRIES:
+                    continue
+                # Skip if too many reconnect failures — disable 24/7
+                if _247_reconnect_fails.get(gid, 0) >= MAX_RECONNECT_ATTEMPTS:
+                    if _music_247.get(gid, False):
+                        _music_247[gid] = False
+                        _247_reconnect_fails[gid] = 0
+                        print(f"[NexPlay/247] ❌ Disabled 24/7 in {guild.name} — {MAX_RECONNECT_ATTEMPTS} consecutive reconnect failures.", flush=True)
                     continue
                 vc = discord.utils.get(bot.voice_clients, guild=guild)
                 ch_id = _247_channel.get(gid)
@@ -3785,15 +3796,17 @@ async def _247_health_check():
                         ch = discord.utils.find(lambda c: c.permissions_for(guild.me).connect, guild.voice_channels)
                     if ch:
                         try:
-                            vc = await ch.connect(timeout=20, reconnect=True)
+                            vc = await ch.connect(timeout=20, reconnect=True, self_deaf=True)
                             _247_channel[gid] = ch.id
-                            _music_fail_counts[gid] = 0  # Reset on successful connect
-                            print(f"[NexPlay/247] Reconnected to {ch.name} in {guild.name}", flush=True)
+                            _music_fail_counts[gid] = 0
+                            _247_reconnect_fails[gid] = 0  # Reset on successful connect
+                            print(f"[NexPlay/247] ✅ Reconnected to {ch.name} in {guild.name}", flush=True)
                             if not vc.is_playing() and not vc.is_paused():
                                 await _play_next(gid, vc)
                         except Exception as e:
-                            print(f"[NexPlay/247] Reconnect failed in {guild.name}: {e}", flush=True)
-                            _music_fail_counts[gid] = _music_fail_counts.get(gid, 0) + 1
+                            fails = _247_reconnect_fails.get(gid, 0) + 1
+                            _247_reconnect_fails[gid] = fails
+                            print(f"[NexPlay/247] Reconnect failed ({fails}/{MAX_RECONNECT_ATTEMPTS}) in {guild.name}: {e}", flush=True)
                 # Connected but nothing playing → resume auto-play
                 elif vc.is_connected() and not vc.is_playing() and not vc.is_paused():
                     if len(_music_queues.get(gid, deque())) == 0:
@@ -3815,9 +3828,16 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
     if before.channel and not after.channel:
         print(f"[Music] Bot disconnected from voice in {member.guild.name}", flush=True)
         _music_now.pop(gid, None)
-        _music_queues[gid] = deque()
-        _music_fail_counts[gid] = 0
-        # Don't disable 24/7 — health check will reconnect
+        # Only clear queue and reset if 24/7 is NOT active
+        # (if 24/7 is active, the health check will handle reconnection)
+        if not _music_247.get(gid, False):
+            _music_queues[gid] = deque()
+            _music_fail_counts[gid] = 0
+        else:
+            # Track this as a reconnect failure so health check knows
+            fails = _247_reconnect_fails.get(gid, 0) + 1
+            _247_reconnect_fails[gid] = fails
+            print(f"[Music] 24/7 active — reconnect failure {fails}/{MAX_RECONNECT_ATTEMPTS}", flush=True)
 
     # Bot connected to a new channel
     elif not before.channel and after.channel:
