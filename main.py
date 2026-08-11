@@ -10,6 +10,8 @@ import discord
 from discord.ext import commands
 from discord import app_commands
 import aiohttp
+import shutil
+import tempfile
 import os
 import asyncio
 import io
@@ -179,6 +181,14 @@ class NexPlayBot(commands.Bot):
         self.http_session = aiohttp.ClientSession(timeout=HTTP_TIMEOUT)
         await self.tree.sync()
         print("[NexPlay] Global slash commands synced.")
+        # ── FFmpeg + yt-dlp diagnostic checks ──────────────────────────
+        _ffmpeg_path = shutil.which("ffmpeg")
+        if _ffmpeg_path:
+            print(f"[Music] ✅ FFmpeg found: {_ffmpeg_path}", flush=True)
+        else:
+            print("[Music] ❌ CRITICAL: FFmpeg NOT found in PATH — music will fail!", flush=True)
+        print(f"[Music] yt-dlp version: {yt_dlp.version.__version__}", flush=True)
+        print(f"[Music] discord.py version: {discord.__version__}", flush=True)
         asyncio.create_task(self._daily_log_scheduler())
         asyncio.create_task(auto_meme_loop())
         asyncio.create_task(_247_health_check())
@@ -3005,8 +3015,19 @@ def _user_in_same_vc(interaction: discord.Interaction) -> bool:
     return interaction.user.voice and interaction.user.voice.channel == vc.channel
 
 # yt-dlp options — robust audio extraction with anti-throttling
+# ── Cookie support for YouTube bot detection workaround ─────────────
+# YouTube blocks datacenter IPs. To fix, set YOUTUBE_COOKIES_FILE env var
+# to the path of a Netscape-format cookies.txt file exported from a browser.
+# See: https://github.com/yt-dlp/yt-dlp/wiki/Extractors#exporting-youtube-cookies
+_COOKIE_FILE = os.environ.get("YOUTUBE_COOKIES_FILE", "")
+if _COOKIE_FILE and os.path.exists(_COOKIE_FILE):
+    print(f"[Music] ✅ YouTube cookies file found: {_COOKIE_FILE}", flush=True)
+else:
+    _COOKIE_FILE = ""
+    print("[Music] ⚠️ No YouTube cookies file — some videos may be blocked by bot detection.", flush=True)
+
 _YDL_OPTS = {
-    "format": "bestaudio/best",
+    "format": "bestaudio[ext=webm][acodec=opus]/bestaudio[ext=m4a]/bestaudio/best",
     "quiet": True,
     "no_warnings": True,
     "default_search": "ytsearch",
@@ -3017,9 +3038,11 @@ _YDL_OPTS = {
     "retries": 3,
     "fragment_retries": 3,
     "http_headers": {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
         "Accept-Language": "en-US,en;q=0.9",
     },
+    # Cookie support — bypasses YouTube "Sign in to confirm you're not a bot"
+    **({"cookiefile": _COOKIE_FILE} if _COOKIE_FILE else {}),
 }
 
 # Track consecutive playback failures per guild — prevent infinite join-leave loops
@@ -3027,7 +3050,7 @@ _music_fail_counts: dict[int, int] = {}
 MAX_PLAYBACK_RETRIES = 3
 
 FFMPEG_OPTS = {
-    "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -vn",
+    "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
     "options": "-vn",
 }
 
@@ -3035,21 +3058,61 @@ FFMPEG_OPTS = {
 async def _extract_audio(query: str) -> dict:
     """Extract audio info from YouTube URL or search query.
     Returns dict with title, url, duration, uploader, thumbnail, webpage_url.
-    Handles YouTube throttling and expired URLs with fresh extraction."""
+    Handles YouTube throttling, expired URLs, and bot detection.
+    Retries with alternative player clients if the default client is blocked."""
     loop = asyncio.get_event_loop()
+    print(f"[Music] Extracting audio for: {query[:80]}", flush=True)
 
-    def extract():
-        with yt_dlp.YoutubeDL(_YDL_OPTS) as ydl:
-            info = ydl.extract_info(query, download=False)
-            if "entries" in info:
-                info = info["entries"][0]
-            return info
+    # Try different player clients — YouTube blocks some, others work
+    client_variants = [
+        {},
+        {"extractor_args": {"youtube": {"player_client": ["android"]}}},
+        {"extractor_args": {"youtube": {"player_client": ["ios"]}}},
+        {"extractor_args": {"youtube": {"player_client": ["tv_simply"]}}},
+        {"extractor_args": {"youtube": {"player_client": ["web_embedded"]}}},
+    ]
 
-    info = await asyncio.wait_for(loop.run_in_executor(None, extract), timeout=30)
+    last_error = None
+    for i, extra_opts in enumerate(client_variants):
+        opts = {**_YDL_OPTS, **extra_opts}
+
+        def extract():
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(query, download=False)
+                if "entries" in info:
+                    info = info["entries"][0]
+                return info
+
+        try:
+            info = await asyncio.wait_for(loop.run_in_executor(None, extract), timeout=30)
+            if i > 0:
+                print(f"[Music] ✅ Extraction succeeded with client variant {i}", flush=True)
+            return info  # Success — return immediately
+        except asyncio.TimeoutError:
+            print(f"[Music] ⏱️ Extraction timed out (variant {i}) for: {query[:80]}", flush=True)
+            last_error = RuntimeError("Audio extraction timed out (30s). YouTube may be slow or rate-limiting.")
+        except Exception as e:
+            err_str = str(e)
+            print(f"[Music] ❌ Extraction failed (variant {i}) for {query[:80]}: {type(e).__name__}: {err_str[:120]}", flush=True)
+            if "Sign in to confirm" in err_str:
+                last_error = RuntimeError(
+                    "YouTube is blocking this server's IP (bot detection). "
+                    "Set YOUTUBE_COOKIES_FILE env var with a cookies.txt file to fix this. "
+                    "See: https://github.com/yt-dlp/yt-dlp/wiki/Extractors#exporting-youtube-cookies"
+                )
+                continue  # Try next client variant
+            elif "429" in err_str or "Too Many Requests" in err_str:
+                last_error = RuntimeError("YouTube rate limit exceeded. Please wait a few minutes and try again.")
+                break  # No point trying other clients if rate limited
+            else:
+                last_error = e
+                continue  # Try next variant
+
+    raise last_error if last_error else RuntimeError("Audio extraction failed for unknown reason.")
 
     # Get the best audio-only stream URL — prefer audio-only formats
     audio_url = info.get("url", "")
-    if not audio_url:
+    if not audio_url or not str(audio_url).startswith(("http://", "https://")):
         # Try to find an audio-only format first (no video)
         best_audio = None
         for fmt in info.get("formats", []):
@@ -3106,8 +3169,10 @@ async def _pick_autoplay_song(guild_id: int) -> dict:
 
 async def _play_next(guild_id: int, voice_client):
     """Play next song from queue, or auto-play from playlist if 24/7 mode is on.
-    Has retry limiting to prevent infinite join-leave loops."""
+    Has retry limiting to prevent infinite join-leave loops.
+    Includes discord.py bug #9866 workaround for FFmpeg exit code detection."""
     if not voice_client or not voice_client.is_connected():
+        print(f"[Music] Guild {guild_id}: Voice client not connected — aborting _play_next.", flush=True)
         _music_now.pop(guild_id, None)
         return
 
@@ -3153,21 +3218,73 @@ async def _play_next(guild_id: int, voice_client):
 
     try:
         # Always extract fresh URL — YouTube audio URLs expire quickly
+        print(f"[Music] Guild {guild_id}: Re-extracting URL for '{song['title'][:50]}'", flush=True)
         fresh_info = await _extract_audio(song["webpage_url"])
         audio_url = fresh_info["url"]
 
-        source = discord.FFmpegPCMAudio(audio_url, **FFMPEG_OPTS)
-        player = discord.PCMVolumeTransformer(source, volume=_music_volumes.get(guild_id, 0.5))
+        # Validate the extracted URL
+        if not audio_url or not str(audio_url).startswith(("http://", "https://")):
+            raise RuntimeError(f"Invalid audio URL extracted: {str(audio_url)[:50]}")
+
+        # Verify FFmpeg exists
+        if not shutil.which("ffmpeg"):
+            raise RuntimeError("FFmpeg is not installed on this system. Music playback is unavailable.")
+
+        print(f"[Music] Guild {guild_id}: Creating FFmpegPCMAudio (URL: {audio_url[:80]}...)", flush=True)
+
+        # Capture FFmpeg stderr for diagnostics
+        stderr_fd, stderr_path = tempfile.mkstemp(suffix=f"_ffmpeg_{guild_id}.log", dir="/tmp")
+        os.close(stderr_fd)  # Close the fd; FFmpeg will open the file by path
+
+        raw_source = discord.FFmpegPCMAudio(
+            audio_url,
+            stderr=open(stderr_path, "w"),
+            **FFMPEG_OPTS
+        )
+        player = discord.PCMVolumeTransformer(raw_source, volume=_music_volumes.get(guild_id, 0.5))
 
         def after_play(error):
-            if error:
-                print(f"[Music] Playback error: {error}", flush=True)
+            """Called by discord.py when the AudioPlayer finishes.
+            discord.py bug #9866: the 'error' param is always None when FFmpeg
+            exits, even on failure. We check the process exit code as a workaround."""
+            detected_error = error  # Start with whatever discord.py gives us
+
+            # ── Bug #9866 workaround: check FFmpeg process exit code ──────────
+            try:
+                proc = getattr(raw_source, "_process", None)
+                if proc is not None and not isinstance(proc, type(discord.utils.MISSING)):
+                    rc = proc.poll()  # Sets proc.returncode
+                    if rc is not None and rc != 0 and rc != -15 and rc != -9:
+                        # Read FFmpeg stderr for the actual error
+                        stderr_msg = ""
+                        try:
+                            with open(stderr_path, "r") as sf:
+                                stderr_msg = sf.read().strip()[:500]
+                        except:
+                            pass
+                        detected_error = RuntimeError(
+                            f"FFmpeg exited with code {rc}"
+                            + (f": {stderr_msg}" if stderr_msg else "")
+                        )
+            except Exception as check_err:
+                print(f"[Music] Error checking FFmpeg exit code: {check_err}", flush=True)
+
+            # Clean up stderr temp file
+            try:
+                os.unlink(stderr_path)
+            except:
+                pass
+
+            if detected_error:
+                print(f"[Music] ❌ Playback error in guild {guild_id}: {detected_error}", flush=True)
                 _music_fail_counts[guild_id] = _music_fail_counts.get(guild_id, 0) + 1
             else:
                 # Success — reset failure count
                 _music_fail_counts[guild_id] = 0
+
             if _music_loops.get(guild_id):
                 _music_queues.setdefault(guild_id, deque()).appendleft(song)
+
             try:
                 asyncio.run_coroutine_threadsafe(
                     _play_next(guild_id, voice_client), bot.loop)
@@ -3175,10 +3292,22 @@ async def _play_next(guild_id: int, voice_client):
                 print(f"[Music] after_play error: {e}", flush=True)
 
         voice_client.play(player, after=after_play)
-        print(f"[Music] Now playing: {song['title']} in guild {guild_id}{' [24/7]' if is_247 else ''}", flush=True)
+        print(f"[Music] ▶️ Now playing: {song['title']} in guild {guild_id}{' [24/7]' if is_247 else ''}", flush=True)
+
+    except discord.ClientException as e:
+        # FFmpeg not found, already playing, not connected, etc.
+        print(f"[Music] ❌ ClientException in guild {guild_id}: {e}", flush=True)
+        _music_fail_counts[guild_id] = fail_count + 1
+        _music_now.pop(guild_id, None)
+        if is_247 and voice_client and voice_client.is_connected():
+            backoff = min(3 * (fail_count + 1), 15)
+            await asyncio.sleep(backoff)
+            asyncio.ensure_future(_play_next(guild_id, voice_client))
+        elif queue:
+            await _play_next(guild_id, voice_client)
 
     except Exception as e:
-        print(f"[Music] Error playing next: {e}", flush=True)
+        print(f"[Music] ❌ Error playing next in guild {guild_id}: {type(e).__name__}: {e}", flush=True)
         _music_fail_counts[guild_id] = fail_count + 1
         _music_now.pop(guild_id, None)
         # If 24/7 is on, retry with next song after delay (with backoff)
@@ -3223,8 +3352,24 @@ async def cmd_play(interaction: discord.Interaction, query: str):
     # Extract video info
     try:
         info = await _extract_audio(query)
+    except asyncio.TimeoutError:
+        await interaction.followup.send(embed=err_e("⏱️ Audio extraction timed out. YouTube may be rate-limiting — try again in a moment."))
+        return
+    except RuntimeError as e:
+        err_msg = str(e)
+        if "bot detection" in err_msg:
+            await interaction.followup.send(embed=err_e(
+                "❌ YouTube is blocking this server (bot detection).\n"
+                "To fix: Unish needs to upload a YouTube cookies file.\n"
+                "See: https://github.com/yt-dlp/yt-dlp/wiki/Extractors#exporting-youtube-cookies"
+            ))
+        elif "rate limit" in err_msg:
+            await interaction.followup.send(embed=err_e("⏱️ YouTube rate limit hit. Please wait a few minutes and try again."))
+        else:
+            await interaction.followup.send(embed=err_e(f"Could not find song: {err_msg}"))
+        return
     except Exception as e:
-        await interaction.followup.send(embed=err_e(f"Could not find song: {e}"))
+        await interaction.followup.send(embed=err_e(f"Could not find song: {type(e).__name__}: {str(e)[:200]}"))
         return
 
     song = {
