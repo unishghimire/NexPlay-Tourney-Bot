@@ -34,6 +34,11 @@ APP_ID      = os.environ.get("APP_ID", "6a5226b5047f5c59d961130e")
 BOT_API_URL = "https://thistle-d961130e.base44.app/functions/botApi"
 DISCORD_API = "https://discord.com/api/v10"
 
+# ── NexPlay Brand Identity (phoenix/eagle logo — deep blue→purple gradient) ──
+BRAND_COLOR      = 0xB565E8   # primary purple accent (from logo wing)
+BRAND_COLOR_DARK = 0x2626A8   # deep blue (from logo background)
+BRAND_LOGO_URL   = "https://media.base44.com/images/public/6a5226b5047f5c59d961130e/e4378c8b9_image.png"
+
 # ── Role names that count as "staff" in any server ────────
 STAFF_ROLE_NAMES = {
     "NexPlay Owner", "Tournament Host", "Admin", "Moderator", "NexPlay Admin",
@@ -378,7 +383,7 @@ async def auto_meme_loop():
                     embed = discord.Embed(
                         title=f"🔥 {meme['title']}",
                         url=meme["permalink"],
-                        color=0xFF6B35 if is_hot else 0x5865F2
+                        color=0xFF6B35 if is_hot else BRAND_COLOR
                     )
                     embed.set_image(url=meme["url"])
                     footer_text = f"r/{sub} • {'🔥 HOT' if is_hot else 'Trending'} • 👍 {score:,} | NexPlay Memes"
@@ -418,9 +423,9 @@ async def on_member_join(member: discord.Member):
             f"**{guild.name}** — competitive esports & Free Fire tournaments.\n\n"
             f"📋 Check our channels\n🏆 Use `/register` to join a tournament\n"
             f"❓ Need help? Use `/help`\n\nGood luck and have fun! 🔥"),
-        color=0x5865F2, timestamp=datetime.now(timezone.utc))
+        color=BRAND_COLOR, timestamp=datetime.now(timezone.utc))
     e.set_thumbnail(url=member.display_avatar.url)
-    e.set_footer(text=f"Member #{guild.member_count} • NexPlay")
+    e.set_footer(text=f"Member #{guild.member_count} • NexPlay", icon_url=BRAND_LOGO_URL)
     await welcome_ch.send(embed=e)
 
 
@@ -446,7 +451,7 @@ async def cmd_announce(
         color=0xE74C3C,
         timestamp=datetime.now(timezone.utc)
     )
-    embed.set_footer(text=f"NexPlay Announcement • {interaction.guild.name}")
+    embed.set_footer(text=f"NexPlay Announcement • {interaction.guild.name}", icon_url=BRAND_LOGO_URL)
     try:
         await target.send(embed=embed)
     except discord.Forbidden:
@@ -483,8 +488,9 @@ async def _post_tournament_info(ch_info, ch_ann, ch_reg, ch_road, ch_logo, name,
         if rules: d += f"\n**📜 Rules:**\n{rules}"
         if stream: d += f"\n**📺 Stream:** {stream}"
         if desc: d += f"\n{desc}"
-        e = discord.Embed(title=f"📋 {name} — Tournament Info", description=d, color=0x5865F2, timestamp=datetime.now(timezone.utc))
-        e.set_footer(text="NexPlay Tournament System")
+        e = discord.Embed(title=f"📋 {name} — Tournament Info", description=d, color=BRAND_COLOR, timestamp=datetime.now(timezone.utc))
+        e.set_thumbnail(url=BRAND_LOGO_URL)
+        e.set_footer(text="NexPlay Tournament System", icon_url=BRAND_LOGO_URL)
         if poster: e.set_image(url=poster)
         await dpost(ch_info, e)
 
@@ -497,7 +503,7 @@ async def _post_tournament_info(ch_info, ch_ann, ch_reg, ch_road, ch_logo, name,
         if ch_road: d += f"\n🗺️ Roadmap → <#{ch_road}>"
         if stream: d += f"\n📺 Stream: **{stream}**"
         e = discord.Embed(title=f"🚨 {name.upper()} — REGISTRATION OPEN!", description=d, color=0x00FF7F, timestamp=datetime.now(timezone.utc))
-        e.set_footer(text="NexPlay | Registration Open")
+        e.set_footer(text="NexPlay | Registration Open", icon_url=BRAND_LOGO_URL)
         if poster: e.set_image(url=poster)
         await dpost(ch_ann, e)
 
@@ -514,7 +520,7 @@ async def _post_tournament_info(ch_info, ch_ann, ch_reg, ch_road, ch_logo, name,
              f"⚠️ All {t_size} players must be @mentioned.")
         if ch_logo: d += f"\n🎨 Submit logo in <#{ch_logo}> — `Team Name: <name>` + image"
         e = discord.Embed(title=f"✍️ Register for {name}", description=d, color=0x00FF7F, timestamp=datetime.now(timezone.utc))
-        e.set_footer(text="NexPlay Registration")
+        e.set_footer(text="NexPlay Registration", icon_url=BRAND_LOGO_URL)
         reg_msg = await dpost(ch_reg, e)
         reg_msg_id = reg_msg.get("id", "") if reg_msg else ""
     else:
@@ -523,7 +529,7 @@ async def _post_tournament_info(ch_info, ch_ann, ch_reg, ch_road, ch_logo, name,
     if ch_road:
         lines = [f"**Stage {i+1}:** {STAGE_NAMES[i] if i < 5 else f'Round {i+1}'}" for i in range(min(rounds, 5))]
         e = discord.Embed(title=f"🗺️ {name} — Roadmap", description="\n".join(lines), color=0xFF6B35)
-        e.set_footer(text="NexPlay Roadmap")
+        e.set_footer(text="NexPlay Roadmap", icon_url=BRAND_LOGO_URL)
         if roadmap: e.set_image(url=roadmap)
         await dpost(ch_road, e)
     return reg_msg_id
@@ -554,7 +560,7 @@ class TournamentStep1Modal(discord.ui.Modal, title="🏆 Create Tournament (1/3)
                 f"**Date:** {self.t_date.value.strip()}\n\n"
                 "Click **Next →** to fill Format & Slots."
             ),
-            color=0x5865F2
+            color=BRAND_COLOR
         )
         await interaction.response.send_message(embed=embed, view=Step2ButtonView(), ephemeral=True)
 
@@ -601,7 +607,7 @@ class TournamentStep2Modal(discord.ui.Modal, title="🏆 Create Tournament (2/3)
                 f"**Format:** {self.t_format.value.strip()}\n\n"
                 "Click **Next →** to fill Schedule & Rules (last step!)"
             ),
-            color=0x5865F2
+            color=BRAND_COLOR
         )
         await interaction.response.send_message(embed=embed, view=Step3ButtonView(), ephemeral=True)
 
@@ -729,7 +735,7 @@ class TournamentStep3Modal(discord.ui.Modal, title="🏆 Create Tournament (3/3)
             ),
             color=0x00FF7F
         )
-        confirm.set_footer(text="NexPlay Tournament System")
+        confirm.set_footer(text="NexPlay Tournament System", icon_url=BRAND_LOGO_URL)
         await interaction.followup.send(embed=confirm, ephemeral=True)
 
 
@@ -785,7 +791,7 @@ class TournamentEditModal(discord.ui.Modal, title="✏️ Edit Tournament"):
             updated_embed = discord.Embed(
                 title=f"📋 {t['name']} — Updated", description=d, color=0xFFA500,
                 timestamp=datetime.now(timezone.utc))
-            updated_embed.set_footer(text="NexPlay | Updated")
+            updated_embed.set_footer(text="NexPlay | Updated", icon_url=BRAND_LOGO_URL)
             await dpost(ch_info_id, updated_embed)
 
         await interaction.followup.send(embed=ok_e("Tournament Updated!", f"**{t['name']}** details have been updated and #info channel refreshed."), ephemeral=True)
@@ -1131,12 +1137,12 @@ def is_staff(member: discord.Member) -> bool:
 
 def err_e(msg: str) -> discord.Embed:
     e = discord.Embed(description="❌  " + msg, color=0xFF4444)
-    e.set_footer(text="NexPlay")
+    e.set_footer(text="NexPlay", icon_url=BRAND_LOGO_URL)
     return e
 
 def ok_e(title: str, desc: str, color: int = 0x00FF7F) -> discord.Embed:
     e = discord.Embed(title=title, description=desc, color=color)
-    e.set_footer(text="NexPlay Tournament System")
+    e.set_footer(text="NexPlay Tournament System", icon_url=BRAND_LOGO_URL)
     e.timestamp = datetime.now(timezone.utc)
     return e
 
@@ -1157,13 +1163,16 @@ async def _reject_msg(message: discord.Message, title: str, desc: str, delay: in
 def img_url(t_name: str, game: str, kind: str, extra: str = "") -> str:
     """Generate a fixed-size tournament image URL via Pollinations.
     Each image type has a FIXED pixel dimension — no free-form sizes."""
+    # NexPlay brand theme: deep navy-to-vivid-blue gradient background with a
+    # magenta/purple phoenix-wing accent glow, matching the official bot logo.
+    BRAND = "deep navy blue to vivid indigo gradient background, glowing magenta-purple phoenix wing accent light, sleek modern esports"
     templates = {
-        "poster":   ("professional esports tournament poster {n} {g} neon dark background gold purple cinematic", 1280, 720),
-        "roadmap":  ("tournament roadmap timeline {n} {g} stages Registration GroupDraw Schedule MatchDay Champion modern dark", 1280, 720),
-        "group":    ("esports group draw reveal {n} {g} {x} dark neon panels", 1024, 576),
-        "schedule": ("match schedule card {n} {g} {x} dark professional infographic", 1024, 576),
-        "result":   ("match result card {x} {n} dark dramatic victory graphic", 1024, 576),
-        "champion": ("champion victory {x} wins {n} {g} golden trophy confetti epic cinematic", 1280, 720),
+        "poster":   ("professional esports tournament poster {n} {g} " + BRAND + " cinematic", 1280, 720),
+        "roadmap":  ("tournament roadmap timeline {n} {g} stages Registration GroupDraw Schedule MatchDay Champion " + BRAND, 1280, 720),
+        "group":    ("esports group draw reveal {n} {g} {x} " + BRAND + " panels", 1024, 576),
+        "schedule": ("match schedule card {n} {g} {x} " + BRAND + " professional infographic", 1024, 576),
+        "result":   ("match result card {x} {n} " + BRAND + " dramatic victory graphic", 1024, 576),
+        "champion": ("champion victory {x} wins {n} {g} golden trophy confetti " + BRAND + " epic cinematic", 1280, 720),
     }
     tpl, w, h = templates.get(kind, ("professional esports graphic {n} {g}", 1280, 720))
     prompt = tpl.format(n=t_name, g=game, x=extra)
@@ -1358,7 +1367,7 @@ async def send_daily_logs(bot_instance: "NexPlayBot"):
             e = discord.Embed(title=f"📊 NexPlay Daily Report — {guild.name}",
                 description=f"Daily report for **{today}** — tournaments, registrations, matches & support.",
                 color=0x1F4E79, timestamp=datetime.now(timezone.utc))
-            e.set_footer(text="NexPlay Tournament System")
+            e.set_footer(text="NexPlay Tournament System", icon_url=BRAND_LOGO_URL)
             await dm.send(embed=e, file=discord.File(xl_buf, filename=f"NexPlay_DailyLog_{guild.name}_{today}.xlsx"))
             print(f"[NexPlay] Daily log sent to {owner} for {guild.name}", flush=True)
         except Exception as e:
@@ -1495,7 +1504,7 @@ async def handle_support(message: discord.Message) -> None:
             desc = f"👋 AI support is **Elite** only. You're on **{srv.get('plan_name','?')}** — a staff member will help shortly."
         else:
             desc = "👋 I'm NexPlay Bot. This server isn't registered — ask an admin to run `/setup`."
-        await message.reply(embed=discord.Embed(description=desc, color=0xFFA500).set_footer(text="NexPlay Support"), mention_author=False)
+        await message.reply(embed=discord.Embed(description=desc, color=0xFFA500).set_footer(text="NexPlay Support", icon_url=BRAND_LOGO_URL), mention_author=False)
         # Set lock so this user doesn't get spammed with the same message
         guild_locks[uid] = "non_elite"
         return
@@ -1538,13 +1547,13 @@ INSTRUCTIONS:
     SUPPORT_COLORS = [(0x00FF7F,['register','join','sign up']),(0x1E90FF,['when','time','date','schedule']),
                       (0xFFD700,['prize','reward','money','win']),(0xFF4444,['rule','cheat','banned','unfair']),
                       (0x9B59B6,['bracket','group','opponent'])]
-    color = next((c for c, kws in SUPPORT_COLORS if any(k in ql for k in kws)), 0x5865F2)
+    color = next((c for c, kws in SUPPORT_COLORS if any(k in ql for k in kws)), BRAND_COLOR)
 
     # ── Reply to user ──────────────────────────────────────────────────────
     if not needs_staff and ai_reply:
         clean_reply = ai_reply.replace("NEEDS_STAFF:", "").strip()
         embed = discord.Embed(description=clean_reply, color=color)
-        embed.set_footer(text="NexPlay Support • Reply handled by AI")
+        embed.set_footer(text="NexPlay Support • Reply handled by AI", icon_url=BRAND_LOGO_URL)
         await message.reply(embed=embed, mention_author=False)
 
     # ── Save to DB ────────────────────────────────────────────────────────
@@ -1664,7 +1673,7 @@ async def update_reg_announcement(tournament: dict, guild: discord.Guild, regist
                     f"```\nTeam Name: <name>\n{lines}\n```\n⚠️ All players must be @mentioned.")
         e = discord.Embed(title=f"{'🔒 CLOSED' if filled else '✍️ OPEN'} — {name}", description=desc,
             color=0x555555 if filled else 0x00FF7F, timestamp=datetime.now(timezone.utc))
-        e.set_footer(text="NexPlay")
+        e.set_footer(text="NexPlay", icon_url=BRAND_LOGO_URL)
         await msg.edit(embed=e)
     except Exception as e:
         log(f"[WARN] Could not update reg announcement: {e}")
@@ -1743,7 +1752,7 @@ async def handle_registration(message: discord.Message, gid: str, short: str, to
                 f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n**CONFIRMED ✅**\n\n"
                 f"🎨 Submit logo in {logo_mention} — `Team Name: <name>` + image"),
             color=0x00FF7F, timestamp=datetime.now(timezone.utc))
-        e.set_footer(text=f"NexPlay | {tournament.get('game','')}", icon_url="https://i.imgur.com/wSTFkRM.png")
+        e.set_footer(text=f"NexPlay | {tournament.get('game','')}", icon_url=BRAND_LOGO_URL)
         await cfm_ch.send(embed=e)
 
     # Update announcement + auto-close
@@ -1757,7 +1766,7 @@ async def handle_registration(message: discord.Message, gid: str, short: str, to
         await message.channel.send(embed=discord.Embed(
             title=f"🔒 REGISTRATION CLOSED — {tournament.get('name', '')}",
             description=f"All **{max_p}** slots filled! Groups next. Stay tuned.",
-            color=0xFF6B35, timestamp=datetime.now(timezone.utc)).set_footer(text="NexPlay"))
+            color=0xFF6B35, timestamp=datetime.now(timezone.utc)).set_footer(text="NexPlay", icon_url=BRAND_LOGO_URL))
 
 
 async def handle_logo_submission(message: discord.Message, gid: str, short: str, tournament: dict):
@@ -1796,7 +1805,7 @@ async def handle_logo_submission(message: discord.Message, gid: str, short: str,
             f"Saved — will appear in group draws and match cards.",
         color=0x00FF7F, timestamp=datetime.now(timezone.utc))
     e.set_thumbnail(url=logo_url)
-    e.set_footer(text="NexPlay")
+    e.set_footer(text="NexPlay", icon_url=BRAND_LOGO_URL)
     await message.channel.send(embed=e)
 
     cfm_ch = discord.utils.get(message.guild.text_channels, name=short + "-confirm-teams")
@@ -1805,7 +1814,7 @@ async def handle_logo_submission(message: discord.Message, gid: str, short: str,
             description=f"**{submitted_name}** submitted their logo ✅\nBy: {message.author.mention}",
             color=0xFF6B9D, timestamp=datetime.now(timezone.utc))
         e2.set_thumbnail(url=logo_url)
-        e2.set_footer(text="NexPlay | Logo will appear in all GFX")
+        e2.set_footer(text="NexPlay | Logo will appear in all GFX", icon_url=BRAND_LOGO_URL)
         await cfm_ch.send(embed=e2)
 
 
@@ -2072,7 +2081,7 @@ async def cmd_host_game(interaction: discord.Interaction, game_type: str):
     title, q, a, hint, color = games.get(game_type, games["trivia"])
     desc = f"**❓ {q}**\n\n💡 Hint: *{hint}*\n\n" + ("Type your answer! First correct wins 🏆" if a else "Drop your prediction! 👇")
     e = discord.Embed(title=title, description=desc, color=color, timestamp=datetime.now(timezone.utc))
-    e.set_footer(text=f"NexPlay Mini-Game | {interaction.user.display_name}")
+    e.set_footer(text=f"NexPlay Mini-Game | {interaction.user.display_name}", icon_url=BRAND_LOGO_URL)
     await interaction.followup.send("@everyone", embed=e)
 
 
@@ -2096,7 +2105,7 @@ async def cmd_suggest_improvement(interaction: discord.Interaction):
     suggestions = await ai_generate(prompt)
     e = discord.Embed(title="💡 NexPlay Growth Advisor", description=suggestions[:4000],
         color=0xF39C12, timestamp=datetime.now(timezone.utc))
-    e.set_footer(text="NexPlay AI | Elite Plan")
+    e.set_footer(text="NexPlay AI | Elite Plan", icon_url=BRAND_LOGO_URL)
     await interaction.followup.send(embed=e)
 
 
@@ -2206,7 +2215,7 @@ async def cmd_register(interaction: discord.Interaction, tournament: str = ""):
         f"**📋 FORMAT — Copy & fill in this #register channel:**\n"
         f"```\nTeam Name: <your team name>\n{lines}\n```\n"
         f"⚠️ All {team_size} players MUST be @mentioned.")
-    e.set_footer(text="NexPlay Registration")
+    e.set_footer(text="NexPlay Registration", icon_url=BRAND_LOGO_URL)
     await interaction.response.send_message(embed=e)
 
 
@@ -2283,8 +2292,8 @@ async def cmd_groups(interaction: discord.Interaction, tournament: str):
     if not status_ok:
         log(f"[Groups] ⚠️ Failed to set tournament status to groups_generated for {t.get('name','?')}")
 
-    e = discord.Embed(title=f"🎯 Group Draw — {t['name']}", description=desc, color=0x5865F2, timestamp=datetime.now(timezone.utc))
-    e.set_footer(text="NexPlay | Groups Generated")
+    e = discord.Embed(title=f"🎯 Group Draw — {t['name']}", description=desc, color=BRAND_COLOR, timestamp=datetime.now(timezone.utc))
+    e.set_footer(text="NexPlay | Groups Generated", icon_url=BRAND_LOGO_URL)
     await interaction.followup.send(embed=ok_e("Groups Generated!", f"{len(groups)} groups created for **{t['name']}**. Check #{short}-groups."))
     if groups_ch:
         try:
@@ -2317,7 +2326,7 @@ async def cmd_results(interaction: discord.Interaction, tournament: str, match_i
         return await interaction.followup.send(embed=err_e(f"#{short}-results channel not found."), ephemeral=True)
 
     e = discord.Embed(title=f"🏅 Result — {t['name']}", description=match_info, color=0xFFD700, timestamp=datetime.now(timezone.utc))
-    e.set_footer(text=f"Posted by {interaction.user.display_name} | NexPlay")
+    e.set_footer(text=f"Posted by {interaction.user.display_name} | NexPlay", icon_url=BRAND_LOGO_URL)
     await results_ch.send(embed=e)
 
     # ── Save to Match entity (docstring says "save to DB") ─────────────
@@ -2431,7 +2440,7 @@ async def cmd_schedule_post(interaction: discord.Interaction, tournament: str):
         desc += f"**Stage {i+1}:** {stage} — {date} (Day {i+1})\n"
 
     e = discord.Embed(title=f"📅 Match Schedule — {t['name']}", description=desc, color=0x1E90FF, timestamp=datetime.now(timezone.utc))
-    e.set_footer(text="NexPlay Schedule")
+    e.set_footer(text="NexPlay Schedule", icon_url=BRAND_LOGO_URL)
 
     # Post to roadmap channel
     road_ch = discord.utils.get(interaction.guild.text_channels, name=f"{short}-roadmap")
@@ -2479,7 +2488,7 @@ async def cmd_roadmap_post(interaction: discord.Interaction, tournament: str):
     stage_names = STAGE_NAMES[:rounds] if rounds <= len(STAGE_NAMES) else [f"Round {i+1}" for i in range(rounds)]
     lines = "\n".join([f"**Stage {i+1}:** {stage_names[i]} — {t.get('tournament_date','TBD')}" for i in range(rounds)])
     e = discord.Embed(title=f"🗺️ {t['name']} — Roadmap", description=lines, color=0xFF6B35, timestamp=datetime.now(timezone.utc))
-    e.set_footer(text="NexPlay Roadmap")
+    e.set_footer(text="NexPlay Roadmap", icon_url=BRAND_LOGO_URL)
 
     # AI GFX roadmap (Pro+)
     can_gfx, _ = await check_feature(gid, "ai_gfx_poster")
@@ -2540,7 +2549,7 @@ async def cmd_standings_post(interaction: discord.Interaction, tournament: str):
         desc = "\n".join([f"{'🥇' if i==0 else '🥈' if i==1 else '🥉' if i==2 else f'{i+1}.'} **{v['name']}** — {v['count']} wins" for i, (wid, v) in enumerate(standings)])
         e = discord.Embed(title=f"🏅 Standings — {t['name']}", description=desc, color=0xFFD700, timestamp=datetime.now(timezone.utc))
 
-    e.set_footer(text="NexPlay Standings")
+    e.set_footer(text="NexPlay Standings", icon_url=BRAND_LOGO_URL)
     results_ch = discord.utils.get(interaction.guild.text_channels, name=f"{short}-results")
     if results_ch:
         try:
@@ -2620,10 +2629,10 @@ async def cmd_status(interaction: discord.Interaction):
     embed = discord.Embed(
         title="🔧 NexPlay Bot Status",
         description="\n".join(lines),
-        color=0x5865F2,
+        color=BRAND_COLOR,
         timestamp=datetime.now(timezone.utc)
     )
-    embed.set_footer(text="NexPlay Diagnostics")
+    embed.set_footer(text="NexPlay Diagnostics", icon_url=BRAND_LOGO_URL)
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
@@ -2639,7 +2648,8 @@ async def cmd_help(interaction: discord.Interaction):
 
     features = PLAN_FEATURES.get(plan, PLAN_FEATURES["trial"])
 
-    e = discord.Embed(title="📖 NexPlay Commands", description=f"**Plan:** {plan.title()} | **Server:** {interaction.guild.name}", color=0x5865F2, timestamp=datetime.now(timezone.utc))
+    e = discord.Embed(title="📖 NexPlay Commands", description=f"**Plan:** {plan.title()} | **Server:** {interaction.guild.name}", color=BRAND_COLOR, timestamp=datetime.now(timezone.utc))
+    e.set_thumbnail(url=BRAND_LOGO_URL)
 
     e.add_field(name="🏆 Tournament", value=(
         "`/create_tournament` — Create a new tournament (3-step form)\n"
@@ -2695,7 +2705,7 @@ async def cmd_help(interaction: discord.Interaction):
         "Billing: https://nexplay-server-portal.vercel.app/subscription"
     ), inline=False)
 
-    e.set_footer(text="NexPlay Tournament System")
+    e.set_footer(text="NexPlay Tournament System", icon_url=BRAND_LOGO_URL)
     await interaction.response.send_message(embed=e, ephemeral=True)
 
 
@@ -3444,7 +3454,7 @@ async def cmd_nowplaying(interaction: discord.Interaction):
         e.description += "\n♾️ **24/7 AutoPlay is ON**"
     if now.get("thumbnail"):
         e.set_thumbnail(url=now["thumbnail"])
-    e.set_footer(text="NexPlay Music")
+    e.set_footer(text="NexPlay Music", icon_url=BRAND_LOGO_URL)
     await interaction.response.send_message(embed=e)
 
 
