@@ -26,9 +26,9 @@ from dotenv import load_dotenv
 # Load .env file if present (local dev). Render injects vars directly.
 load_dotenv()
 
-BOT_TOKEN   = os.environ.get("DISCORD_BOT_TOKEN", "")
+BOT_TOKEN   = os.environ.get("DISCORD_BOT_TOKEN", "").strip()
 HOME_GUILD  = int(os.environ.get("DISCORD_GUILD_ID", "0"))   # owner's server only
-SVC_TOKEN   = os.environ.get("BASE44_SERVICE_TOKEN", "")
+SVC_TOKEN   = os.environ.get("BASE44_SERVICE_TOKEN", "").strip()
 APP_ID      = os.environ.get("APP_ID", "6a5226b5047f5c59d961130e")
 
 BASE44_API  = "https://" + APP_ID + ".base44.app/api/apps/" + APP_ID + "/entities"
