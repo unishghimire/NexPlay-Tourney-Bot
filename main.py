@@ -86,7 +86,7 @@ PLAN_UPGRADE_MSG = {
     "ai_support":        "🤖 AI Support agent requires **Elite** plan.",
     "host_game":         "🎮 Mini-game hosting requires **Elite** plan.",
     "suggest_improvement":"💡 AI growth advisor requires **Elite** plan.",
-    "meme_post":         "😂 Meme/clip sharing requires **Elite** plan.",
+    "meme_post":         "😂 Meme/clip sharing is available on **all plans**.",
     "welcome_message":   "👋 Automated welcome messages require **Elite** plan.",
     "edit_tournament":   "✏️ Tournament editing requires **Starter** or higher plan.",
     "schedule_post":     "📅 Schedule posting requires **Starter** or higher plan.",
@@ -98,16 +98,23 @@ async def check_feature(guild_id: str, feature: str, interaction: discord.Intera
     """
     Returns (allowed: bool, reason: str).
     If interaction is provided, automatically replies with an ephemeral error on deny.
+    Self-heals: if no server record exists, tries to create one.
     """
     rec = await get_server_record(guild_id)
     if not rec:
-        msg = "❌ Server not registered. Run `/setup` first."
-        if interaction:
-            try:
-                await interaction.followup.send(embed=err_e(msg), ephemeral=True)
-            except:
-                pass
-        return False, msg
+        # Self-heal: try to auto-register if we have a guild context
+        guild = bot.get_guild(int(guild_id)) if guild_id.isdigit() else None
+        if guild and SVC_TOKEN:
+            print(f"[NexPlay] check_feature: auto-registering {guild.name} ({guild_id})", flush=True)
+            rec = await register_server(guild)
+        if not rec or not rec.get("id"):
+            msg = "❌ Server not registered. Run `/setup` first."
+            if interaction:
+                try:
+                    await interaction.followup.send(embed=err_e(msg), ephemeral=True)
+                except:
+                    pass
+            return False, msg
 
     plan    = (rec.get("plan_name") or rec.get("subscription_status") or "trial").lower()
     status  = rec.get("subscription_status", "trial").lower()
@@ -274,18 +281,30 @@ async def fetch_reddit_meme(subreddit: str = "dankmemes", exclude_url: str = "")
     return None
 
 async def auto_meme_loop():
-    """Post trending memes to ALL servers every 30 minutes.
-    Elite servers: every 30 min. Non-Elite: every 2 hours (4 cycles)."""
+    """Post trending memes to ALL servers every 15 minutes.
+    meme_post is available on every plan (trial → elite), so all
+    servers receive memes. Uses per-guild last-URL tracking to
+    prevent repeats. Auto-creates #memes channel if none found."""
     await bot.wait_until_ready()
     print(f"[NexPlay] auto_meme_loop started — interval={MEME_INTERVAL}s (15 min, ALL servers)", flush=True)
     while not bot.is_closed():
         try:
             for guild in bot.guilds:
                 try:
-                    # ALL servers get memes every 15 minutes
-                    ok, _ = await check_feature(str(guild.id), "meme_post")
+                    # ── Self-heal: if server isn't in DB, register it first ──────
+                    srv = await get_server_record(str(guild.id))
+                    if not srv:
+                        print(f"[NexPlay/Meme] Server {guild.name} not in DB — auto-registering...", flush=True)
+                        srv = await register_server(guild)
+                        if not srv or not srv.get("id"):
+                            print(f"[NexPlay/Meme] Failed to register {guild.name} — skipping meme cycle", flush=True)
+                            continue
+
+                    # ALL servers get memes — meme_post is in every plan
+                    ok, reason = await check_feature(str(guild.id), "meme_post")
                     if not ok:
-                        continue  # Skip servers without meme_post feature
+                        print(f"[NexPlay/Meme] {guild.name}: feature check failed — {reason[:100]}", flush=True)
+                        continue
 
                     # ── Find or create meme channel ─────────────────────────────
                     target = guild.get_channel(_meme_channel_cache.get(guild.id, 0))
@@ -293,7 +312,8 @@ async def auto_meme_loop():
                         target = None
                         _meme_channel_cache.pop(guild.id, None)
 
-                    # Search by name hint
+                    # Search by name hint — checks if the hint string appears
+                    # anywhere in the channel name (handles emoji prefixes like "😂│memes")
                     if not target:
                         _meme_channel_cache.pop(guild.id, None)
                         for hint in ("meme-server", "memes", "meems", "meme", "memez", "funny",
@@ -303,7 +323,7 @@ async def auto_meme_loop():
                                 and c.permissions_for(guild.me).send_messages, guild.text_channels)
                             if target:
                                 _meme_channel_cache[guild.id] = target.id
-                                print(f"[NexPlay] Meme channel found → #{target.name} in {guild.name}", flush=True)
+                                print(f"[NexPlay/Meme] Channel found → #{target.name} in {guild.name}", flush=True)
                                 break
 
                     # Not found → auto-create a #memes channel
@@ -337,6 +357,7 @@ async def auto_meme_loop():
                     last_url = _last_meme_url.get(guild.id, "")
                     meme = await fetch_reddit_meme(sub, exclude_url=last_url)
                     if not meme:
+                        print(f"[NexPlay/Meme] No meme fetched for {guild.name} (tried r/{sub})", flush=True)
                         continue
 
                     # Save URL to prevent repeats
@@ -406,7 +427,7 @@ async def cmd_announce(
     message: str,
     channel: discord.TextChannel = None
 ):
-    if not is_staff(interaction):
+    if not is_staff(interaction.user):
         return await interaction.response.send_message(embed=err_e("Staff only."), ephemeral=True)
     await interaction.response.defer(thinking=True, ephemeral=True)
     target = channel or interaction.channel
@@ -731,7 +752,6 @@ class TournamentEditModal(discord.ui.Modal, title="✏️ Edit Tournament"):
             if info_ch: ch_info_id = info_ch.id
 
         if ch_info_id:
-            t.update(updates)
             d = (f"**🎮 Game:** {t.get('game','')}\n**💰 Prize:** {updates['prize_pool']}\n"
                  f"**📅 Date:** {updates['tournament_date']} | ⏰ {updates['tournament_time']}\n"
                  f"**👥 Slots:** {t.get('max_players','')} | Teams: {t.get('team_size','')}v{t.get('team_size','')}\n"
@@ -821,17 +841,40 @@ class TournamentStatusModal(discord.ui.Modal, title="🔄 Change Tournament Stat
 
 @bot.event
 async def on_ready():
-    """Fires when bot connects. Clears support locks for fresh session."""
+    """Fires when bot connects. Clears support locks, self-heals server records."""
     global _replied_users
     _replied_users = {}
     print(f"[NexPlay] ✅ {bot.user} online — {len(bot.guilds)} server(s)", flush=True)
-    for g in bot.guilds:
-        print(f"[NexPlay]   • {g.name} ({g.id}) — {g.member_count} members", flush=True)
+
+    # ── Self-heal: ensure EVERY guild the bot is in has a DB record ────────
+    # This fixes "bot can't recognize servers" — if a server was added while
+    # the bot was offline, or the DB was reset, on_guild_join never fired.
     if SVC_TOKEN:
-        try: print(f"[NexPlay] DB OK — {len(await b44_list('Server'))} server(s)", flush=True)
-        except Exception as e: print(f"[NexPlay] ⚠️ DB: {e}", flush=True)
+        try:
+            db_servers = await b44_list("Server")
+            db_guild_ids = {s.get("guild_id") for s in db_servers}
+            print(f"[NexPlay] DB OK — {len(db_servers)} server(s) in DB", flush=True)
+
+            for g in bot.guilds:
+                gid = str(g.id)
+                if gid not in db_guild_ids:
+                    print(f"[NexPlay] 🔧 Self-heal: registering {g.name} ({gid}) — was missing from DB", flush=True)
+                    await register_server(g)
+                else:
+                    # Update member count + last_active for existing servers
+                    srv = next((s for s in db_servers if s.get("guild_id") == gid), None)
+                    if srv:
+                        await b44_update("Server", srv["id"], {
+                            "member_count": g.member_count or 0,
+                            "last_active": now_iso(),
+                            "guild_name": g.name,
+                        })
+                print(f"[NexPlay]   • {g.name} ({g.id}) — {g.member_count} members", flush=True)
+        except Exception as e:
+            print(f"[NexPlay] ⚠️ DB self-heal error: {e}", flush=True)
     else:
-        print("[NexPlay] ⚠️ BASE44_SERVICE_TOKEN not set!", flush=True)
+        print("[NexPlay] ⚠️ BASE44_SERVICE_TOKEN not set! Bot cannot read/write the database.", flush=True)
+
     try: print(f"[NexPlay] Synced {len(await bot.tree.sync())} commands.", flush=True)
     except Exception as e: print(f"[NexPlay] ⚠️ Sync: {e}", flush=True)
 
@@ -951,20 +994,11 @@ async def is_allowed(guild_id: str, guild: discord.Guild = None) -> tuple[bool, 
     rec = await get_server_record(guild_id)
     if not rec:
         if guild:
-            owner = guild.owner
-            rec = await b44_create("Server", {
-                "guild_id":            guild_id,
-                "guild_name":          guild.name,
-                "owner_id":            str(owner.id) if owner else "",
-                "owner_name":          owner.display_name if owner else "Unknown",
-                "plan_name":           "Free Trial",
-                "subscription_status": "trial",
-                "tournaments_used":    0,
-                "tournament_limit":    3,
-                "member_count":        guild.member_count or 0,
-                "last_active":         now_iso(),
-            })
-            print(f"[NexPlay] Auto-registered {guild.name} via is_allowed fallback", flush=True)
+            # Delegate to register_server — single source of truth for
+            # server creation. Avoids field drift between two code paths.
+            rec = await register_server(guild)
+            if rec and rec.get("id"):
+                print(f"[NexPlay] Auto-registered {guild.name} via is_allowed fallback", flush=True)
         else:
             return False, "This server is not registered with NexPlay. Please re-invite the bot."
     status = rec.get("subscription_status", "trial")
@@ -1113,7 +1147,8 @@ def img_url(t_name: str, game: str, kind: str, extra: str = "") -> str:
     }
     tpl, w, h = templates.get(kind, ("professional esports graphic {n} {g}", 1280, 720))
     prompt = tpl.format(n=t_name, g=game, x=extra)
-    prompt = prompt.replace(" ", "%20").replace(",", "%2C")
+    # Proper URL encoding — handles all special chars (&, #, ?, etc.)
+    prompt = urllib.parse.quote(prompt, safe="")
     return (
         "https://image.pollinations.ai/prompt/" + prompt
         + f"?width={w}&height={h}&nologo=true&seed={now_ts()}&model=flux"
@@ -1354,7 +1389,7 @@ class StaffLogView(discord.ui.View):
     @discord.ui.button(label="🔔 Escalate", style=discord.ButtonStyle.danger, custom_id="staff_escalate")
     async def btn_escalate(self, interaction: discord.Interaction, button: discord.ui.Button):
         self._set_status(interaction, "escalated", "🚨 ESCALATED", 0xFF6600, False)
-        await interaction.response.send_message(f"🚨 Escalated! <@&{interaction.guild.id}> please review.", ephemeral=True)
+        await interaction.response.send_message("🚨 Escalated! Staff please review.", ephemeral=True)
 
     # ── 🗑️ DISMISS ────────────────────────────────────────────────────────
     @discord.ui.button(label="🗑️ Dismiss", style=discord.ButtonStyle.secondary, custom_id="staff_dismiss")
@@ -1418,14 +1453,26 @@ async def _post_staff_log(message, uid, q, rec_id, guild_locks, needs_staff, ai_
 
 
 async def handle_support(message: discord.Message) -> None:
-    ok, reason = await check_feature(str(message.guild.id), "ai_support")
+    gid = str(message.guild.id)
+    uid = str(message.author.id)
+
+    # ── ONE-REPLY LOCK (applies to ALL paths, including non-Elite) ───────
+    # Without this, every message in #support from a non-Elite server
+    # triggers the "Elite only" reply — spam. Lock prevents repeats.
+    guild_locks = _replied_users.setdefault(gid, {})
+    if uid in guild_locks:
+        return  # Already replied — silently ignore until staff clears
+
+    ok, reason = await check_feature(gid, "ai_support")
     if not ok:
-        srv = await get_server_record(str(message.guild.id))
+        srv = await get_server_record(gid)
         if srv:
             desc = f"👋 AI support is **Elite** only. You're on **{srv.get('plan_name','?')}** — a staff member will help shortly."
         else:
             desc = "👋 I'm NexPlay Bot. This server isn't registered — ask an admin to run `/setup`."
         await message.reply(embed=discord.Embed(description=desc, color=0xFFA500).set_footer(text="NexPlay Support"), mention_author=False)
+        # Set lock so this user doesn't get spammed with the same message
+        guild_locks[uid] = "non_elite"
         return
     gid = str(message.guild.id)
     uid = str(message.author.id)
@@ -1823,9 +1870,9 @@ async def cmd_setup(interaction: discord.Interaction):
         else:
             created = await register_server(interaction.guild)
             if created and created.get("id"):
-                status_msg = "Server registered! You have a **free trial** with 3 tournaments."
+                status_msg = "✅ Server registered! You have a **Free Trial** with 3 tournaments.\nRun `/setup` again to refresh channels."
             else:
-                status_msg = "⚠️ Failed to register server in the database. Check bot logs for the error."
+                status_msg = "⚠️ Failed to register server in the database. Check bot logs for the error.\n**Try:** Re-invite the bot to your server, or contact NexPlay support."
     elif existing.get("subscription_status") == "inactive":
         # Server was previously removed — reactivate, preserving plan + tournament history
         await b44_update("Server", existing["id"], {
@@ -2153,6 +2200,13 @@ async def cmd_groups(interaction: discord.Interaction, tournament: str):
     if len(regs) < 2:
         return await interaction.followup.send(embed=err_e("Need at least 2 registered teams to generate groups."), ephemeral=True)
 
+    # ── Delete existing groups before regenerating (prevent duplicates) ──
+    existing_groups = await b44_list("TournamentGroup", {"tournament_id": t["id"]})
+    for eg in existing_groups:
+        await b44_delete("TournamentGroup", eg.get("id", ""))
+    if existing_groups:
+        log(f"[Groups] Cleared {len(existing_groups)} old groups for {t.get('name','?')}")
+
     group_size = int(t.get("group_size", 4))
     teams = list(regs)
     random.shuffle(teams)
@@ -2178,9 +2232,9 @@ async def cmd_groups(interaction: discord.Interaction, tournament: str):
             "player_names": player_names,
             "generated_at": now_iso(),
         })
-        # Update registration records with group label
-        for r in group:
-            await b44_update("Registration", r["id"], {"group_label": label, "seed_number": groups.index(group) * group_size + group.index(r) + 1})
+        # Update registration records with group label + sequential seed
+        for idx, r in enumerate(group):
+            await b44_update("Registration", r["id"], {"group_label": label, "seed_number": gi * group_size + idx + 1})
 
     # Update tournament status
     await b44_update("Tournament", t["id"], {"status": "groups_generated"})
@@ -2216,7 +2270,38 @@ async def cmd_results(interaction: discord.Interaction, tournament: str, match_i
     e = discord.Embed(title=f"🏅 Result — {t['name']}", description=match_info, color=0xFFD700, timestamp=datetime.now(timezone.utc))
     e.set_footer(text=f"Posted by {interaction.user.display_name} | NexPlay")
     await results_ch.send(embed=e)
-    await interaction.followup.send(embed=ok_e("Result Posted!", f"Match result posted to #{short}-results."), ephemeral=True)
+
+    # ── Save to Match entity (docstring says "save to DB") ─────────────
+    # Parse match_info: "Group A: Team1 2-1 Team2" or "Team1 2-1 Team2"
+    # This feeds /standings_post, daily reports, and tournament exports.
+    try:
+        score_match = re.search(r'(\S+)\s+(\d+)\s*[-–]\s*(\d+)\s+(\S+)', match_info)
+        group_match = re.search(r'(?:Group\s+([A-Z]))\s*:', match_info, re.I)
+
+        if score_match:
+            p1_name, s1, s2, p2_name = score_match.group(1), int(score_match.group(2)), int(score_match.group(3)), score_match.group(4)
+            winner_name = p1_name if s1 > s2 else p2_name if s2 > s1 else ""
+            # Find player IDs from registrations
+            regs = await b44_list("Registration", {"tournament_id": t["id"]})
+            p1_id = next((r.get("player_discord_id", "") for r in regs if r.get("player_name", "").lower() == p1_name.lower()), "")
+            p2_id = next((r.get("player_discord_id", "") for r in regs if r.get("player_name", "").lower() == p2_name.lower()), "")
+            winner_id = p1_id if s1 > s2 else p2_id if s2 > s1 else ""
+
+            await b44_create("Match", {
+                "tournament_id": t["id"], "guild_id": gid,
+                "round_number": 0, "match_number": 0,
+                "group_label": group_match.group(1) if group_match else "",
+                "player1_id": p1_id, "player1_username": p1_name,
+                "player2_id": p2_id, "player2_username": p2_name,
+                "player1_score": s1, "player2_score": s2,
+                "winner_id": winner_id, "winner_username": winner_name,
+                "status": "completed" if winner_id else "draw",
+                "scheduled_at": now_iso(),
+            })
+    except Exception as ex:
+        log(f"[Results] Could not parse/save match: {ex}")
+
+    await interaction.followup.send(embed=ok_e("Result Posted!", f"Match result posted to #{short}-results and saved to database."), ephemeral=True)
 
 
 @tree.command(name="export_csv", description="📊 Export tournament registrations as CSV")
@@ -2382,14 +2467,16 @@ async def cmd_standings_post(interaction: discord.Interaction, tournament: str):
             desc += f"**🏆 Group {label}**\n{names}\n\n"
         e = discord.Embed(title=f"🏅 Standings — {t['name']} (Group Stage)", description=desc, color=0xFFD700, timestamp=datetime.now(timezone.utc))
     else:
-        # Count wins per player
-        wins = {}
+        # Count wins per player (group by ID, display by username)
+        wins = {}  # {winner_id: {"name": username, "count": N}}
         for m in completed:
             wid = m.get("winner_id", "")
             wname = m.get("winner_username", "Unknown")
-            wins[wname] = wins.get(wname, 0) + 1
-        standings = sorted(wins.items(), key=lambda x: -x[1])
-        desc = "\n".join([f"{'🥇' if i==0 else '🥈' if i==1 else '🥉' if i==2 else f'{i+1}.'} **{name}** — {w} wins" for i, (name, w) in enumerate(standings)])
+            if wid not in wins:
+                wins[wid] = {"name": wname, "count": 0}
+            wins[wid]["count"] += 1
+        standings = sorted(wins.items(), key=lambda x: -x[1]["count"])
+        desc = "\n".join([f"{'🥇' if i==0 else '🥈' if i==1 else '🥉' if i==2 else f'{i+1}.'} **{v['name']}** — {v['count']} wins" for i, (wid, v) in enumerate(standings)])
         e = discord.Embed(title=f"🏅 Standings — {t['name']}", description=desc, color=0xFFD700, timestamp=datetime.now(timezone.utc))
 
     e.set_footer(text="NexPlay Standings")
@@ -2397,6 +2484,83 @@ async def cmd_standings_post(interaction: discord.Interaction, tournament: str):
     if results_ch:
         await results_ch.send(embed=e)
     await interaction.followup.send(embed=ok_e("Standings Posted!", f"Standings posted to #{short}-results."))
+
+
+@tree.command(name="status", description="[Staff] Show bot diagnostic status — DB, memes, music, features")
+async def cmd_status(interaction: discord.Interaction):
+    """Diagnostic command showing what's working and what's broken."""
+    if not is_staff(interaction.user):
+        return await interaction.response.send_message(embed=err_e("Staff only."), ephemeral=True)
+    await interaction.response.defer(thinking=True, ephemeral=True)
+
+    gid = str(interaction.guild.id)
+    lines = []
+
+    # ── Bot status ──────────────────────────────────────────
+    lines.append(f"🤖 **Bot:** {bot.user} ({bot.user.id})")
+    lines.append(f"🌐 **Guild:** {interaction.guild.name} ({gid})")
+    lines.append(f"👥 **Members:** {interaction.guild.member_count}")
+    lines.append(f"📡 **Latency:** {round(bot.latency * 1000)}ms")
+
+    # ── Env vars ────────────────────────────────────────────
+    lines.append(f"\n**Environment:**")
+    lines.append(f"  DISCORD_BOT_TOKEN: {'✅' if BOT_TOKEN else '❌ MISSING'}")
+    lines.append(f"  BASE44_SERVICE_TOKEN: {'✅' if SVC_TOKEN else '❌ MISSING'}")
+    lines.append(f"  GROQ_API_KEY: {'✅' if os.environ.get('GROQ_API_KEY') else '❌ MISSING'}")
+    lines.append(f"  APP_ID: {APP_ID}")
+
+    # ── DB check ────────────────────────────────────────────
+    lines.append(f"\n**Database:**")
+    try:
+        srv = await get_server_record(gid)
+        if srv:
+            lines.append(f"  ✅ Server registered: {srv.get('plan_name','?')} ({srv.get('subscription_status','?')})")
+            lines.append(f"  Tournaments used: {srv.get('tournaments_used',0)}/{srv.get('tournament_limit','∞')}")
+        else:
+            lines.append(f"  ❌ Server NOT in DB — run `/setup` to register")
+    except Exception as e:
+        lines.append(f"  ❌ DB error: {e}")
+
+    # ── Feature check ──────────────────────────────────────
+    lines.append(f"\n**Features:**")
+    for feat in ("meme_post", "create_tournament", "ai_support", "ai_gfx_poster"):
+        ok, _ = await check_feature(gid, feat)
+        lines.append(f"  {'✅' if ok else '❌'} {feat}")
+
+    # ── Meme channel check ────────────────────────────────
+    lines.append(f"\n**Meme System:**")
+    meme_ch = None
+    for hint in ("memes", "meme", "funny", "media"):
+        meme_ch = discord.utils.find(
+            lambda c, h=hint: isinstance(c, discord.TextChannel) and h in c.name.lower(),
+            interaction.guild.text_channels)
+        if meme_ch:
+            break
+    if meme_ch:
+        can_send = meme_ch.permissions_for(interaction.guild.me).send_messages
+        lines.append(f"  ✅ Channel found: #{meme_ch.name} (ID: {meme_ch.id})")
+        lines.append(f"  Can send: {'✅' if can_send else '❌ NO PERMISSION'}")
+    else:
+        lines.append(f"  ❌ No meme channel found — bot will auto-create #memes")
+
+    # ── Music check ────────────────────────────────────────
+    vc = discord.utils.get(bot.voice_clients, guild=interaction.guild)
+    lines.append(f"\n**Music:**")
+    lines.append(f"  Connected: {'✅' if vc else '❌'}")
+    if vc:
+        lines.append(f"  Playing: {'✅' if vc.is_playing() else '❌'}")
+        lines.append(f"  24/7: {'✅' if _music_247.get(interaction.guild.id) else '❌'}")
+
+    embed = discord.Embed(
+        title="🔧 NexPlay Bot Status",
+        description="\n".join(lines),
+        color=0x5865F2,
+        timestamp=datetime.now(timezone.utc)
+    )
+    embed.set_footer(text="NexPlay Diagnostics")
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
 @tree.command(name="help", description="📖 Show all NexPlay commands and features")
 async def cmd_help(interaction: discord.Interaction):
     """Show help with all available commands based on server's plan."""
@@ -3067,7 +3231,7 @@ async def cmd_volume(interaction: discord.Interaction, level: int):
     vol = level / 100
     _music_volumes[interaction.guild.id] = vol
     voice_client = _get_vc(interaction)
-    if voice_client and hasattr(voice_client.source, "volume") and voice_client.source:
+    if voice_client and voice_client.source and hasattr(voice_client.source, "volume"):
         voice_client.source.volume = vol
     await interaction.response.send_message(embed=ok_e("🔊 Volume", f"Volume set to **{level}%**."))
 
