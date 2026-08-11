@@ -33,7 +33,7 @@ HOME_GUILD  = int(os.environ.get("DISCORD_GUILD_ID", "0"))   # owner's server on
 BOT_API_KEY = os.environ.get("BOT_API_KEY", "nexplay-bot-2026").strip()
 APP_ID      = os.environ.get("APP_ID", "6a5226b5047f5c59d961130e")
 
-BOT_API_URL = "https://thistle-d961130e.base44.app/functions/botApi"
+BOT_API_URL = os.environ.get("BOT_API_URL", f"https://{APP_ID}.base44.app/functions/botApi")
 DISCORD_API = "https://discord.com/api/v10"
 
 # ── NexPlay Brand Identity (phoenix/eagle logo — deep blue→purple gradient) ──
@@ -107,6 +107,16 @@ async def check_feature(guild_id: str, feature: str, interaction: discord.Intera
     If interaction is provided, automatically replies with an ephemeral error on deny.
     Self-heals: if no server record exists, tries to create one.
     """
+    # Security: check is_allowed() FIRST so banned/inactive servers can't bypass gating
+    allowed, reason = await is_allowed(guild_id)
+    if not allowed:
+        if interaction:
+            try:
+                await interaction.followup.send(embed=err_e(reason), ephemeral=True)
+            except Exception:
+                pass
+        return False, reason
+
     rec = await get_server_record(guild_id)
     if not rec:
         # Self-heal: try to auto-register if we have a guild context
@@ -482,7 +492,7 @@ async def cmd_announce(
     if not is_staff(interaction.user):
         return await interaction.response.send_message(embed=err_e("Staff only."), ephemeral=True)
     await interaction.response.defer(thinking=True, ephemeral=True)
-    ok, msg = await check_feature(str(interaction.guild.id), "schedule_post", interaction)
+    ok, msg = await check_feature(str(interaction.guild.id), "auto_announce", interaction)
     if not ok:
         return
     # ── Input validation ────────────────────────────────────────────────
@@ -516,8 +526,12 @@ async def cmd_announce(
 #  Next button → button opens next Modal → repeat.
 #  Step data stored in _tourney_sessions[user_id].
 
-_tourney_sessions: dict[int, dict] = {}
-_tourney_session_ts: dict[int, float] = {}  # user_id → creation timestamp (for cleanup)
+_tourney_sessions: dict[tuple, dict] = {}
+_tourney_session_ts: dict[tuple, float] = {}  # (guild_id, user_id) → creation timestamp (for cleanup)
+
+def _session_key(interaction: discord.Interaction) -> tuple:
+    """Scope session by (guild_id, user_id) to prevent cross-server contamination."""
+    return (interaction.guild_id, interaction.user.id)
 
 FMT_LABELS = {"single_elim":"Single Elimination","double_elim":"Double Elimination","round_robin":"Round Robin","battle_royale":"Battle Royale"}
 STAGE_NAMES = ["Group Stage","Quarter Final","Semi Final","Grand Final","Championship"]
@@ -589,19 +603,29 @@ class TournamentStep1Modal(discord.ui.Modal, title="🏆 Create Tournament (1/3)
     t_desc  = discord.ui.TextInput(label="Description (optional)",placeholder="Open for all — register now!",            required=False, max_length=200, style=discord.TextStyle.paragraph)
 
     async def on_submit(self, interaction: discord.Interaction):
-        _tourney_sessions[interaction.user.id] = {
-            "name":        self.t_name.value.strip(),
-            "game":        self.t_game.value.strip(),
+        name = self.t_name.value.strip()
+        game = self.t_game.value.strip()
+        if not name or not game:
+            return await interaction.response.send_message(
+                "❌ Tournament Name and Game cannot be empty!", ephemeral=True)
+        # ── Early duplicate check ──
+        existing = await _find_tournament(str(interaction.guild.id), name)
+        if existing:
+            return await interaction.response.send_message(
+                embed=err_e(f"A tournament named **{name}** already exists in this server."), ephemeral=True)
+        _tourney_sessions[_session_key(interaction)] = {
+            "name":        name,
+            "game":        game,
             "prize_pool":  self.t_prize.value.strip(),
             "date":        self.t_date.value.strip(),
             "description": self.t_desc.value.strip(),
         }
-        _tourney_session_ts[interaction.user.id] = now_ts()
+        _tourney_session_ts[_session_key(interaction)] = now_ts()
         embed = discord.Embed(
             title="✅ Step 1 of 3 saved!",
             description=(
-                f"**Name:** {self.t_name.value.strip()}\n"
-                f"**Game:** {self.t_game.value.strip()}\n"
+                f"**Name:** {name}\n"
+                f"**Game:** {game}\n"
                 f"**Prize:** {self.t_prize.value.strip()}\n"
                 f"**Date:** {self.t_date.value.strip()}\n\n"
                 "Click **Next →** to fill Format & Slots."
@@ -616,13 +640,13 @@ class Step2ButtonView(discord.ui.View):
 
     @discord.ui.button(label="Next → Format & Slots", style=discord.ButtonStyle.primary, emoji="➡️")
     async def go_step2(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id not in _tourney_sessions:
+        if _session_key(interaction) not in _tourney_sessions:
             return await interaction.response.send_message("❌ Session expired. Run /create_tournament again.", ephemeral=True)
         await interaction.response.send_modal(TournamentStep2Modal())
 
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.danger, emoji="✖️")
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
-        _tourney_sessions.pop(interaction.user.id, None)
+        _tourney_sessions.pop(_session_key(interaction), None)
         await interaction.response.edit_message(content="❌ Tournament creation cancelled.", embed=None, view=None)
 
 
@@ -635,7 +659,7 @@ class TournamentStep2Modal(discord.ui.Modal, title="🏆 Create Tournament (2/3)
     t_format = discord.ui.TextInput(label="Match Format",            placeholder="Battle Royale / Single Elim / Round Robin", max_length=40)
 
     async def on_submit(self, interaction: discord.Interaction):
-        uid = interaction.user.id
+        uid = _session_key(interaction)
         if uid not in _tourney_sessions:
             return await interaction.response.send_message("❌ Session expired. Run /create_tournament again.", ephemeral=True)
         _tourney_sessions[uid].update({
@@ -663,13 +687,13 @@ class Step3ButtonView(discord.ui.View):
 
     @discord.ui.button(label="Next → Schedule & Rules", style=discord.ButtonStyle.primary, emoji="➡️")
     async def go_step3(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id not in _tourney_sessions:
+        if _session_key(interaction) not in _tourney_sessions:
             return await interaction.response.send_message("❌ Session expired. Run /create_tournament again.", ephemeral=True)
         await interaction.response.send_modal(TournamentStep3Modal())
 
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.danger, emoji="✖️")
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
-        _tourney_sessions.pop(interaction.user.id, None)
+        _tourney_sessions.pop(_session_key(interaction), None)
         await interaction.response.edit_message(content="❌ Tournament creation cancelled.", embed=None, view=None)
 
 
@@ -683,7 +707,7 @@ class TournamentStep3Modal(discord.ui.Modal, title="🏆 Create Tournament (3/3)
 
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(thinking=True, ephemeral=True)
-        uid = interaction.user.id
+        uid = _session_key(interaction)
         if uid not in _tourney_sessions:
             return await interaction.followup.send("❌ Session expired. Run /create_tournament again.", ephemeral=True)
 
@@ -703,10 +727,10 @@ class TournamentStep3Modal(discord.ui.Modal, title="🏆 Create Tournament (3/3)
         prize_pool  = s["prize_pool"]
         date        = s["date"]
         description = s.get("description", "")
-        max_players = safe_int(s.get("max_players", "16"), 16)
-        team_size   = safe_int(s.get("team_size", "4"),     4)
-        group_size  = safe_int(s.get("group_size", "4"),    4)
-        rounds      = safe_int(s.get("rounds", "3"),        3)
+        max_players = safe_pos_int(s.get("max_players", "16"), 16, 2)
+        team_size   = safe_pos_int(s.get("team_size", "4"),     4, 1)
+        group_size  = safe_pos_int(s.get("group_size", "4"),    4, 2)
+        rounds      = safe_pos_int(s.get("rounds", "3"),        3, 1)
         fmt         = s.get("format", "Battle Royale")
         time_str    = self.t_time.value.strip()    or "TBD"
         reg_end     = self.t_regend.value.strip()  or "TBD"
@@ -762,10 +786,23 @@ class TournamentStep3Modal(discord.ui.Modal, title="🏆 Create Tournament (3/3)
         })
         tid = rec.get("id", "")
         if not tid:
+            # ── Rollback: delete orphaned channels if DB creation failed ──
+            try:
+                for ch_key in ["announcements", "register", "info", "roadmap", "groups", "results", "confirm-teams", "team-logo", "help"]:
+                    cid = t_channels.get(ch_key)
+                    if cid:
+                        ch = interaction.guild.get_channel(int(cid))
+                        if ch:
+                            await ch.delete(reason="Rollback: DB record creation failed")
+                cat_id = t_channels.get("category_id")
+                if cat_id:
+                    cat = interaction.guild.get_channel(int(cat_id))
+                    if cat:
+                        await cat.delete(reason="Rollback: DB record creation failed")
+            except Exception as rb_err:
+                log(f"[Tournament] Rollback failed: {rb_err}")
             return await interaction.followup.send(embed=err_e(
-                "❌ Database error — tournament could not be created. "
-                "Channels were created but the database record failed. "
-                "Contact staff to manually create the record or delete the channels."), ephemeral=True)
+                "❌ Database error — tournament creation aborted and created channels were rolled back."), ephemeral=True)
 
         # Update server tournament count
         srv = await get_server_record(gid)
@@ -889,10 +926,10 @@ class TournamentEditSlotsModal(discord.ui.Modal, title="✏️ Edit Tournament �
         await interaction.response.defer(thinking=True, ephemeral=True)
         t = self.tournament
         updates = {
-            "max_players":      safe_int(self.t_max.value, t.get("max_players", 16)),
-            "team_size":        safe_int(self.t_tsize.value, t.get("team_size", 4)),
-            "group_size":       safe_int(self.t_gsize.value, t.get("group_size", 4)),
-            "rounds":           safe_int(self.t_rounds.value, t.get("rounds", 3)),
+            "max_players":      safe_pos_int(self.t_max.value, t.get("max_players", 16), 2),
+            "team_size":        safe_pos_int(self.t_tsize.value, t.get("team_size", 4), 1),
+            "group_size":       safe_pos_int(self.t_gsize.value, t.get("group_size", 4), 2),
+            "rounds":           safe_pos_int(self.t_rounds.value, t.get("rounds", 3), 1),
             "eligible_nations": self.t_nations.value.strip() or "🇳🇵",
         }
         update_result = await b44_update("Tournament", t["id"], updates)
@@ -904,7 +941,7 @@ class TournamentEditSlotsModal(discord.ui.Modal, title="✏️ Edit Tournament �
 class TournamentStatusModal(discord.ui.Modal, title="🔄 Change Tournament Status"):
     t_status = discord.ui.TextInput(
         label="New Status",
-        placeholder="registration_open / registration_closed / in_progress / completed / cancelled",
+        placeholder="registration_open / registration_closed / groups_generated / in_progress / completed / cancelled",
         max_length=30
     )
 
@@ -915,10 +952,25 @@ class TournamentStatusModal(discord.ui.Modal, title="🔄 Change Tournament Stat
 
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(thinking=True, ephemeral=True)
-        valid = {"registration_open", "registration_closed", "in_progress", "completed", "cancelled"}
+        valid = {"registration_open", "registration_closed", "groups_generated", "in_progress", "completed", "cancelled"}
         new_status = self.t_status.value.strip().lower()
         if new_status not in valid:
             return await interaction.followup.send(embed=err_e(f"Invalid status. Choose from: {', '.join(valid)}"), ephemeral=True)
+        # ── State machine: validate transitions ──
+        curr = self.tournament.get("status", "registration_open")
+        VALID_TRANSITIONS = {
+            "registration_open":   {"registration_closed", "cancelled"},
+            "registration_closed": {"groups_generated", "in_progress", "registration_open", "cancelled"},
+            "groups_generated":    {"in_progress", "registration_closed", "cancelled"},
+            "in_progress":         {"completed", "cancelled"},
+            "completed":           set(),  # Terminal state
+            "cancelled":           {"registration_open"},  # Can reopen
+        }
+        allowed_next = VALID_TRANSITIONS.get(curr, set())
+        if new_status not in allowed_next and new_status != curr:
+            return await interaction.followup.send(embed=err_e(
+                f"❌ Cannot transition from **{curr}** → **{new_status}**.\n"
+                f"Allowed: {', '.join(sorted(allowed_next)) if allowed_next else '(terminal state)'}"), ephemeral=True)
         update_result = await b44_update("Tournament", self.tournament["id"], {"status": new_status})
         if not update_result or not update_result.get("id"):
             return await interaction.followup.send(embed=err_e("❌ Database error — status could not be updated."), ephemeral=True)
@@ -1176,6 +1228,13 @@ def now_ts() -> int:
 def safe_int(v, d=16):
     """Safe int conversion with default fallback."""
     try: return int(v)
+    except: return d
+
+def safe_pos_int(v, d=16, min_val=1):
+    """Safely parse integer ensuring value >= min_val."""
+    try:
+        parsed = int(v)
+        return parsed if parsed >= min_val else d
     except: return d
 
 def is_staff(member: discord.Member) -> bool:
@@ -1735,8 +1794,20 @@ async def update_reg_announcement(tournament: dict, guild: discord.Guild, regist
 
 async def handle_registration(message: discord.Message, gid: str, short: str, tournament: dict):
     text = message.content.strip()
-    team_size = int(tournament.get("team_size", 4))
+    team_size = max(1, int(tournament.get("team_size", 4)))
     parsed = parse_registration(text, team_size)
+
+    # ── Registration deadline enforcement ──
+    reg_dl = tournament.get("reg_deadline", "")
+    if reg_dl and reg_dl.upper().strip() != "TBD":
+        try:
+            dl_dt = datetime.fromisoformat(reg_dl.replace("Z", "+00:00"))
+            if datetime.now(timezone.utc) > dl_dt:
+                await _reject_msg(message, "🔒 Registration Closed",
+                    "The registration deadline for this tournament has passed.")
+                return
+        except (ValueError, TypeError):
+            pass  # Free-form deadline string, skip strict enforcement
 
     if not parsed:
         lines_needed = "\n".join([f"Player {i+1}: @mention" for i in range(team_size)])
@@ -1748,7 +1819,26 @@ async def handle_registration(message: discord.Message, gid: str, short: str, to
     team_name = parsed["team_name"]
     players = parsed["players"]
 
-    existing_regs = await b44_list("Registration", {"tournament_id": tournament["id"]})
+    existing_regs = await b44_list("Registration", {"tournament_id": tournament["id"], "guild_id": gid})
+
+    # ── Captain duplicate check ──
+    captain_id = str(message.author.id)
+    if any(r.get("player_discord_id") == captain_id for r in existing_regs):
+        await _reject_msg(message, "❌ Already Registered",
+            "You have already registered a team for this tournament as Captain!")
+        return
+
+    # ── Internal duplicate mention check ──
+    if len(set(players)) != len(players):
+        await _reject_msg(message, "❌ Duplicate Mentions",
+            "Each team member must be a unique user!")
+        return
+
+    # ── Team name length validation ──
+    if len(team_name) > 50:
+        await _reject_msg(message, "❌ Team Name Too Long",
+            "Team name must be 50 characters or fewer.")
+        return
 
     # Duplicate team name?
     if any(r.get("player_name", "").lower() == team_name.lower() for r in existing_regs):
@@ -1783,6 +1873,9 @@ async def handle_registration(message: discord.Message, gid: str, short: str, to
         "tournament_id": tournament["id"], "guild_id": gid,
         "player_name": team_name, "player_discord_id": str(message.author.id),
         "team_members": players, "status": "registered", "logo_url": "",
+        "logo_submitted_at": "", "logo_submitted_by": "",
+        "registered_at": datetime.now(timezone.utc).isoformat(),
+        "seed_number": 0, "group_label": "",
     })
     if not reg_rec or not reg_rec.get("id"):
         await _reject_msg(message, "❌ Registration Failed",
@@ -1793,22 +1886,22 @@ async def handle_registration(message: discord.Message, gid: str, short: str, to
         log(f"[Reg] Failed to update tournament count for {tournament.get('name','?')}")
     await message.add_reaction("✅")
 
-    # Post confirmation to #<short>-confirm-teams
+    # Post confirmation to #<short>-confirm-teams (fallback to register channel)
     cfm_ch = discord.utils.get(message.guild.text_channels, name=short + "-confirm-teams")
-    if cfm_ch:
-        player_mentions = " ".join(f"<@{p}>" for p in players)
-        logo_ch = discord.utils.get(message.guild.text_channels, name=short + "-team-logo")
-        logo_mention = f"<#{logo_ch.id}>" if logo_ch else f"#{short}-team-logo"
-        e = discord.Embed(title="✅ TEAM REGISTERED!",
-            description=(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"🏷️ **Team:** {team_name}\n👑 **Captain:** {message.author.mention}\n"
-                f"👥 **Players:** {player_mentions}\n🎫 **Slot:** #{slot} of {max_p}\n"
-                f"🏆 **Tournament:** {tournament.get('name', '')}\n"
-                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n**CONFIRMED ✅**\n\n"
-                f"🎨 Submit logo in {logo_mention} — `Team Name: <name>` + image"),
-            color=0x00FF7F, timestamp=datetime.now(timezone.utc))
-        e.set_footer(text=f"NexPlay | {tournament.get('game','')}", icon_url=BRAND_LOGO_URL)
-        await cfm_ch.send(embed=e)
+    target_ch = cfm_ch or message.channel  # Fallback if confirm-teams deleted
+    player_mentions = " ".join(f"<@{p}>" for p in players)
+    logo_ch = discord.utils.get(message.guild.text_channels, name=short + "-team-logo")
+    logo_mention = f"<#{logo_ch.id}>" if logo_ch else f"#{short}-team-logo"
+    e = discord.Embed(title="✅ TEAM REGISTERED!",
+        description=(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🏷️ **Team:** {team_name}\n👑 **Captain:** {message.author.mention}\n"
+            f"👥 **Players:** {player_mentions}\n🎫 **Slot:** #{slot} of {max_p}\n"
+            f"🏆 **Tournament:** {tournament.get('name', '')}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n**CONFIRMED ✅**\n\n"
+            f"🎨 Submit logo in {logo_mention} — `Team Name: <name>` + image"),
+        color=0x00FF7F, timestamp=datetime.now(timezone.utc))
+    e.set_footer(text=f"NexPlay | {tournament.get('game','')}", icon_url=BRAND_LOGO_URL)
+    await target_ch.send(embed=e)
 
     # Update announcement + auto-close
     updated_t = dict(tournament); updated_t["registered_count"] = slot
@@ -1826,6 +1919,10 @@ async def handle_registration(message: discord.Message, gid: str, short: str, to
 
 async def handle_logo_submission(message: discord.Message, gid: str, short: str, tournament: dict):
     images = [a for a in message.attachments if a.content_type and a.content_type.startswith("image/")]
+    # ── File size validation (max 8MB) ──
+    if images and images[0].size > 8 * 1024 * 1024:
+        await _reject_msg(message, "❌ Image Too Large", "Team logo must be smaller than 8MB.")
+        return
     if not images:
         await _reject_msg(message, "❌ No Image Attached",
             "Attach your team logo (PNG/JPG) + include your team name.\n"
@@ -1838,7 +1935,7 @@ async def handle_logo_submission(message: discord.Message, gid: str, short: str,
         return
 
     submitted_name = match.group(1).strip()
-    existing_regs = await b44_list("Registration", {"tournament_id": tournament["id"]})
+    existing_regs = await b44_list("Registration", {"tournament_id": tournament["id"], "guild_id": gid})
     matched = next((r for r in existing_regs if r.get("player_name", "").lower() == submitted_name.lower()), None)
     if not matched:
         matched = next((r for r in existing_regs if r.get("player_discord_id") == str(message.author.id)), None)
@@ -1846,6 +1943,18 @@ async def handle_logo_submission(message: discord.Message, gid: str, short: str,
     if not matched:
         await _reject_msg(message, "❌ Team Not Found",
             f"**{submitted_name}** is not registered in this tournament.", delay=20)
+        return
+
+    # ── CRITICAL: Verify author is captain or team member ──
+    author_id = str(message.author.id)
+    team_members = matched.get("team_members", [])
+    if isinstance(team_members, str):
+        team_members = [x.strip() for x in team_members.split(",")]
+    is_captain = matched.get("player_discord_id") == author_id
+    is_member = author_id in [str(m) for m in team_members]
+    if not (is_captain or is_member or is_staff(message.author)):
+        await _reject_msg(message, "❌ Unauthorized",
+            f"You are not a member or captain of **{submitted_name}**.", delay=20)
         return
 
     logo_url = images[0].url
@@ -2014,7 +2123,9 @@ async def make_tournament_channels(guild: discord.Guild, tournament_name: str) -
         short = words[0][:4].lower()
     else:
         short = ("".join(w[0] for w in words) + re.sub(r"[^0-9]", "", tournament_name)[-2:])[:6].lower()
-    short = re.sub(r"[^a-z0-9]", "", short)[:6] or "tourney"
+    short = re.sub(r"[^a-z0-9]", "", short)[:6]
+    if not short:
+        short = f"t{str(guild.id)[-3:]}{random.randint(10,99)}"
 
     cat_name = f"🏆 {short.upper()}"
     
@@ -2308,15 +2419,15 @@ async def cmd_groups(interaction: discord.Interaction, tournament: str):
     if not t:
         return await interaction.followup.send(embed=err_e(f"Tournament **{tournament}** not found."), ephemeral=True)
 
-    if t.get("status") not in ("registration_closed", "registration_open"):
+    if t.get("status") not in ("registration_closed", "registration_open", "groups_generated"):
         return await interaction.followup.send(embed=err_e(f"Close registration first. Current status: **{t.get('status')}**"), ephemeral=True)
 
-    regs = await b44_list("Registration", {"tournament_id": t["id"]})
+    regs = await b44_list("Registration", {"tournament_id": t["id"], "guild_id": gid})
     if len(regs) < 2:
         return await interaction.followup.send(embed=err_e("Need at least 2 registered teams to generate groups."), ephemeral=True)
 
     # ── Delete existing groups before regenerating (prevent duplicates) ──
-    existing_groups = await b44_list("TournamentGroup", {"tournament_id": t["id"]})
+    existing_groups = await b44_list("TournamentGroup", {"tournament_id": t["id"], "guild_id": gid})
     del_ok, del_fail = 0, 0
     for eg in existing_groups:
         if await b44_delete("TournamentGroup", eg.get("id", "")):
@@ -2327,7 +2438,7 @@ async def cmd_groups(interaction: discord.Interaction, tournament: str):
         log(f"[Groups] Cleared {del_ok} old groups for {t.get('name','?')}" +
             (f" ({del_fail} failed to delete)" if del_fail else ""))
 
-    group_size = int(t.get("group_size", 4))
+    group_size = max(2, safe_pos_int(t.get("group_size", 4), 4, 2))
     teams = list(regs)
     random.shuffle(teams)
     num_groups = max(1, (len(teams) + group_size - 1) // group_size)
@@ -2339,6 +2450,7 @@ async def cmd_groups(interaction: discord.Interaction, tournament: str):
     short = t.get("short_name", "")
     groups_ch = discord.utils.get(interaction.guild.text_channels, name=f"{short}-groups")
     desc = ""
+    current_seed = 1  # Continuous seed counter across all groups
     for gi, group in enumerate(groups):
         label = chr(65 + gi)  # A, B, C...
         player_names = [r.get("player_name", "?") for r in group]
@@ -2354,11 +2466,12 @@ async def cmd_groups(interaction: discord.Interaction, tournament: str):
         })
         if not group_rec or not group_rec.get("id"):
             log(f"[Groups] ⚠️ Failed to create TournamentGroup {label} for {t.get('name','?')}")
-        # Update registration records with group label + sequential seed
+        # Update registration records with group label + continuous seed
         for idx, r in enumerate(group):
-            upd_ok = await b44_update("Registration", r["id"], {"group_label": label, "seed_number": gi * group_size + idx + 1})
+            upd_ok = await b44_update("Registration", r["id"], {"group_label": label, "seed_number": current_seed})
             if not upd_ok:
                 log(f"[Groups] ⚠️ Failed to update registration {r.get('player_name','?')} with group {label}")
+            current_seed += 1
 
     # Update tournament status — verify it took
     status_ok = await b44_update("Tournament", t["id"], {"status": "groups_generated"})
@@ -2393,6 +2506,11 @@ async def cmd_results(interaction: discord.Interaction, tournament: str, match_i
     if not t:
         return await interaction.followup.send(embed=err_e(f"Tournament **{tournament}** not found."), ephemeral=True)
 
+    # ── Status validation: only accept results for active tournaments ──
+    if t.get("status") not in ("in_progress", "groups_generated", "registration_closed"):
+        return await interaction.followup.send(embed=err_e(
+            f"Tournament status is **{t.get('status')}**. Results can only be posted when tournament is in progress."), ephemeral=True)
+
     short = t.get("short_name", "")
     results_ch = discord.utils.get(interaction.guild.text_channels, name=f"{short}-results")
     if not results_ch:
@@ -2406,22 +2524,39 @@ async def cmd_results(interaction: discord.Interaction, tournament: str, match_i
     # Parse match_info: "Group A: Team1 2-1 Team2" or "Team1 2-1 Team2"
     # This feeds /standings_post, daily reports, and tournament exports.
     try:
-        score_match = re.search(r'(\S+)\s+(\d+)\s*[-–]\s*(\d+)\s+(\S+)', match_info)
-        group_match = re.search(r'(?:Group\s+([A-Z]))\s*:', match_info, re.I)
+        # ── Improved regex: handles team names with spaces ──
+        score_match = re.search(r'^(?:Group\s+([A-Z])\s*:\s*)?(.+?)\s+(\d+)\s*[-–]\s*(\d+)\s+(.+)$', match_info.strip(), re.I)
 
         if score_match:
-            p1_name, s1, s2, p2_name = score_match.group(1), int(score_match.group(2)), int(score_match.group(3)), score_match.group(4)
-            winner_name = p1_name if s1 > s2 else p2_name if s2 > s1 else ""
+            g_label = score_match.group(1) or ""
+            p1_name, s1, s2, p2_name = score_match.group(2).strip(), int(score_match.group(3)), int(score_match.group(4)), score_match.group(5).strip()
+            winner_name = p1_name if s1 > s2 else p2_name if s2 > s1 else "Draw"
+
+            # ── Score validation ──
+            if s1 < 0 or s2 < 0:
+                await interaction.followup.send(embed=err_e("❌ Scores must be non-negative!"), ephemeral=True)
+                return
+
             # Find player IDs from registrations
-            regs = await b44_list("Registration", {"tournament_id": t["id"]})
-            p1_id = next((r.get("player_discord_id", "") for r in regs if r.get("player_name", "").lower() == p1_name.lower()), "")
-            p2_id = next((r.get("player_discord_id", "") for r in regs if r.get("player_name", "").lower() == p2_name.lower()), "")
+            regs = await b44_list("Registration", {"tournament_id": t["id"], "guild_id": gid})
+            p1_reg = next((r for r in regs if r.get("player_name", "").lower() == p1_name.lower()), None)
+            p2_reg = next((r for r in regs if r.get("player_name", "").lower() == p2_name.lower()), None)
+            if not p1_reg or not p2_reg:
+                missing = []
+                if not p1_reg: missing.append(f"`{p1_name}`")
+                if not p2_reg: missing.append(f"`{p2_name}`")
+                await interaction.followup.send(embed=err_e(
+                    f"❌ Team not found in registrations: {' & '.join(missing)}"), ephemeral=True)
+                return
+            p1_id = p1_reg.get("player_discord_id", "")
+            p2_id = p2_reg.get("player_discord_id", "")
             winner_id = p1_id if s1 > s2 else p2_id if s2 > s1 else ""
 
-            # ── Idempotency: skip if this exact match already exists ────
-            existing_ms = await b44_list("Match", {"tournament_id": t["id"]})
+            # ── Idempotency: check both orderings ────
+            existing_ms = await b44_list("Match", {"tournament_id": t["id"], "guild_id": gid})
             dup = any(
-                m.get("player1_id") == p1_id and m.get("player2_id") == p2_id
+                ((m.get("player1_id") == p1_id and m.get("player2_id") == p2_id) or
+                 (m.get("player1_id") == p2_id and m.get("player2_id") == p1_id))
                 and m.get("round_number", 0) == 0
                 for m in existing_ms
             )
@@ -2432,17 +2567,25 @@ async def cmd_results(interaction: discord.Interaction, tournament: str, match_i
 
             match_rec = await b44_create("Match", {
                 "tournament_id": t["id"], "guild_id": gid,
-                "round_number": 0, "match_number": 0,
-                "group_label": group_match.group(1) if group_match else "",
+                "round_number": 0, "match_number": len(existing_ms) + 1,
+                "group_label": g_label,
                 "player1_id": p1_id, "player1_username": p1_name,
                 "player2_id": p2_id, "player2_username": p2_name,
                 "player1_score": s1, "player2_score": s2,
                 "winner_id": winner_id, "winner_username": winner_name,
                 "status": "completed" if winner_id else "draw",
                 "scheduled_at": now_iso(),
+                "results_card_image_url": "",
             })
+        else:
+            await interaction.followup.send(embed=err_e(
+                "❌ Invalid format! Use: `Group A: Team One 2-1 Team Two` or `Team One 2-1 Team Two`"), ephemeral=True)
+            return
     except Exception as ex:
         log(f"[Results] Could not parse/save match: {ex}")
+        await interaction.followup.send(embed=err_e(
+            f"❌ Error processing match result: {ex}"), ephemeral=True)
+        return
 
     await interaction.followup.send(embed=ok_e("Result Posted!", f"Match result posted to #{short}-results." + (" Match saved to database." if 'match_rec' in dir() and match_rec and match_rec.get('id') else " Match NOT saved — parse failed or DB error.")), ephemeral=True)
 
@@ -2463,7 +2606,7 @@ async def cmd_export_csv(interaction: discord.Interaction, tournament: str):
     if not t:
         return await interaction.followup.send(embed=err_e(f"Tournament **{tournament}** not found."), ephemeral=True)
 
-    regs = await b44_list("Registration", {"tournament_id": t["id"]})
+    regs = await b44_list("Registration", {"tournament_id": t["id"], "guild_id": gid})
     import csv
     buf = io.StringIO()
     writer = csv.writer(buf)
@@ -2507,7 +2650,7 @@ async def cmd_schedule_post(interaction: discord.Interaction, tournament: str):
         return await interaction.followup.send(embed=err_e(f"Tournament **{tournament}** not found."), ephemeral=True)
 
     short = t.get("short_name", "")
-    groups = await b44_list("TournamentGroup", {"tournament_id": t["id"]})
+    groups = await b44_list("TournamentGroup", {"tournament_id": t["id"], "guild_id": gid})
     rounds = int(t.get("rounds", 3))
     date = t.get("tournament_date", "TBD")
     time_str = t.get("tournament_time", "TBD")
@@ -2606,32 +2749,65 @@ async def cmd_standings_post(interaction: discord.Interaction, tournament: str):
         return await interaction.followup.send(embed=err_e(f"Tournament **{tournament}** not found."), ephemeral=True)
 
     short = t.get("short_name", "")
-    matches = await b44_list("Match", {"tournament_id": t["id"]})
-    completed = [m for m in matches if m.get("status") == "completed" and m.get("winner_id")]
+    matches = await b44_list("Match", {"tournament_id": t["id"], "guild_id": gid})
+    regs = await b44_list("Registration", {"tournament_id": t["id"], "guild_id": gid})
 
-    if not completed:
-        # No completed matches — show group stage standings instead
-        groups = await b44_list("TournamentGroup", {"tournament_id": t["id"]})
-        if not groups:
-            return await interaction.followup.send(embed=err_e("No matches completed and no groups generated yet. Run /groups first."), ephemeral=True)
-        desc = ""
-        for g in groups:
-            label = g.get("group_label", "?")
-            names = g.get("player_names", [])
-            if isinstance(names, list): names = "\n".join(f"  {i+1}. {n}" for i, n in enumerate(names))
-            desc += f"**🏆 Group {label}**\n{names}\n\n"
-        e = discord.Embed(title=f"🏅 Standings — {t['name']} (Group Stage)", description=desc, color=0xFFD700, timestamp=datetime.now(timezone.utc))
-    else:
-        # Count wins per player (group by ID, display by username)
-        wins = {}  # {winner_id: {"name": username, "count": N}}
-        for m in completed:
+    # ── Full standings: points system (3=win, 1=draw, 0=loss) ──
+    stats = {}
+    for r in regs:
+        pid = r.get("player_discord_id", "")
+        if pid:
+            stats[pid] = {"name": r.get("player_name", "Unknown"), "group": r.get("group_label", "—"),
+                          "played": 0, "wins": 0, "draws": 0, "losses": 0, "pts": 0, "diff": 0}
+
+    for m in matches:
+        p1, p2 = m.get("player1_id", ""), m.get("player2_id", "")
+        s1, s2 = int(m.get("player1_score", 0)), int(m.get("player2_score", 0))
+        status = m.get("status", "")
+        if status not in ("completed", "draw"):
+            continue
+        if p1 in stats:
+            stats[p1]["played"] += 1
+            stats[p1]["diff"] += (s1 - s2)
+        if p2 in stats:
+            stats[p2]["played"] += 1
+            stats[p2]["diff"] += (s2 - s1)
+        if status == "completed":
             wid = m.get("winner_id", "")
-            wname = m.get("winner_username", "Unknown")
-            if wid not in wins:
-                wins[wid] = {"name": wname, "count": 0}
-            wins[wid]["count"] += 1
-        standings = sorted(wins.items(), key=lambda x: -x[1]["count"])
-        desc = "\n".join([f"{'🥇' if i==0 else '🥈' if i==1 else '🥉' if i==2 else f'{i+1}.'} **{v['name']}** — {v['count']} wins" for i, (wid, v) in enumerate(standings)])
+            lid = p2 if wid == p1 else p1
+            if wid in stats:
+                stats[wid]["wins"] += 1
+                stats[wid]["pts"] += 3
+            if lid in stats:
+                stats[lid]["losses"] += 1
+        elif status == "draw":
+            if p1 in stats:
+                stats[p1]["draws"] += 1
+                stats[p1]["pts"] += 1
+            if p2 in stats:
+                stats[p2]["draws"] += 1
+                stats[p2]["pts"] += 1
+
+    leaderboard = sorted(stats.values(), key=lambda x: (-x["pts"], -x["diff"], -x["wins"]))
+
+    if not leaderboard or all(s["played"] == 0 for s in leaderboard):
+        # No matches played — show group stage instead
+        groups = await b44_list("TournamentGroup", {"tournament_id": t["id"], "guild_id": gid})
+        if not groups and not leaderboard:
+            return await interaction.followup.send(embed=err_e("No matches completed and no groups generated yet. Run /groups first."), ephemeral=True)
+        if groups:
+            desc = ""
+            for g in groups:
+                label = g.get("group_label", "?")
+                names = g.get("player_names", [])
+                if isinstance(names, list): names = "\n".join(f"  {i+1}. {n}" for i, n in enumerate(names))
+                desc += f"**🏆 Group {label}**\n{names}\n\n"
+            e = discord.Embed(title=f"🏅 Standings — {t['name']} (Group Stage)", description=desc, color=0xFFD700, timestamp=datetime.now(timezone.utc))
+        else:
+            desc = "\n".join([f"{'🥇' if i==0 else '🥈' if i==1 else '🥉' if i==2 else f'{i+1}.'} **{s['name']}** — {s['pts']} pts | {s['wins']}W-{s['draws']}D-{s['losses']}L | Diff: {s['diff']:+d}" for i, s in enumerate(leaderboard)])
+            e = discord.Embed(title=f"🏅 Standings — {t['name']}", description=desc, color=0xFFD700, timestamp=datetime.now(timezone.utc))
+    else:
+        desc = "\n".join([f"{'🥇' if i==0 else '🥈' if i==1 else '🥉' if i==2 else f'{i+1}.'} **{s['name']}** — {s['pts']} pts | {s['wins']}W-{s['draws']}D-{s['losses']}L | Diff: {s['diff']:+d}" for i, s in enumerate(leaderboard)])
         e = discord.Embed(title=f"🏅 Standings — {t['name']}", description=desc, color=0xFFD700, timestamp=datetime.now(timezone.utc))
 
     e.set_footer(text="NexPlay Standings", icon_url=BRAND_LOGO_URL)
@@ -2897,9 +3073,9 @@ async def cmd_delete_tournament(interaction: discord.Interaction, name: str):
 
     # 0. Excel backup BEFORE deleting
     try:
-        regs = await b44_list("Registration", {"tournament_id": t_id})
-        groups = await b44_list("TournamentGroup", {"tournament_id": t_id})
-        matches = await b44_list("Match", {"tournament_id": t_id})
+        regs = await b44_list("Registration", {"tournament_id": t_id, "guild_id": gid})
+        groups = await b44_list("TournamentGroup", {"tournament_id": t_id, "guild_id": gid})
+        matches = await b44_list("Match", {"tournament_id": t_id, "guild_id": gid})
         xl_buf = await build_tournament_export_excel(tournament, regs, groups, matches)
         safe_name = "".join(c for c in t_name if c.isalnum() or c in " -_")[:30].strip() or "tournament"
         filename = f"NexPlay_Backup_{safe_name}_{datetime.now(timezone.utc).strftime('%Y%m%d')}.xlsx"
@@ -2941,6 +3117,15 @@ async def cmd_delete_tournament(interaction: discord.Interaction, name: str):
     # 6. Delete the tournament record itself
     t_deleted = await b44_delete("Tournament", t_id) if t_id else False
 
+    # ── Decrement tournaments_used on the Server record ──
+    if t_deleted:
+        srv = await get_server_record(gid)
+        if srv:
+            current_used = int(srv.get("tournaments_used", 1))
+            await b44_update("Server", srv["id"], {
+                "tournaments_used": max(0, current_used - 1)
+            })
+
     desc = f"🗑️ **{t_name}**\nChannels: {len(deleted_channels)} deleted"
     if failed_channels: desc += f", {len(failed_channels)} failed"
     if category_deleted: desc += f"\nCategory: {cat_name} deleted"
@@ -2951,6 +3136,55 @@ async def cmd_delete_tournament(interaction: discord.Interaction, name: str):
     else:
         await interaction.followup.send(embed=err_e("DB record could not be deleted."), ephemeral=True)
 
+
+
+
+@tree.command(name="redeem", description="🎟️ Redeem a promo code for plan upgrade")
+@app_commands.describe(code="Promo code to redeem")
+async def cmd_redeem(interaction: discord.Interaction, code: str):
+    """Redeem a promo code for a plan upgrade."""
+    if not is_staff(interaction.user):
+        return await interaction.response.send_message(embed=err_e("❌ Staff only command."), ephemeral=True)
+    await interaction.response.defer(thinking=True, ephemeral=True)
+
+    gid = str(interaction.guild.id)
+    promos = await b44_list("PromoCode", {"code": code.strip().upper()})
+    if not promos:
+        return await interaction.followup.send(embed=err_e("❌ Invalid promo code."), ephemeral=True)
+
+    promo = promos[0]
+    if not promo.get("active", True):
+        return await interaction.followup.send(embed=err_e("❌ This promo code is no longer active."), ephemeral=True)
+
+    used = int(promo.get("used_count", 0))
+    max_uses = int(promo.get("max_uses", 1))
+    if used >= max_uses:
+        return await interaction.followup.send(embed=err_e("❌ This promo code has been fully redeemed."), ephemeral=True)
+
+    expires = promo.get("expires_at", "")
+    if expires:
+        try:
+            exp_dt = datetime.fromisoformat(expires.replace("Z", "+00:00"))
+            if datetime.now(timezone.utc) > exp_dt:
+                return await interaction.followup.send(embed=err_e("❌ This promo code has expired."), ephemeral=True)
+        except (ValueError, TypeError):
+            pass
+
+    # Apply the discount/upgrade
+    srv = await get_server_record(gid)
+    if not srv:
+        return await interaction.followup.send(embed=err_e("❌ Server not registered."), ephemeral=True)
+
+    discount = int(promo.get("discount_percent", 0))
+    # For now, just increment usage count
+    await b44_update("PromoCode", promo["id"], {
+        "used_count": used + 1
+    })
+
+    await interaction.followup.send(embed=ok_e("🎟️ Promo Code Redeemed!",
+        f"Code **{code.upper()}** redeemed successfully!\n"
+        f"Discount: **{discount}%**\n"
+        f"Uses remaining: **{max_uses - used - 1}**"), ephemeral=True)
 
 # Per-guild music state
 _music_queues: dict[int, deque] = {}
