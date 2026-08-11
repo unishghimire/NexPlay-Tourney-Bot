@@ -189,6 +189,34 @@ class NexPlayBot(commands.Bot):
             print("[Music] ❌ CRITICAL: FFmpeg NOT found in PATH — music will fail!", flush=True)
         print(f"[Music] yt-dlp version: {yt_dlp.version.__version__}", flush=True)
         print(f"[Music] discord.py version: {discord.__version__}", flush=True)
+        # ── Load Opus codec (required for Discord voice audio) ────────
+        import ctypes.util
+        if not discord.opus.is_loaded():
+            # Try common library paths on Linux/Debian
+            _opus_paths = [
+                ctypes.util.find_library("opus"),
+                "/usr/lib/x86_64-linux-gnu/libopus.so.0",
+                "/usr/lib/x86_64-linux-gnu/libopus.so",
+                "/usr/lib/libopus.so.0",
+                "/usr/lib/libopus.so",
+                "/lib/x86_64-linux-gnu/libopus.so.0",
+                "/lib/libopus.so.0",
+            ]
+            _opus_loaded = False
+            for _path in _opus_paths:
+                if _path:
+                    try:
+                        discord.opus.load_opus(_path)
+                        _opus_loaded = True
+                        print(f"[Music] ✅ Opus codec loaded from: {_path}", flush=True)
+                        break
+                    except Exception:
+                        continue
+            if not _opus_loaded:
+                print("[Music] ❌ CRITICAL: Opus codec NOT loaded — voice audio will fail!", flush=True)
+                print("[Music]    Tried paths:", [p for p in _opus_paths if p], flush=True)
+        else:
+            print("[Music] ✅ Opus codec already loaded", flush=True)
         asyncio.create_task(self._daily_log_scheduler())
         asyncio.create_task(auto_meme_loop())
         asyncio.create_task(_247_health_check())
