@@ -3422,13 +3422,32 @@ async def cmd_play(interaction: discord.Interaction, query: str):
     voice_channel = interaction.user.voice.channel
     guild_id = interaction.guild.id
 
-    # Connect to voice channel
+    # Connect to voice channel — use reconnect=False on initial connect
+    # to prevent discord.py's internal retry loop from hanging the command.
+    # We enable reconnect AFTER a successful connection.
     voice_client = _get_vc(interaction)
     if not voice_client:
         try:
-            voice_client = await voice_channel.connect(timeout=30, reconnect=True)
+            voice_client = await asyncio.wait_for(
+                voice_channel.connect(timeout=15, reconnect=False, self_deaf=True),
+                timeout=20
+            )
+        except asyncio.TimeoutError:
+            return await interaction.followup.send(embed=err_e(
+                "⏱️ Could not connect to voice channel (timed out).\n"
+                "Try joining a different voice channel, or kick the bot and retry."
+            ))
         except Exception as e:
-            return await interaction.followup.send(embed=err_e(f"Failed to join voice: {e}"))
+            err_str = str(e)
+            if "4006" in err_str or "4017" in err_str or "ConnectionClosed" in err_str:
+                return await interaction.followup.send(embed=err_e(
+                    "❌ Discord rejected the voice connection. This can happen when:\n"
+                    "• The voice channel is full or restricted\n"
+                    "• The bot lacks **Connect** or **Speak** permissions\n"
+                    "• Discord's voice server is having issues\n\n"
+                    "Try: Move to a different voice channel and use /play again."
+                ))
+            return await interaction.followup.send(embed=err_e(f"Failed to join voice: {err_str[:200]}"))
     elif voice_client.channel != voice_channel:
         await voice_client.move_to(voice_channel)
     if guild_id not in _music_queues:
@@ -3666,7 +3685,10 @@ async def cmd_247(interaction: discord.Interaction):
 
     if not voice_client:
         try:
-            voice_client = await voice_channel.connect(timeout=30, reconnect=True)
+            voice_client = await asyncio.wait_for(
+                voice_channel.connect(timeout=15, reconnect=False, self_deaf=True),
+                timeout=20
+            )
         except Exception as e:
             return await interaction.response.send_message(embed=err_e(f"Failed to join voice: {e}"))
     elif voice_client.channel != voice_channel:
