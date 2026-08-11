@@ -28,10 +28,10 @@ load_dotenv()
 
 BOT_TOKEN   = os.environ.get("DISCORD_BOT_TOKEN", "").strip()
 HOME_GUILD  = int(os.environ.get("DISCORD_GUILD_ID", "0"))   # owner's server only
-SVC_TOKEN   = os.environ.get("BASE44_SERVICE_TOKEN", "").strip()
+BOT_API_KEY = os.environ.get("BOT_API_KEY", "nexplay-bot-2026").strip()
 APP_ID      = os.environ.get("APP_ID", "6a5226b5047f5c59d961130e")
 
-BASE44_API  = "https://" + APP_ID + ".base44.app/api/apps/" + APP_ID + "/entities"
+BOT_API_URL = "https://thistle-d961130e.base44.app/functions/botApi"
 DISCORD_API = "https://discord.com/api/v10"
 
 # ── Role names that count as "staff" in any server ────────
@@ -104,7 +104,7 @@ async def check_feature(guild_id: str, feature: str, interaction: discord.Intera
     if not rec:
         # Self-heal: try to auto-register if we have a guild context
         guild = bot.get_guild(int(guild_id)) if guild_id.isdigit() else None
-        if guild and SVC_TOKEN:
+        if guild and BOT_API_KEY:
             print(f"[NexPlay] check_feature: auto-registering {guild.name} ({guild_id})", flush=True)
             rec = await register_server(guild)
         if not rec or not rec.get("id"):
@@ -876,7 +876,7 @@ async def on_ready():
     # ── Self-heal: ensure EVERY guild the bot is in has a DB record ────────
     # This fixes "bot can't recognize servers" — if a server was added while
     # the bot was offline, or the DB was reset, on_guild_join never fired.
-    if SVC_TOKEN:
+    if True:  # Always sync — botApi uses static key, no JWT to expire
         try:
             db_servers = await b44_list("Server")
             db_guild_ids = {s.get("guild_id") for s in db_servers}
@@ -907,41 +907,32 @@ async def on_ready():
 
 
 def _b44_headers() -> dict:
-    return {"Authorization": "Bearer " + SVC_TOKEN, "Content-Type": "application/json"}
+    return {"x-bot-key": BOT_API_KEY, "Content-Type": "application/json"}
 
 async def b44_list(entity: str, filters: dict | None = None) -> list:
-    url = BASE44_API + "/" + entity
     try:
-        if not SVC_TOKEN:
-            print("[b44_list] ⚠️ SVC_TOKEN is empty! Base44 API calls will fail.", flush=True)
-            return []
-        async with bot.http_session.get(url, headers=_b44_headers()) as r:
+        body = {"action": "list", "entity": entity}
+        if filters:
+            body["filter"] = filters
+        async with bot.http_session.post(BOT_API_URL, json=body, headers=_b44_headers()) as r:
             if r.status != 200:
                 err_body = await r.text()
                 print(f"[b44_list] ⚠️ {entity} HTTP {r.status}: {err_body[:200]}", flush=True)
                 return []
             data = await r.json()
-            if not isinstance(data, list):
-                print(f"[b44_list] ⚠️ {entity} returned non-list: {type(data).__name__}", flush=True)
-                return []
-            if filters:
-                for k, v in filters.items():
-                    data = [x for x in data if x.get(k) == v]
-            return data
+            return data.get("records", [])
     except Exception as e:
         print(f"[b44_list] ❌ {entity} error: {e}", flush=True)
         return []
 
 
 async def b44_create(entity: str, payload: dict) -> dict:
-    url = BASE44_API + "/" + entity
-    if not SVC_TOKEN:
-        print("[b44_create] ⚠️ SVC_TOKEN is empty! Base44 API calls will fail.", flush=True)
-        return {}
     try:
-        async with bot.http_session.post(url, json=payload, headers=_b44_headers()) as r:
-            if r.status in (200, 201):
-                return await r.json()
+        body = {"action": "create", "entity": entity, "data": payload}
+        async with bot.http_session.post(BOT_API_URL, json=body, headers=_b44_headers()) as r:
+            if r.status == 200:
+                data = await r.json()
+                return data.get("record", {})
             err_body = await r.text()
             print(f"[b44_create] ⚠️ {entity} HTTP {r.status}: {err_body[:200]}", flush=True)
             return {}
@@ -951,14 +942,12 @@ async def b44_create(entity: str, payload: dict) -> dict:
 
 
 async def b44_update(entity: str, record_id: str, payload: dict) -> dict:
-    url = BASE44_API + "/" + entity + "/" + record_id
-    if not SVC_TOKEN:
-        print("[b44_update] ⚠️ SVC_TOKEN is empty! Base44 API calls will fail.", flush=True)
-        return {}
     try:
-        async with bot.http_session.put(url, json=payload, headers=_b44_headers()) as r:
-            if r.status in (200, 201):
-                return await r.json()
+        body = {"action": "update", "entity": entity, "id": record_id, "data": payload}
+        async with bot.http_session.post(BOT_API_URL, json=body, headers=_b44_headers()) as r:
+            if r.status == 200:
+                data = await r.json()
+                return data.get("record", {})
             err_body = await r.text()
             print(f"[b44_update] ⚠️ {entity}/{record_id} HTTP {r.status}: {err_body[:200]}", flush=True)
             return {}
@@ -968,14 +957,12 @@ async def b44_update(entity: str, record_id: str, payload: dict) -> dict:
 
 
 async def b44_delete(entity: str, record_id: str) -> bool:
-    url = BASE44_API + "/" + entity + "/" + record_id
-    if not SVC_TOKEN:
-        print("[b44_delete] ⚠️ SVC_TOKEN is empty! Base44 API calls will fail.", flush=True)
-        return False
     try:
-        async with bot.http_session.delete(url, headers=_b44_headers()) as r:
-            if r.status in (200, 204):
-                return True
+        body = {"action": "delete", "entity": entity, "id": record_id}
+        async with bot.http_session.post(BOT_API_URL, json=body, headers=_b44_headers()) as r:
+            if r.status == 200:
+                data = await r.json()
+                return data.get("success", False)
             err_body = await r.text()
             print(f"[b44_delete] ⚠️ {entity}/{record_id} HTTP {r.status}: {err_body[:200]}", flush=True)
             return False
@@ -1908,8 +1895,8 @@ async def cmd_setup(interaction: discord.Interaction):
     existing = await get_server_record(gid)
     if not existing:
         # No record at all — try to create one
-        if not SVC_TOKEN:
-            status_msg = "⚠️ **Database not configured.** `BASE44_SERVICE_TOKEN` env var is missing on the bot server. Contact the bot owner."
+        if not BOT_API_KEY:
+            status_msg = "⚠️ **Database not configured.** `BOT_API_KEY` env var is missing on the bot server."
         else:
             created = await register_server(interaction.guild)
             if created and created.get("id"):
@@ -2584,7 +2571,7 @@ async def cmd_status(interaction: discord.Interaction):
     # ── Env vars ────────────────────────────────────────────
     lines.append(f"\n**Environment:**")
     lines.append(f"  DISCORD_BOT_TOKEN: {'✅' if BOT_TOKEN else '❌ MISSING'}")
-    lines.append(f"  BASE44_SERVICE_TOKEN: {'✅' if SVC_TOKEN else '❌ MISSING'}")
+    lines.append(f"  BOT_API_KEY: {'✅' if BOT_API_KEY else '❌ MISSING'}")
     lines.append(f"  GROQ_API_KEY: {'✅' if os.environ.get('GROQ_API_KEY') else '❌ MISSING'}")
     lines.append(f"  APP_ID: {APP_ID}")
 
@@ -3621,7 +3608,7 @@ if not BOT_TOKEN:
     print("[NexPlay] ❌ FATAL: DISCORD_BOT_TOKEN is not set! Bot cannot start.", flush=True)
     raise SystemExit(1)
 
-if not SVC_TOKEN:
-    print("[NexPlay] ⚠️ WARNING: BASE44_SERVICE_TOKEN is not set! DB operations will fail.", flush=True)
+if not BOT_API_KEY:
+    print("[NexPlay] ⚠️ WARNING: BOT_API_KEY is not set! DB operations will fail.", flush=True)
 
 bot.run(BOT_TOKEN)
