@@ -277,6 +277,18 @@ _register_locks: dict[str, asyncio.Lock] = {}
 # This lock serializes the check-create-update sequence per tournament.
 _registration_tourney_locks: dict[str, asyncio.Lock] = {}
 
+# Per-tournament lock for group generation — prevents concurrent /generate_groups
+# from double-creating TournamentGroup records or corrupting group assignments.
+_group_gen_locks: dict[str, asyncio.Lock] = {}
+
+# Per-tournament lock for match results — prevents concurrent /results calls
+# from creating duplicate Match records or computing stale match_number values.
+_match_result_locks: dict[str, asyncio.Lock] = {}
+
+# Per-guild lock for tournament creation — prevents tournaments_used
+# read-then-increment race on the Server entity.
+_tournament_create_locks: dict[str, asyncio.Lock] = {}
+
 # Per-guild meme state tracking
 _last_meme_url: dict[int, str] = {}     # guild_id → last posted meme URL
 _meme_channel_cache: dict[int, int] = {} # guild_id → channel_id (cached)
@@ -813,13 +825,16 @@ class TournamentStep3Modal(discord.ui.Modal, title="🏆 Create Tournament (3/3)
             return await interaction.followup.send(embed=err_e(
                 "❌ Database error — tournament creation aborted and created channels were rolled back."), ephemeral=True)
 
-        # Update server tournament count
-        srv = await get_server_record(gid)
-        if srv:
-            await b44_update("Server", srv["id"], {
-                "tournaments_used": (srv.get("tournaments_used") or 0) + 1,
-                "last_active": now_iso(),
-            })
+        # Update server tournament count (locked to prevent read-then-increment race)
+        if gid not in _tournament_create_locks:
+            _tournament_create_locks[gid] = asyncio.Lock()
+        async with _tournament_create_locks[gid]:
+            srv = await get_server_record(gid)
+            if srv:
+                await b44_update("Server", srv["id"], {
+                    "tournaments_used": (srv.get("tournaments_used") or 0) + 1,
+                    "last_active": now_iso(),
+                })
 
         # Confirm to host
         confirm = discord.Embed(
@@ -2459,57 +2474,63 @@ async def cmd_groups(interaction: discord.Interaction, tournament: str):
     if len(regs) < 2:
         return await interaction.followup.send(embed=err_e("Need at least 2 registered teams to generate groups."), ephemeral=True)
 
-    # ── Delete existing groups before regenerating (prevent duplicates) ──
-    existing_groups = await b44_list("TournamentGroup", {"tournament_id": t["id"], "guild_id": gid})
-    del_ok, del_fail = 0, 0
-    for eg in existing_groups:
-        if await b44_delete("TournamentGroup", eg.get("id", "")):
-            del_ok += 1
-        else:
-            del_fail += 1
-    if existing_groups:
-        log(f"[Groups] Cleared {del_ok} old groups for {t.get('name','?')}" +
-            (f" ({del_fail} failed to delete)" if del_fail else ""))
+    # ── Per-tournament lock — serializes delete-old + create-new ──
+    # Without this, two concurrent /groups calls both delete old groups
+    # and both create new ones — resulting in duplicate TournamentGroup records.
+    group_lock_key = f"{gid}:{t['id']}"
+    if group_lock_key not in _group_gen_locks:
+        _group_gen_locks[group_lock_key] = asyncio.Lock()
+    async with _group_gen_locks[group_lock_key]:
+        existing_groups = await b44_list("TournamentGroup", {"tournament_id": t["id"], "guild_id": gid})
+        del_ok, del_fail = 0, 0
+        for eg in existing_groups:
+            if await b44_delete("TournamentGroup", eg.get("id", "")):
+                del_ok += 1
+            else:
+                del_fail += 1
+        if existing_groups:
+            log(f"[Groups] Cleared {del_ok} old groups for {t.get('name','?')}" +
+                (f" ({del_fail} failed to delete)" if del_fail else ""))
 
-    group_size = max(2, safe_pos_int(t.get("group_size", 4), 4, 2))
-    teams = list(regs)
-    random.shuffle(teams)
-    num_groups = max(1, (len(teams) + group_size - 1) // group_size)
-    groups = [[] for _ in range(num_groups)]
-    for i, team in enumerate(teams):
-        groups[i % num_groups].append(team)
+        group_size = max(2, safe_pos_int(t.get("group_size", 4), 4, 2))
+        teams = list(regs)
+        random.shuffle(teams)
+        num_groups = max(1, (len(teams) + group_size - 1) // group_size)
+        groups = [[] for _ in range(num_groups)]
+        for i, team in enumerate(teams):
+            groups[i % num_groups].append(team)
 
-    # Save to DB + post to #groups channel
-    short = t.get("short_name", "")
-    groups_ch = discord.utils.get(interaction.guild.text_channels, name=f"{short}-groups")
-    desc = ""
-    current_seed = 1  # Continuous seed counter across all groups
-    for gi, group in enumerate(groups):
-        label = chr(65 + gi)  # A, B, C...
-        player_names = [r.get("player_name", "?") for r in group]
-        player_ids = [r.get("player_discord_id", "") for r in group]
-        desc += f"**🏆 Group {label}**\n" + "\n".join(f"{i+1}. {n}" for i, n in enumerate(player_names)) + "\n\n"
-        # Save group to DB — verify success
-        group_rec = await b44_create("TournamentGroup", {
-            "tournament_id": t["id"], "guild_id": gid,
-            "group_label": label,
-            "player_ids": player_ids,
-            "player_names": player_names,
-            "generated_at": now_iso(),
-        })
-        if not group_rec or not group_rec.get("id"):
-            log(f"[Groups] ⚠️ Failed to create TournamentGroup {label} for {t.get('name','?')}")
-        # Update registration records with group label + continuous seed
-        for idx, r in enumerate(group):
-            upd_ok = await b44_update("Registration", r["id"], {"group_label": label, "seed_number": current_seed})
-            if not upd_ok:
-                log(f"[Groups] ⚠️ Failed to update registration {r.get('player_name','?')} with group {label}")
-            current_seed += 1
+        # Save to DB + post to #groups channel
+        short = t.get("short_name", "")
+        groups_ch = discord.utils.get(interaction.guild.text_channels, name=f"{short}-groups")
+        desc = ""
+        current_seed = 1  # Continuous seed counter across all groups
+        for gi, group in enumerate(groups):
+            label = chr(65 + gi)  # A, B, C...
+            player_names = [r.get("player_name", "?") for r in group]
+            player_ids = [r.get("player_discord_id", "") for r in group]
+            desc += f"**🏆 Group {label}**\n" + "\n".join(f"{i+1}. {n}" for i, n in enumerate(player_names)) + "\n\n"
+            # Save group to DB — verify success
+            group_rec = await b44_create("TournamentGroup", {
+                "tournament_id": t["id"], "guild_id": gid,
+                "group_label": label,
+                "player_ids": player_ids,
+                "player_names": player_names,
+                "generated_at": now_iso(),
+            })
+            if not group_rec or not group_rec.get("id"):
+                log(f"[Groups] ⚠️ Failed to create TournamentGroup {label} for {t.get('name','?')}")
+            # Update registration records with group label + continuous seed
+            for idx, r in enumerate(group):
+                upd_ok = await b44_update("Registration", r["id"], {"group_label": label, "seed_number": current_seed})
+                if not upd_ok:
+                    log(f"[Groups] ⚠️ Failed to update registration {r.get('player_name','?')} with group {label}")
+                current_seed += 1
 
-    # Update tournament status — verify it took
-    status_ok = await b44_update("Tournament", t["id"], {"status": "groups_generated"})
-    if not status_ok:
-        log(f"[Groups] ⚠️ Failed to set tournament status to groups_generated for {t.get('name','?')}")
+        # Update tournament status — verify it took
+        status_ok = await b44_update("Tournament", t["id"], {"status": "groups_generated"})
+        if not status_ok:
+            log(f"[Groups] ⚠️ Failed to set tournament status to groups_generated for {t.get('name','?')}")
 
     e = discord.Embed(title=f"🎯 Group Draw — {t['name']}", description=desc, color=BRAND_COLOR, timestamp=datetime.now(timezone.utc))
     e.set_footer(text="NexPlay | Groups Generated", icon_url=BRAND_LOGO_URL)
@@ -2585,31 +2606,38 @@ async def cmd_results(interaction: discord.Interaction, tournament: str, match_i
             p2_id = p2_reg.get("player_discord_id", "")
             winner_id = p1_id if s1 > s2 else p2_id if s2 > s1 else ""
 
-            # ── Idempotency: check both orderings ────
-            existing_ms = await b44_list("Match", {"tournament_id": t["id"], "guild_id": gid})
-            dup = any(
-                ((m.get("player1_id") == p1_id and m.get("player2_id") == p2_id) or
-                 (m.get("player1_id") == p2_id and m.get("player2_id") == p1_id))
-                and m.get("round_number", 0) == 0
-                for m in existing_ms
-            )
-            if dup:
-                await interaction.followup.send(embed=err_e(
-                    "❌ This match result already exists."), ephemeral=True)
-                return
+            # ── Per-tournament lock — serializes idempotency check + create ──
+            # Without this, two staff posting results simultaneously both see
+            # no existing match, both pass the dup check, and both create —
+            # resulting in duplicate Match records and wrong match_number.
+            match_lock_key = f"{gid}:{t['id']}"
+            if match_lock_key not in _match_result_locks:
+                _match_result_locks[match_lock_key] = asyncio.Lock()
+            async with _match_result_locks[match_lock_key]:
+                existing_ms = await b44_list("Match", {"tournament_id": t["id"], "guild_id": gid})
+                dup = any(
+                    ((m.get("player1_id") == p1_id and m.get("player2_id") == p2_id) or
+                     (m.get("player1_id") == p2_id and m.get("player2_id") == p1_id))
+                    and m.get("round_number", 0) == 0
+                    for m in existing_ms
+                )
+                if dup:
+                    await interaction.followup.send(embed=err_e(
+                        "❌ This match result already exists."), ephemeral=True)
+                    return
 
-            match_rec = await b44_create("Match", {
-                "tournament_id": t["id"], "guild_id": gid,
-                "round_number": 0, "match_number": len(existing_ms) + 1,
-                "group_label": g_label,
-                "player1_id": p1_id, "player1_username": p1_name,
-                "player2_id": p2_id, "player2_username": p2_name,
-                "player1_score": s1, "player2_score": s2,
-                "winner_id": winner_id, "winner_username": winner_name,
-                "status": "completed" if winner_id else "draw",
-                "scheduled_at": now_iso(),
-                "results_card_image_url": "",
-            })
+                match_rec = await b44_create("Match", {
+                    "tournament_id": t["id"], "guild_id": gid,
+                    "round_number": 0, "match_number": len(existing_ms) + 1,
+                    "group_label": g_label,
+                    "player1_id": p1_id, "player1_username": p1_name,
+                    "player2_id": p2_id, "player2_username": p2_name,
+                    "player1_score": s1, "player2_score": s2,
+                    "winner_id": winner_id, "winner_username": winner_name,
+                    "status": "completed" if winner_id else "draw",
+                    "scheduled_at": now_iso(),
+                    "results_card_image_url": "",
+                })
         else:
             await interaction.followup.send(embed=err_e(
                 "❌ Invalid format! Use: `Group A: Team One 2-1 Team Two` or `Team One 2-1 Team Two`"), ephemeral=True)
