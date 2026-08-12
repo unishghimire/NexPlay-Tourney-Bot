@@ -268,6 +268,9 @@ MEME_SUBREDDITS = [
     "okbuddyretard", "wholesomememes", "PewdiepieSubmissions", "aww",
 ]
 
+# Per-guild registration lock — prevents TOCTOU race in register_server()
+_register_locks: dict[str, asyncio.Lock] = {}
+
 # Per-guild meme state tracking
 _last_meme_url: dict[int, str] = {}     # guild_id → last posted meme URL
 _meme_channel_cache: dict[int, int] = {} # guild_id → channel_id (cached)
@@ -1106,17 +1109,22 @@ async def _update_member_count(guild: discord.Guild):
 async def register_server(guild: discord.Guild) -> dict:
     """Register a new server as Free Trial. Returns the created record.
     
-    GUARD: Checks for an existing record first to prevent duplicates.
-    All 5 call sites (on_guild_join, self-heal, check_feature, meme loop, /setup)
-    go through this function, so the guard here protects all of them."""
-    # ── Duplicate guard — single source of truth ──────────────────────
-    existing = await get_server_record(str(guild.id))
-    if existing:
-        # Server already exists — return it instead of creating a duplicate
-        print(f"[NexPlay] register_server: {guild.name} ({guild.id}) already in DB — returning existing record", flush=True)
-        return existing
-    owner = guild.owner
-    return await b44_create("Server", {
+    GUARD: Uses a per-guild asyncio.Lock + existing record check to prevent
+    duplicates. All 5 call sites go through this function.
+    The lock prevents TOCTOU races where two concurrent async tasks both
+    see no record and both call b44_create."""
+    gid = str(guild.id)
+    # ── Per-guild lock — only one register at a time ───────────────────
+    if gid not in _register_locks:
+        _register_locks[gid] = asyncio.Lock()
+    async with _register_locks[gid]:
+        # Double-check inside the lock — another task may have created it
+        existing = await get_server_record(gid)
+        if existing:
+            print(f"[NexPlay] register_server: {guild.name} ({gid}) already in DB — returning existing record", flush=True)
+            return existing
+        owner = guild.owner
+        return await b44_create("Server", {
         "guild_id":            str(guild.id),
         "guild_name":          guild.name,
         "owner_id":            str(owner.id) if owner else "",
