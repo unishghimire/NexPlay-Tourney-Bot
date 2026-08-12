@@ -261,6 +261,34 @@ class NexPlayBot(commands.Bot):
 bot  = NexPlayBot()
 tree = bot.tree
 
+# ── Global slash command error handler ──────────────────────────────────────
+@tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError) -> None:
+    """Catch unhandled exceptions so users see a helpful message instead of
+    'The application did not respond.'"""
+    import traceback
+    tb = traceback.format_exc()
+    print(f"[NexPlay] ⚠️ Command error: {error}", flush=True)
+    print(tb, flush=True)
+
+    # User-facing message
+    if isinstance(error, app_commands.CommandOnCooldown):
+        msg = f"⏳ This command is on cooldown. Try again in {error.retry_after:.0f}s."
+    elif isinstance(error, app_commands.CheckFailure):
+        msg = "❌ You don't have permission to use this command."
+    else:
+        msg = "⚠️ Something went wrong running that command. The error has been logged."
+
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(embed=err_e(msg), ephemeral=True)
+        else:
+            await interaction.response.send_message(embed=err_e(msg), ephemeral=True)
+    except Exception:
+        pass  # Interaction may have expired
+
+
+
 
 MEME_SUBREDDITS = [
     "dankmemes", "gaming", "freefire", "PUBGMobile", "FreeFireBattlegrounds",
@@ -3206,6 +3234,9 @@ async def cmd_redeem(interaction: discord.Interaction, code: str):
     """Redeem a promo code for a plan upgrade."""
     if not is_staff(interaction.user):
         return await interaction.response.send_message(embed=err_e("❌ Staff only command."), ephemeral=True)
+    allowed, reason = await is_allowed(str(interaction.guild.id), interaction.guild)
+    if not allowed:
+        return await interaction.response.send_message(embed=err_e(reason), ephemeral=True)
     await interaction.response.defer(thinking=True, ephemeral=True)
 
     gid = str(interaction.guild.id)
