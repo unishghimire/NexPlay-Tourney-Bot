@@ -271,6 +271,12 @@ MEME_SUBREDDITS = [
 # Per-guild registration lock — prevents TOCTOU race in register_server()
 _register_locks: dict[str, asyncio.Lock] = {}
 
+# Per-tournament registration lock — prevents TOCTOU race in handle_registration()
+# When two users register simultaneously, both fetch the same existing_regs,
+# both pass the duplicate/slot checks, and both create — corrupting counts.
+# This lock serializes the check-create-update sequence per tournament.
+_registration_tourney_locks: dict[str, asyncio.Lock] = {}
+
 # Per-guild meme state tracking
 _last_meme_url: dict[int, str] = {}     # guild_id → last posted meme URL
 _meme_channel_cache: dict[int, int] = {} # guild_id → channel_id (cached)
@@ -1837,71 +1843,80 @@ async def handle_registration(message: discord.Message, gid: str, short: str, to
     team_name = parsed["team_name"]
     players = parsed["players"]
 
-    existing_regs = await b44_list("Registration", {"tournament_id": tournament["id"], "guild_id": gid})
+    # ── Per-tournament lock — serializes the check-create-update sequence ──
+    # Without this, two users registering at the same time both fetch the same
+    # existing_regs list, both pass duplicate/slot checks, and both create —
+    # resulting in duplicate team names, corrupted registered_count, and
+    # exceeding max_players.
+    tourney_lock_key = f"{gid}:{tournament['id']}"
+    if tourney_lock_key not in _registration_tourney_locks:
+        _registration_tourney_locks[tourney_lock_key] = asyncio.Lock()
+    async with _registration_tourney_locks[tourney_lock_key]:
+        existing_regs = await b44_list("Registration", {"tournament_id": tournament["id"], "guild_id": gid})
 
-    # ── Captain duplicate check ──
-    captain_id = str(message.author.id)
-    if any(r.get("player_discord_id") == captain_id for r in existing_regs):
-        await _reject_msg(message, "❌ Already Registered",
-            "You have already registered a team for this tournament as Captain!")
-        return
+        # ── Captain duplicate check ──
+        captain_id = str(message.author.id)
+        if any(r.get("player_discord_id") == captain_id for r in existing_regs):
+            await _reject_msg(message, "❌ Already Registered",
+                "You have already registered a team for this tournament as Captain!")
+            return
 
-    # ── Internal duplicate mention check ──
-    if len(set(players)) != len(players):
-        await _reject_msg(message, "❌ Duplicate Mentions",
-            "Each team member must be a unique user!")
-        return
+        # ── Internal duplicate mention check ──
+        if len(set(players)) != len(players):
+            await _reject_msg(message, "❌ Duplicate Mentions",
+                "Each team member must be a unique user!")
+            return
 
-    # ── Team name length validation ──
-    if len(team_name) > 50:
-        await _reject_msg(message, "❌ Team Name Too Long",
-            "Team name must be 50 characters or fewer.")
-        return
+        # ── Team name length validation ──
+        if len(team_name) > 50:
+            await _reject_msg(message, "❌ Team Name Too Long",
+                "Team name must be 50 characters or fewer.")
+            return
 
-    # Duplicate team name?
-    if any(r.get("player_name", "").lower() == team_name.lower() for r in existing_regs):
-        await _reject_msg(message, "❌ Team Name Taken", f"**{team_name}** is already registered.")
-        return
+        # Duplicate team name?
+        if any(r.get("player_name", "").lower() == team_name.lower() for r in existing_regs):
+            await _reject_msg(message, "❌ Team Name Taken", f"**{team_name}** is already registered.")
+            return
 
-    # Duplicate player?
-    all_players = []
-    for r in existing_regs:
-        members = r.get("team_members", [])
-        if isinstance(members, list): all_players.extend(members)
-        elif isinstance(members, str) and members: all_players.extend(members.split(","))
-    already = [f"<@{p}>" for p in players if p in all_players]
-    if already:
-        await _reject_msg(message, "❌ Player Already Registered", f"{', '.join(already)} is already on another team!")
-        return
+        # Duplicate player?
+        all_players = []
+        for r in existing_regs:
+            members = r.get("team_members", [])
+            if isinstance(members, list): all_players.extend(members)
+            elif isinstance(members, str) and members: all_players.extend(members.split(","))
+        already = [f"<@{p}>" for p in players if p in all_players]
+        if already:
+            await _reject_msg(message, "❌ Player Already Registered", f"{', '.join(already)} is already on another team!")
+            return
 
-    # Slots full? (re-check count to mitigate race condition)
-    max_p = int(tournament.get("max_players", 16))
-    # Use the tournament's registered_count as the authoritative count
-    # rather than len(existing_regs) which may be stale
-    current_count = max(int(tournament.get("registered_count", 0)), len(existing_regs))
-    slot = current_count + 1
-    if slot > max_p:
-        await message.add_reaction("❌")
-        await message.reply(embed=discord.Embed(title="🔒 Registration Full",
-            description=f"All {max_p} slots are taken.", color=0xFF4444))
-        return
+        # Slots full? (re-check count — now race-free inside the lock)
+        max_p = int(tournament.get("max_players", 16))
+        # Use the tournament's registered_count as the authoritative count
+        # rather than len(existing_regs) which may be stale
+        current_count = max(int(tournament.get("registered_count", 0)), len(existing_regs))
+        slot = current_count + 1
+        if slot > max_p:
+            await message.add_reaction("❌")
+            await message.reply(embed=discord.Embed(title="🔒 Registration Full",
+                description=f"All {max_p} slots are taken.", color=0xFF4444))
+            return
 
-    # Save registration — verify DB write succeeded (NO FAKE SUCCESS)
-    reg_rec = await b44_create("Registration", {
-        "tournament_id": tournament["id"], "guild_id": gid,
-        "player_name": team_name, "player_discord_id": str(message.author.id),
-        "team_members": players, "status": "registered", "logo_url": "",
-        "logo_submitted_at": "", "logo_submitted_by": "",
-        "registered_at": datetime.now(timezone.utc).isoformat(),
-        "seed_number": 0, "group_label": "",
-    })
-    if not reg_rec or not reg_rec.get("id"):
-        await _reject_msg(message, "❌ Registration Failed",
-            "Database error — could not save your registration. Please try again or contact staff.")
-        return
-    update_ok = await b44_update("Tournament", tournament["id"], {"registered_count": slot})
-    if not update_ok:
-        log(f"[Reg] Failed to update tournament count for {tournament.get('name','?')}")
+        # Save registration — verify DB write succeeded (NO FAKE SUCCESS)
+        reg_rec = await b44_create("Registration", {
+            "tournament_id": tournament["id"], "guild_id": gid,
+            "player_name": team_name, "player_discord_id": str(message.author.id),
+            "team_members": players, "status": "registered", "logo_url": "",
+            "logo_submitted_at": "", "logo_submitted_by": "",
+            "registered_at": datetime.now(timezone.utc).isoformat(),
+            "seed_number": 0, "group_label": "",
+        })
+        if not reg_rec or not reg_rec.get("id"):
+            await _reject_msg(message, "❌ Registration Failed",
+                "Database error — could not save your registration. Please try again or contact staff.")
+            return
+        update_ok = await b44_update("Tournament", tournament["id"], {"registered_count": slot})
+        if not update_ok:
+            log(f"[Reg] Failed to update tournament count for {tournament.get('name','?')}")
     await message.add_reaction("✅")
 
     # Post confirmation to #<short>-confirm-teams (fallback to register channel)
