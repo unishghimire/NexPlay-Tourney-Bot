@@ -1104,7 +1104,17 @@ async def _update_member_count(guild: discord.Guild):
         await b44_update("Server", srv["id"], {"member_count": guild.member_count or 0, "last_active": now_iso()})
 
 async def register_server(guild: discord.Guild) -> dict:
-    """Register a new server as Free Trial. Returns the created record."""
+    """Register a new server as Free Trial. Returns the created record.
+    
+    GUARD: Checks for an existing record first to prevent duplicates.
+    All 5 call sites (on_guild_join, self-heal, check_feature, meme loop, /setup)
+    go through this function, so the guard here protects all of them."""
+    # ── Duplicate guard — single source of truth ──────────────────────
+    existing = await get_server_record(str(guild.id))
+    if existing:
+        # Server already exists — return it instead of creating a duplicate
+        print(f"[NexPlay] register_server: {guild.name} ({guild.id}) already in DB — returning existing record", flush=True)
+        return existing
     owner = guild.owner
     return await b44_create("Server", {
         "guild_id":            str(guild.id),
