@@ -230,6 +230,7 @@ class NexPlayBot(commands.Bot):
         asyncio.create_task(self._daily_log_scheduler())
         asyncio.create_task(auto_meme_loop())
         asyncio.create_task(_247_health_check())
+        asyncio.create_task(_bot_status_heartbeat())
 
     async def _daily_log_scheduler(self):
         """Send daily Excel log at midnight (00:00 NPT = 18:15 UTC prev day).
@@ -4193,6 +4194,88 @@ async def _247_health_check():
         except Exception as e:
             print(f"[NexPlay/247] Health check error: {e}", flush=True)
         await asyncio.sleep(90)
+
+
+# ── Bot Status Heartbeat — writes live metrics to BotStatus entity every 60s ──
+import platform as _platform_module
+try:
+    import psutil as _psutil_module
+except ImportError:
+    _psutil_module = None
+
+_start_time = datetime.now(timezone.utc)
+
+async def _bot_status_heartbeat():
+    """Background task: every 60s, write bot live status to BotStatus entity."""
+    await bot.wait_until_ready()
+    print("[NexPlay] Bot status heartbeat started (60s interval).", flush=True)
+    while not bot.is_closed():
+        try:
+            latency_ms = round(bot.latency * 1000, 1)
+            guild_count = len(bot.guilds)
+            total_members = sum(g.member_count or 0 for g in bot.guilds)
+            voice_conns = len(bot.voice_clients)
+            music_247_count = sum(1 for v in bot.voice_clients if _music_247.get(v.guild.id, False))
+
+            all_tournaments = await b44_list("Tournament")
+            active_t = len([t for t in all_tournaments if t.get("status") in ("registration_open", "in_progress", "groups_generated")])
+
+            uptime_s = int((datetime.now(timezone.utc) - _start_time).total_seconds())
+
+            try:
+                cpu = _psutil_module.cpu_percent(interval=0.5) if _psutil_module else 0
+                mem = round(_psutil_module.Process().memory_info().rss / 1024 / 1024, 1) if _psutil_module else 0
+            except Exception:
+                cpu, mem = 0, 0
+
+            guilds_data = []
+            for g in bot.guilds:
+                vc = discord.utils.get(bot.voice_clients, guild=g)
+                srv = await get_server_record(str(g.id))
+                t_count = len([t for t in all_tournaments if t.get("guild_id") == str(g.id)])
+                guilds_data.append({
+                    "guild_id": str(g.id),
+                    "guild_name": g.name,
+                    "member_count": g.member_count or 0,
+                    "voice_connected": bool(vc and vc.is_connected()),
+                    "playing_music": bool(vc and vc.is_playing()),
+                    "is_247": bool(_music_247.get(g.id, False)),
+                    "latency_ms": latency_ms,
+                    "plan_name": srv.get("plan_name", "Trial") if srv else "Trial",
+                    "subscription_status": srv.get("subscription_status", "trial") if srv else "trial",
+                    "tournament_count": t_count,
+                })
+
+            existing = await b44_list("BotStatus")
+            status_data = {
+                "bot_id": str(bot.user.id) if bot.user else "",
+                "bot_name": str(bot.user) if bot.user else "NexPlay Bot",
+                "status": "online",
+                "latency_ms": latency_ms,
+                "guild_count": guild_count,
+                "total_members": total_members,
+                "voice_connections": voice_conns,
+                "music_247_count": music_247_count,
+                "active_tournaments": active_t,
+                "uptime_seconds": uptime_s,
+                "cpu_percent": cpu,
+                "memory_mb": mem,
+                "last_heartbeat": datetime.now(timezone.utc).isoformat(),
+                "guilds": guilds_data,
+                "version": "2.0",
+                "python_version": _platform_module.python_version(),
+                "platform": _platform_module.platform()[:100],
+                "commands_count": len(tree.get_commands()),
+            }
+            if existing:
+                await b44_update("BotStatus", existing[0]["id"], status_data)
+            else:
+                await b44_create("BotStatus", status_data)
+
+        except Exception as e:
+            print(f"[NexPlay/Heartbeat] Error: {e}", flush=True)
+        await asyncio.sleep(60)
+
 
 
 @bot.event
